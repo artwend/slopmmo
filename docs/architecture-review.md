@@ -5,6 +5,11 @@ authority split), plus the decisions this repository is built on.
 
 Status: **working notes**, not a final specification. Numbers marked `TBD` need measurement.
 
+This document is the *review*: it records where the dialogue was wrong and what replaced it. The
+decisions themselves — as the project owner made them, with verbatim quotes — are in
+[`decisions/`](decisions/README.md); the assembled system is in
+[`server-architecture.md`](server-architecture.md). Where the two disagree, the ADRs win.
+
 ---
 
 ## 1. What the design settled on

@@ -24,6 +24,20 @@ running code instead of arguing about them.
 `proto` and `sim` are deliberately engine-free apart from `bevy_math` vectors, so the same code
 runs unchanged on the client (prediction) and on the server (shadow).
 
+## Docs
+
+| Document | What it is |
+| --- | --- |
+| [`docs/dialogue-decisions.md`](docs/dialogue-decisions.md) | Every decision-making turn from the three design conversations, verbatim (Russian) with translation |
+| [`docs/decisions/`](docs/decisions/README.md) | 14 ADRs: what was decided, by whom, at what cost, and what this repo actually does |
+| [`docs/server-architecture.md`](docs/server-architecture.md) | The assembled system — layers, world topology, tick pipeline, protocols, ops, status |
+| [`docs/architecture-review.md`](docs/architecture-review.md) | Critical review of the dialogue: what was wrong, what replaced it |
+
+Status legend for the ADRs: **Implemented**, **Partial**, **Open** (decided, not built),
+**Deviation** (we knowingly do something else). The one deviation that matters is
+[ADR 006](docs/decisions/006-netcode-lightyear.md): the dialogue chose **Lightyear**, and this
+prototype currently speaks raw UDP. The ADR records why and what converging takes.
+
 ## Design in one page
 
 The split is asymmetric, and that asymmetry is the whole architecture:
@@ -56,7 +70,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 30 tests: proto, sim, server, client
+cargo test --workspace          # 32 tests: proto, sim, server, client
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -139,6 +153,7 @@ implementation here diverges where the review concluded the design was wrong:
 | "authoritative movement state" | shadow state | the client owns its position |
 | corrections applied blindly | `(seq, tick, epoch)` gate | UDP duplicates are normal |
 | report tick compared with the server tick | per-player offset mapping | the two clocks start at different times |
+| Lightyear + built-in transport | raw UDP + hand-rolled codec | scaffold deliberately dependency-free; **deviation**, see ADR 006 |
 
 Open questions are listed in `docs/architecture-review.md`; the biggest is zone handover, which is
 not implemented at all.
