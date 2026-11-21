@@ -27,6 +27,8 @@ pub struct Peers {
     player_of: HashMap<Entity, u64>,
     entity_of: HashMap<u64, Entity>,
     last_seen: HashMap<Entity, Instant>,
+    /// Reused every frame by `evict_silent`.
+    expired: Vec<Entity>,
     pub admitted: u64,
     pub dropped: u64,
     pub packets_in: u64,
@@ -114,7 +116,7 @@ fn ingest(
             // who it is. A real deployment authenticates the session here and
             // spawns at a zone-defined point instead of trusting the client's
             // position.
-            if !game.0.sim.players.contains_key(&packet.player) {
+            if !game.0.sim.contains_player(packet.player) {
                 let pos = Vec3::from_array(packet.report.position);
                 game.0.sim.add_player(packet.player, pos);
                 peers.admitted += 1;
@@ -143,17 +145,23 @@ fn ingest(
 
 fn evict_silent(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut commands: Commands) {
     let now = Instant::now();
-    let expired: Vec<Entity> = peers
-        .last_seen
-        .iter()
-        .filter(|(_, seen)| now.duration_since(**seen) > PEER_TIMEOUT)
-        .map(|(entity, _)| *entity)
-        .collect();
-    for entity in expired {
+    // Same buffer every frame: silence is rare, so this normally collects
+    // nothing and allocates nothing.
+    let mut expired = std::mem::take(&mut peers.expired);
+    expired.extend(
+        peers
+            .last_seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > PEER_TIMEOUT)
+            .map(|(entity, _)| *entity),
+    );
+    for &entity in &expired {
         peers.release(entity, &mut game.0);
         // `Disconnecting` closes the session and despawns the link next frame.
         commands.entity(entity).try_insert(Disconnecting);
     }
+    expired.clear();
+    peers.expired = expired;
 }
 
 /// A link lightyear tore down (or that we evicted) must not leave a body behind.
@@ -176,8 +184,8 @@ fn dispatch(
     if !game.0.snapshots_pending {
         return;
     }
-    for (id, snapshot) in &game.0.last_snapshots {
-        let Some(entity) = peers.entity_of.get(id).copied() else {
+    for &(id, snapshot) in game.0.sim.snapshots() {
+        let Some(entity) = peers.entity_of.get(&id).copied() else {
             continue;
         };
         let Ok((_, sender)) = clients.get_mut(entity) else {
@@ -186,7 +194,9 @@ fn dispatch(
         let Some(mut sender) = sender else {
             continue;
         };
-        sender.send::<net::SnapshotChannel>(snapshot.clone());
+        // `ServerSnapshot` is `Copy` and its peer list is inline, so this is a
+        // flat copy instead of a per-player heap clone.
+        sender.send::<net::SnapshotChannel>(snapshot);
         peers.snapshots_out += 1;
     }
     game.0.snapshots_pending = false;
@@ -209,7 +219,7 @@ mod tests {
         peers.last_seen.insert(link, Instant::now());
         peers.release(link, &mut game);
 
-        assert!(game.sim.players.is_empty(), "body outlived its link");
+        assert!(game.sim.is_empty(), "body outlived its link");
         assert_eq!(peers.dropped, 1);
         assert!(peers.player_of.is_empty());
         assert!(peers.entity_of.is_empty());
@@ -231,10 +241,10 @@ mod tests {
         peers.entity_of.insert(1, new);
 
         peers.release(old, &mut game);
-        assert!(game.sim.players.contains_key(&1), "rebind dropped the body");
+        assert!(game.sim.contains_player(1), "rebind dropped the body");
 
         peers.release(new, &mut game);
-        assert!(game.sim.players.is_empty());
+        assert!(game.sim.is_empty());
         assert_eq!(peers.dropped, 1);
     }
 }

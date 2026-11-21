@@ -33,7 +33,8 @@ One tick, eight phases, in this order:
 1. **Drain input** — read packets, map client ticks to server ticks, drop stale/duplicate.
 2. **Movement update** — integrate intent for players without a fresh report; apply reports as the
    shadow base.
-3. **Spatial index rebuild** — uniform hash over player/boss colliders.
+3. **Spatial index rebuild** — counting-sort rebuild of a uniform grid over player/boss colliders
+   (CSR layout, buffers reused; `crates/sim/src/spatial.rs`).
 4. **Broadphase** — nearest `K`, radius-bounded, pair de-duplication.
 5. **Collision policy** — pick modes per pair (ADR 010), skip `None`.
 6. **Solver** — inelastic capsule/capsule, budgeted vector-sum correction.
@@ -53,9 +54,10 @@ Rules:
 ## Consequences
 
 - The dialogue's frequency split (soft at 20–30 Hz, hard at 60 Hz) is **collapsed**: everything is
-  solved at 60 Hz. Rationale: the solve is a few microseconds per player (measured: 0.042 ms/tick
-  for 32 bots, ~395× headroom), so splitting frequencies adds state (a "last solved tick" per pair)
-  for no measured gain. Keep the split as a knob if profiling ever demands it.
+  solved at 60 Hz. Rationale: the solve is a small fraction of a tick (measured: 0.042 ms/tick at 32
+  bots, 1.004 ms/tick at 256 bots, i.e. 400× and 16.6× realtime headroom), so splitting frequencies
+  adds state (a "last solved tick" per pair) for no measured gain. Keep the split as a knob if
+  profiling ever demands it.
 - Snapshot rate is currently tied to the tick; an adaptive snapshot rate needs a client-side
   interpolation buffer to be worth anything.
 - Because there is no rewind, a high-ping player's shots land against current positions. That is a
@@ -63,13 +65,16 @@ Rules:
 
 ## What this repository does
 
-- `crates/server/src/main.rs` — a `Game` struct with an explicit fixed-step accumulate loop, the
-  phases collapsed into `pump_net` → `authority::ingest` → `spatial` rebuild → `collision::solve` →
-  snapshot build → `net::send`.
+- `crates/server/src/main.rs` — `Game` owns the `Simulation` and the `World`; the fixed step is
+  `ScheduleRunnerPlugin::run_loop(1 ms)` and the phases collapsed into `pump_net` →
+  `authority::ingest` → `spatial` rebuild → `collision::solve` → snapshot build → `net::send`.
 - `crates/sim/src/authority.rs` — per-player client→server tick mapping (`tick_offset`), so a client
   starting its counter at 0 can join, and a mapped tick in the future re-anchors instead of
   rejecting.
-- Measured: 32 bots at 0.042 ms per tick → ~395× realtime headroom on one core.
+- The tick is **single-threaded by decision**, not by omission: determinism (above) comes first, and
+  one core is not the constraint yet. It also **does not allocate** in the steady state, which
+  `crates/sim/tests/allocations.rs` enforces with a counting allocator.
+- Measured: 32 bots at 0.042 ms per tick (400× headroom), 256 bots at 1.004 ms per tick (16.6×).
 - Not implemented: adaptive snapshot rate, per-system frequency split, lag compensation.
 
 ## Open questions

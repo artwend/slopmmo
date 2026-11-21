@@ -13,7 +13,7 @@ mod wire;
 pub use packet::peer_mode;
 pub use packet::{
     CollisionCorrection, KIND_PLAYER_MOVEMENT, KIND_SERVER_SNAPSHOT, MAX_SNAPSHOT_PEERS,
-    MovementReport, PeerCollider, PlayerMovementPacket, ServerSnapshot,
+    MovementReport, PeerCollider, PeerList, PlayerMovementPacket, ServerSnapshot,
 };
 pub use wire::{Reader, WireError, Writer};
 

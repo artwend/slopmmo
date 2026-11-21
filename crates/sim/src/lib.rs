@@ -19,11 +19,11 @@ pub mod spatial;
 pub mod world;
 
 pub use authority::{Reject, ServerPlayer, SimConfig, SimStats, Simulation};
-pub use collision::{Body, Mode, Pair};
+pub use collision::{Body, Impulse, Mode, Pair, PairScratch};
 pub use kcc::{Capsule, KccParams, MoveOutput};
 pub use movement::{MoveParams, step_velocity};
 pub use spatial::SpatialGrid;
 pub use world::{Aabb, StaticWorld};
 
-pub use collision::{build_pairs, solve};
+pub use collision::{build_pairs, solve, solve_into};
 pub use kcc::move_and_slide;

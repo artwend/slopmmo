@@ -188,3 +188,141 @@ A running skeleton that answers the cheapest question first:
 
 Everything that can be decided from numbers (tick rate, K, solver iterations, bandwidth per
 player) is decided here, before any Lightyear integration.
+
+---
+
+## 7. Code review: the hot path (performance pass)
+
+The second review asked for one thing: *"ensure that the server is a multithreaded, asynchronous,
+non-blocking, data-oriented and cache-friendly application with no unnecessary allocations in
+critical sections."* This section is what that audit found and what changed. Nothing here
+contradicts an ADR; it makes the ADRs cheap enough to keep.
+
+### 7.1 What was wrong
+
+The tick was already small, but it was small in wall-clock terms only while the player count was
+small. Every one of the following was on the per-tick path.
+
+| # | Finding | Where | Cost |
+| --- | --- | --- | --- |
+| 1 | Four `Vec`s allocated per tick in the broadphase | `collision::build_pairs` | 4 allocations × 60 Hz |
+| 2 | One `Vec<Impulse>` sized to the whole body list, per tick | `collision::solve` | 1 allocation + full write pass |
+| 3 | A `Vec<(f32, usize)>` collected **per player per tick** for AOI peers, then sorted | `Simulation::build_snapshots` | 1 allocation + a sort per player per tick |
+| 4 | A fresh `Vec<ServerSnapshot>` returned from `step`, and a second `Vec<u64>` of ids collected to zip it back up | `Simulation::step`, `Game::tick_once` | 2 allocations per tick |
+| 5 | `BTreeMap<u64, ServerPlayer>` player storage | `Simulation::players` | O(log n) lookups, one node per player, pointer chasing on the one loop that touches everyone |
+| 6 | `HashMap<(i32, i32), Vec<u32>>` spatial grid | `spatial::SpatialGrid` | a hash per body per tick, a heap `Vec` per occupied cell, churn on every clear |
+| 7 | `snapshot.clone()` per player per tick | `transport::dispatch` | a heap clone of the peer list per send |
+| 8 | `barrier_ok` recomputed a distance the caller had just computed | `Simulation::build_snapshots` | a second `sqrt` per body pair per player |
+| 9 | `nearest.sort_by(..)` over every candidate before truncating to K | `collision::build_pairs` | O(c log c) where O(c · K) suffices |
+| 10 | `std::thread::sleep(500 µs)` **inside a Bevy system** | `server::drive` | a blocked worker thread, and frame pacing hidden in game logic |
+| 11 | `--help` advertised `0.0.0.0:4000` as the default listen address; the default is `127.0.0.1:4000` | `server::Args::parse` | a wrong doc, not a bug — but it misleads the operator |
+
+Finding 10 is the one that mattered most to the *stated* requirement. Sleeping inside a system
+blocks a task-pool thread that the executor wanted back, and it makes the frame loop's cadence a
+property of game code. Bevy's schedule runner is the component that owns frame pacing; it now gets
+to do its job (`ScheduleRunnerPlugin::run_loop(1 ms)`), and `drive` either does work or returns.
+
+### 7.2 What replaced it
+
+**Dense player storage** (`sim/src/authority.rs`). Players are a `Vec<ServerPlayer>` addressed by
+slot, plus a `HashMap<u64, u32>` for the two places that only know an id (admission and removal).
+Removal is `swap_remove` with the moved body's slot repaired. The tick is now one linear pass over
+a contiguous array: no tree walk, no allocator traffic, and the shadow state of players that are
+near each other — the ones the solver actually compares — lands in adjacent cache lines.
+
+**CSR grid with reused buffers** (`sim/src/spatial.rs`). The uniform grid is a counting sort into
+one flat `items` array plus a `starts` prefix table and a `cursor` scatter buffer, all allocated
+once and reused by every rebuild. No hashing, no per-cell `Vec`, candidates arrive in cell order
+(contiguous memory). The window is clamped to 128×128 cells, so one absurd coordinate cannot blow up
+memory; bodies outside the window are clamped into the border cell and the caller's exact distance
+test rejects them.
+
+**Reusable physics scratch** (`sim/src/collision.rs`). `PairScratch` owns every buffer the pair
+build and the solve need; `solve_into` writes into a caller-provided `Vec<Impulse>`. Nearest-neighbour
+selection is a bounded insertion (`partition_point` + shift, at most K entries) instead of a sort of
+everything followed by a truncate. The allocating free functions `build_pairs` and `solve` remain as
+thin wrappers for the tests and one-shot analysis.
+
+**Snapshots owned by the simulation** (`Simulation::snapshots()`), and an inline peer list.
+`proto::PeerList` is a fixed-capacity array with hand-written compact serde, byte-identical on the
+wire to the `Vec` it replaced, which makes `ServerSnapshot: Copy` — so the transport sends a copy
+instead of cloning a heap vector, and the snapshot build never allocates. Peer selection is one
+distance per candidate into an inline `[(f32, usize); 16]` window ordered by `(distance, body)`,
+which reproduces the old stable-sort semantics exactly, and the redundant `barrier_ok` distance is
+gone.
+
+**Frame loop** (`server/src/main.rs`). `Game` no longer mirrors the tick or the snapshots; the
+simulation owns both, and `tick_once` is just `step`. Pacing moved to the schedule runner. The
+`--listen` help text now states the real default.
+
+### 7.3 Result
+
+Same binary, same seed, same workload, before and after (`--bots N --duration 3`, release):
+
+| | 32 bots before | 32 bots after | 256 bots before | 256 bots after |
+| --- | --- | --- | --- | --- |
+| `ms_per_tick` | 0.038 | **0.039** | 1.963 | **0.993** |
+| `solve_us_per_tick` | 31.4 | **27.5** | 1909.0 | **904.5** |
+| `pairs_last_tick` | 85 | 85 | 876 | 876 |
+| `corrections` | 5293 | 5293 | 45 929 | 45 929 |
+| `headroom_x` | 435.8 | 427.5 | 8.5 | **16.8** |
+
+The identical `pairs` and `corrections` counts are the point: this was a data-layout change, not a
+behaviour change. At 32 bots the tick was dominated by fixed per-tick bookkeeping, so it lands within
+noise; at 256 bots — where the per-player allocations and the tree walks actually bite — the tick
+halved, and the remaining 904 µs is the solver doing real work, not overhead.
+
+### 7.4 The allocation guard
+
+`crates/sim/tests/allocations.rs` installs a counting `GlobalAlloc` and asserts that **64 consecutive
+steady-state ticks allocate zero times** with 16 players in eight touching pairs. The fixture is built
+so that bodies never move (pairs exist, penetration is zero), which removes grid-window growth from the
+measurement. The test also asserts the warm-up *did* allocate, so a dead counter cannot pass.
+
+This is a regression test, not a benchmark: it fails the moment someone adds a `vec![]`, a `collect()`
+or a `clone()` of a heap value to `Simulation::step`.
+
+### 7.5 Multithreading and asynchrony: what is true, and what is not
+
+Claims that are true:
+
+- The UDP endpoint is **non-blocking** (`set_nonblocking(true)` on the socket); no system ever waits
+  on the network.
+- Receive buffers are **pooled** by lightyear; a steady-state tick does not allocate for I/O.
+- The I/O layer runs as an **async** task on the Bevy task pool (`multi_threaded` + `async_executor`
+  features are enabled), so socket work is not on the tick thread.
+- The process is **multi-threaded**: Bevy's multi-threaded executor distributes systems across the
+  task pool.
+
+Claim that would be false, and is therefore not made: **the authoritative tick itself is
+single-threaded, deliberately.** Determinism is a stated requirement (ADR 013: fixed `dt`, tie-broken
+iteration order), and the tick now costs 0.99 ms of a 16.67 ms budget at 256 players. Note also that
+`ingest`, `drive` and `dispatch` all take `ResMut<GameRes>`, so the executor serialises them by
+construction — that conflict *is* the design, not an oversight.
+
+Where parallelism goes next, in the order it should be tried:
+
+1. **Snapshot build per player** — embarrassingly parallel once each worker owns its own peer window.
+   Cheap to verify: `ServerSnapshot` order is already deterministic.
+2. **Broadphase per cell** — split the cell range across workers; the counting sort gives a natural
+   boundary and the pair list can be merged in cell order.
+3. **Solve per body range** — bin pairs by body, solve bins in parallel, then apply. This is where the
+   time actually is (~90 % of the tick at 256 players), and it is the only one with a real design cost:
+   sequential impulses across a bin boundary are not the same as a global pass, so it changes results
+   and needs its own determinism test.
+
+The incremental spatial update that §2.1 suggested as the way to "buy CPU back" turned out not to be
+first: the grid is a small fraction of the tick, and a counting sort over a reused buffer is already
+cheap. It stays on the list for when the player count makes the rebuild visible again.
+
+### 7.6 Known remaining allocation/blocking sites
+
+Honest list, so the next review does not have to rediscover them:
+
+- `Peers` keeps three `HashMap`s and allocates on admission, rebind and eviction — per packet and per
+  event, not per tick. `evict_silent` now reuses a scratch `Vec` per frame instead of allocating one.
+- `Simulation::slots` grows on join and never shrinks; that is intentional (no rehash churn), but it
+  means the map is sized for the peak concurrent population.
+- Lightyear serialises outgoing messages into its own buffers; that cost is inside
+  `MessageSender::send` and is not covered by the allocation guard.
+- `std::net::UdpSocket::bind` probe in `main` is a one-shot startup check, not a hot path.

@@ -4,11 +4,15 @@
 //! nesting beyond one repeated array. A client packet costs about 60 bytes,
 //! a server snapshot about 30 + 15 bytes per peer.
 
+use core::fmt;
+
 use crate::{
     MAX_INPUT_FRAMES, Tick, dequantise_normal, dequantise_position, quantise_normal,
     quantise_position,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const KIND_PLAYER_MOVEMENT: u8 = 1;
 pub const KIND_SERVER_SNAPSHOT: u8 = 2;
@@ -139,7 +143,7 @@ impl PlayerMovementPacket {
 
 /// A replicated collider. The client feeds these into its own solver instead of
 /// waiting for the server to move it.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PeerCollider {
     pub player: u64,
     pub position: [f32; 3],
@@ -149,6 +153,14 @@ pub struct PeerCollider {
 
 impl PeerCollider {
     const SIZE: usize = 8 + 12 + 2 + 1;
+
+    /// Neutral value used to fill the tail of a [`PeerList`].
+    pub const EMPTY: Self = Self {
+        player: 0,
+        position: [0.0; 3],
+        body_yaw: 0.0,
+        mode: peer_mode::NONE,
+    };
 
     fn write(&self, w: &mut crate::Writer) {
         w.u64(self.player);
@@ -173,6 +185,118 @@ impl PeerCollider {
             body_yaw,
             mode,
         })
+    }
+}
+
+/// Inline, fixed-capacity peer list.
+///
+/// The server builds one of these per player per tick, so a `Vec` here would be
+/// a heap allocation in the hot loop. The cap is also the wire budget
+/// ([`MAX_SNAPSHOT_PEERS`]), so nothing is lost: the encoder never wrote more
+/// than that anyway. Because it is inline, [`ServerSnapshot`] is `Copy` and can
+/// be handed to the network layer without cloning.
+///
+/// The `serde` representation is a plain sequence of colliders, byte-identical
+/// to the `Vec` this replaced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PeerList {
+    items: [PeerCollider; MAX_SNAPSHOT_PEERS],
+    len: u8,
+}
+
+impl PeerList {
+    pub const CAPACITY: usize = MAX_SNAPSHOT_PEERS;
+
+    pub const fn new() -> Self {
+        Self {
+            items: [PeerCollider::EMPTY; MAX_SNAPSHOT_PEERS],
+            len: 0,
+        }
+    }
+
+    /// Appends a collider. Returns `false` when the list is already full, so a
+    /// caller that must not silently drop peers can notice.
+    pub fn push(&mut self, peer: PeerCollider) -> bool {
+        let Some(slot) = self.items.get_mut(self.len as usize) else {
+            return false;
+        };
+        *slot = peer;
+        self.len += 1;
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[PeerCollider] {
+        &self.items[..self.len as usize]
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'_, PeerCollider> {
+        self.as_slice().iter()
+    }
+}
+
+impl Default for PeerList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FromIterator<PeerCollider> for PeerList {
+    /// Convenience for construction sites (tests, fixtures). Overflow is a
+    /// programming error here rather than wire input, so it panics.
+    fn from_iter<I: IntoIterator<Item = PeerCollider>>(iter: I) -> Self {
+        let mut out = Self::new();
+        for peer in iter {
+            assert!(out.push(peer), "more than {} peers", MAX_SNAPSHOT_PEERS);
+        }
+        out
+    }
+}
+
+impl Serialize for PeerList {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.len()))?;
+        for peer in self.iter() {
+            seq.serialize_element(peer)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerList {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ListVisitor;
+
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = PeerList;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "at most {MAX_SNAPSHOT_PEERS} peer colliders")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<PeerList, A::Error> {
+                let mut out = PeerList::new();
+                while let Some(peer) = seq.next_element::<PeerCollider>()? {
+                    if !out.push(peer) {
+                        return Err(de::Error::custom("too many peer colliders"));
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        d.deserialize_seq(ListVisitor)
     }
 }
 
@@ -238,14 +362,14 @@ impl CollisionCorrection {
 }
 
 /// Server→client.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerSnapshot {
     pub server_tick: Tick,
     pub acked_seq: u16,
     /// Server shadow position. Informational: the client must not adopt it.
     pub shadow_position: [f32; 3],
     pub correction: Option<CollisionCorrection>,
-    pub peers: Vec<PeerCollider>,
+    pub peers: PeerList,
 }
 
 impl ServerSnapshot {
@@ -264,9 +388,9 @@ impl ServerSnapshot {
             }
             None => w.u8(0),
         }
-        let n = self.peers.len().min(MAX_SNAPSHOT_PEERS);
+        let n = self.peers.len();
         w.u8(n as u8);
-        for p in self.peers.iter().take(n) {
+        for p in self.peers.iter() {
             p.write(&mut w);
         }
         w.finish()
@@ -290,9 +414,11 @@ impl ServerSnapshot {
             None
         };
         let n = r.count(MAX_SNAPSHOT_PEERS)?;
-        let mut peers = Vec::with_capacity(n);
+        let mut peers = PeerList::new();
         for _ in 0..n {
-            peers.push(PeerCollider::read(&mut r)?);
+            let peer = PeerCollider::read(&mut r)?;
+            // `count` already capped `n` at the list capacity.
+            let _ = peers.push(peer);
         }
         Ok(Self {
             server_tick,
@@ -357,17 +483,18 @@ mod tests {
             acked_seq: 3,
             shadow_position: [1.0, 0.0, 2.0],
             correction: None,
-            peers: vec![PeerCollider {
+            peers: core::iter::once(PeerCollider {
                 player: 1,
                 position: [0.1, 0.2, 0.3],
                 body_yaw: 0.5,
                 mode: peer_mode::SOFT,
-            }],
+            })
+            .collect(),
         };
         let back = ServerSnapshot::decode(&empty.encode()).unwrap();
         assert!(back.correction.is_none());
         assert_eq!(back.peers.len(), 1);
-        assert_eq!(back.peers[0].mode, peer_mode::SOFT);
+        assert_eq!(back.peers.as_slice()[0].mode, peer_mode::SOFT);
 
         let with = ServerSnapshot {
             correction: Some(CollisionCorrection {
@@ -377,7 +504,7 @@ mod tests {
                 velocity_delta: [0.5, 0.0, -0.25],
                 hard_normal: Some([1.0, 0.0, 0.0]),
             }),
-            ..empty.clone()
+            ..empty
         };
         let back = ServerSnapshot::decode(&with.encode()).unwrap();
         let c = back.correction.expect("correction survives");
@@ -385,6 +512,37 @@ mod tests {
         assert_eq!(c.epoch, 7);
         assert!((c.velocity_delta[0] - 0.5).abs() < 1e-3);
         assert!(c.hard_normal.is_some());
+    }
+
+    #[test]
+    fn a_full_peer_list_is_carried_whole_and_an_overfull_one_cannot_be_built() {
+        let full: PeerList = (0..MAX_SNAPSHOT_PEERS as u64)
+            .map(|i| PeerCollider {
+                player: i + 1,
+                position: [i as f32, 0.9, 0.0],
+                body_yaw: 0.0,
+                mode: peer_mode::SOFT,
+            })
+            .collect();
+        assert_eq!(full.len(), MAX_SNAPSHOT_PEERS);
+
+        let snap = ServerSnapshot {
+            peers: full,
+            ..Default::default()
+        };
+        let back = ServerSnapshot::decode(&snap.encode()).unwrap();
+        assert_eq!(back.peers, full, "last peer was truncated on the wire");
+
+        // Capacity is enforced at insertion, so an overfull list cannot exist.
+        let mut list = full;
+        assert!(
+            !list.push(PeerCollider {
+                player: 99,
+                ..PeerCollider::EMPTY
+            }),
+            "peer list grew past its capacity"
+        );
+        assert_eq!(list.len(), MAX_SNAPSHOT_PEERS);
     }
 
     #[test]

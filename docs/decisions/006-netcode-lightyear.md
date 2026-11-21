@@ -86,7 +86,7 @@ KCC, which is exactly what a stock state-copy prediction would get wrong.
 
 Acceptance: the live round trip passes through Lightyear, the headless invariant script produces
 the same `peak_y`/`deterministic` result, and the bot benchmark still fits the tick budget.
-The first clause is green today (`cargo test --workspace` = 33 tests, plus the live check).
+The first clause is green today (`cargo test --workspace` = 39 tests, plus the live check).
 
 ## Open questions
 

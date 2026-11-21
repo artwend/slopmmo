@@ -4,7 +4,7 @@
 //!
 //! * `--bots N --duration S` — no sockets, N deterministic bots, metrics on
 //!   exit. This is the CI target.
-//! * `--listen 0.0.0.0:4000` — UDP through lightyear, snapshots back to clients.
+//! * `--listen 127.0.0.1:4000` — UDP through lightyear, snapshots back to clients.
 //!
 //! The server never owns terrain and never rewinds. See
 //! `docs/architecture-review.md` for why.
@@ -13,8 +13,9 @@ mod bots;
 mod transport;
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 
 use sim::authority::{SimConfig, Simulation};
@@ -33,10 +34,7 @@ pub struct Game {
     pub sim: Simulation,
     pub world: StaticWorld,
     pub move_params: MoveParams,
-    pub tick: proto::Tick,
     pub accumulator: f32,
-    /// `(player, snapshot)` from the most recent completed tick.
-    pub last_snapshots: Vec<(u64, proto::ServerSnapshot)>,
     /// Set by a tick, cleared once the snapshots have been sent. Without this the
     /// network system would re-send the same snapshot on every frame.
     pub snapshots_pending: bool,
@@ -54,9 +52,7 @@ impl Game {
             sim: Simulation::new(SimConfig::default()),
             world: StaticWorld::test_room(),
             move_params: MoveParams::default(),
-            tick: proto::Tick::ZERO,
             accumulator: 0.0,
-            last_snapshots: Vec::new(),
             snapshots_pending: false,
         }
     }
@@ -79,12 +75,9 @@ impl Game {
     }
 
     fn tick_once(&mut self) {
-        self.tick = self.tick.add(1);
-        let ids: Vec<u64> = self.sim.players.keys().copied().collect();
-        let snaps = self.sim.step(&self.world);
-        self.last_snapshots.clear();
-        self.last_snapshots
-            .extend(snaps.into_iter().zip(ids).map(|(s, id)| (id, s)));
+        // `Simulation::step` owns the tick counter and writes the snapshots into
+        // its own buffer, so this is the whole fixed step.
+        self.sim.step(&self.world);
         self.snapshots_pending = true;
     }
 }
@@ -101,7 +94,7 @@ fn main() {
     }
 
     let mut app = App::new();
-    app.add_plugins(MinimalPlugins)
+    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))))
         .add_plugins(bevy::log::LogPlugin::default())
         .configure_sets(
             Update,
@@ -130,11 +123,10 @@ fn main() {
 }
 
 fn drive(time: Res<Time>, mut game: ResMut<GameRes>) {
-    let ran = game.0.advance(time.delta_secs(), 8);
-    if ran == 0 {
-        // Let the runner idle instead of spinning on an empty frame.
-        std::thread::sleep(std::time::Duration::from_micros(500));
-    }
+    // No sleeping in here: the schedule runner owns the frame pacing (see
+    // `ScheduleRunnerPlugin::run_loop` in `main`), so this system either does
+    // work or returns immediately.
+    game.0.advance(time.delta_secs(), 8);
 }
 
 /// Deterministic N-bot soak test. Prints a machine-readable summary.
@@ -154,20 +146,22 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
     let mut solve_ns: u128 = 0;
 
     for _ in 0..total_ticks {
-        game.tick = game.tick.add(1);
+        // `step` advances the tick; hand the bots the tick they are reporting
+        // for, exactly as the old driver did.
+        let tick = game.sim.tick.add(1);
 
         for bot in roster.iter_mut() {
-            let input = bot.input(game.tick, &mut rng);
+            let input = bot.input(tick, &mut rng);
             let (pos, vel) = bot.predict(&game.world, &game.move_params, &input, proto::TICK_DT);
             bot.pos = pos;
             bot.vel = vel;
             bot.grounded = vel.y <= 0.0;
 
             let packet = proto::PlayerMovementPacket {
-                seq: (game.tick.0 & 0xFFFF) as u16,
+                seq: (tick.0 & 0xFFFF) as u16,
                 player: bot.id,
                 report: proto::MovementReport {
-                    tick: game.tick,
+                    tick,
                     position: pos.to_array(),
                     velocity: vel.to_array(),
                     body_yaw: 0.0,
@@ -252,7 +246,7 @@ impl Args {
                         "usage: server [--bots N --duration S] [--listen ADDR]\n\
                          \n  --bots N        run N deterministic bots, no sockets, print metrics\n\
                          \n  --duration S    bot benchmark length in seconds (default 10)\n\
-                         \n  --listen ADDR   UDP bind address (default 0.0.0.0:4000)\n"
+                         \n  --listen ADDR   UDP bind address (default 127.0.0.1:4000)\n"
                     );
                     std::process::exit(0);
                 }
@@ -280,13 +274,13 @@ mod tests {
         for _ in 0..6 {
             b.advance(1.0 / 6.0, 16);
         }
-        assert!(a.tick.0 >= 59, "too few ticks: {}", a.tick.0);
+        assert!(a.sim.tick.0 >= 59, "too few ticks: {}", a.sim.tick.0);
         // f32 accumulation can land one tick either side of the exact second.
         assert!(
-            a.tick.0.abs_diff(b.tick.0) <= 1,
+            a.sim.tick.0.abs_diff(b.sim.tick.0) <= 1,
             "accumulator drifted: a={} b={}",
-            a.tick.0,
-            b.tick.0
+            a.sim.tick.0,
+            b.sim.tick.0
         );
     }
 

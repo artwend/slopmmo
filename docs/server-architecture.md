@@ -106,7 +106,7 @@ The unit of deployment. One process, N cores, one tick loop.
  tick n (fixed 1/60 s)
   1 drain input      map client tick → server tick, drop stale/duplicate  ── O(packets)
   2 movement update  integrate intent, apply reports as shadow base       ── O(players)
-  3 spatial rebuild  uniform hash over player/boss colliders              ── O(players)
+  3 spatial rebuild  counting-sort rebuild of the uniform grid, buffers reused ── O(players)
   4 broadphase       nearest K within radius, pair dedup                  ── O(players·K)
   5 policy           per-pair mode: none / soft / hard                    ── O(pairs)
   6 solver           inelastic capsules, budgeted vector-sum correction   ── O(pairs)
@@ -122,6 +122,7 @@ Invariants:
   combat design (ADR 013).
 - Extrapolation is bounded by `REPORT_WINDOW` (30 ticks), then the actor is frozen.
 - Everything is deterministic: fixed `dt`, tie-broken iteration order, no wall-clock input.
+- The steady state **does not allocate** and does not block. See §3.5.
 
 ### 3.2 Collision profiles (ADR 009, ADR 010)
 
@@ -159,6 +160,30 @@ once.
 Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s; server ≈ 28 B + 23 B per peer per
 snapshot → 1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope
 and are the reason AOI exists.
+
+### 3.5 Data layout and allocation discipline
+
+The eight phases above are one linear pass over contiguous memory, and that is a requirement rather
+than an accident (see `architecture-review.md` §7 for the audit that got here).
+
+| Structure | Layout | Why |
+| --- | --- | --- |
+| Players | dense `Vec<ServerPlayer>` + `HashMap<u64, u32>` slot map | the tick walks everyone in order; ids are only needed on join, leave and ingest. `swap_remove` keeps it dense |
+| Spatial grid | CSR: flat `items` ordered by cell + `starts` prefix table + `cursor` scatter buffer | counting sort instead of hashing; no per-cell `Vec`; buffers reused every rebuild |
+| Broadphase / solver | `PairScratch` owned by the simulation | four `Vec`s and an `Impulse` array that never reallocate after the first tick |
+| Snapshots | `Vec<(u64, ServerSnapshot)>` owned by the simulation, peers inline (`PeerList`) | `ServerSnapshot` is `Copy`, so the transport sends a copy instead of cloning a heap vector |
+| AOI peer selection | inline `[(f32, usize); 16]` window per player | no per-player `Vec`, no per-player sort |
+
+`crates/sim/tests/allocations.rs` guards this: a counting global allocator asserts that 64
+steady-state ticks perform zero allocations. A `vec![]`, a `collect()` or a heap `clone()` added to
+the tick fails that test.
+
+Concurrency, stated precisely: the UDP endpoint is non-blocking and lightyear pools its receive
+buffers, the I/O layer runs as an async task on Bevy's task pool, and Bevy's executor is
+multi-threaded — but the tick itself is single-threaded on purpose. Determinism is an invariant
+(ADR 013), and the tick costs ~1 ms of a 16.67 ms budget at 256 players. `ingest`, `drive` and
+`dispatch` all take `ResMut<GameRes>`, so the executor serialises them by construction; that conflict
+is the design, not a missed optimisation.
 
 ---
 
@@ -234,12 +259,16 @@ create → auth → character select → place in zone instance → play → han
 | Report window | 30 ticks (0.5 s) | `proto::REPORT_WINDOW` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.042 ms at 32 bots | `server --bots 32` |
+| Measured tick cost | 0.039 ms at 32 bots, 0.993 ms at 256 bots | `server --bots N --duration 3` |
+| Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
-The 10 000-player target is **not** demonstrated by these numbers. 0.042 ms at 32 players is
+The 10 000-player target is **not** demonstrated by these numbers. 0.039 ms at 32 players is
 linear-ish in the solver only; the unmeasured parts are replication bandwidth, AOI building and
-handoff. Treat the target as a constraint that shapes the design, not as a result.
+handoff. Treat the target as a constraint that shapes the design, not as a result. The 32-bot figure
+is also dominated by fixed per-tick bookkeeping, which is why it barely moved when the data layout
+was rewritten — the 256-bot column is the one that reflects the layout (see
+`architecture-review.md` §7.3).
 
 ---
 
@@ -250,7 +279,8 @@ handoff. Treat the target as a constraint that shapes the design, not as a resul
 | Fixed 60 Hz tick, eight phases | Implemented (phases collapsed) |
 | Client KCC + peer collision | Implemented |
 | Server shadow + validation | Implemented |
-| Spatial hash, K = 8, pair cap | Implemented |
+| Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
+| Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |
 | Correction protocol with `(seq, tick, epoch)` | Implemented |
 | Lightyear UDP transport with admission, timeout, orphan release | Implemented |
 | Per-player clock offset mapping | Implemented |

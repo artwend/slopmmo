@@ -68,12 +68,15 @@ Consequences that are enforced in code, not just documented:
   are metrics and cheat signals.
 - **Terrain is client-side**, so a boss-vs-terrain contact that only the client can see is
   reported as a hard contact rather than resolved server-side.
+- **The tick does not allocate.** The grid, the solver scratch and the snapshot buffer are owned and
+  reused, and `crates/sim/tests/allocations.rs` fails the build if a tick starts allocating
+  (`docs/architecture-review.md` §7).
 
 ## Build, test, run
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 33 tests: proto, net, sim, server, client
+cargo test --workspace          # 39 tests: proto, net, sim, server, client
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -101,21 +104,28 @@ end, and the script was not truncated by `--seconds` (default 30, a safety cap).
 
 ```sh
 cargo run --release -p server -- --bots 32 --duration 5
+cargo run --release -p server -- --bots 256 --duration 5
 ```
 
-32 bots, no sockets, deterministic seed. One machine's numbers, for scale only:
+Deterministic seed, no sockets. One machine's numbers, for scale only:
 
 ```
-ticks             300
-ms_per_tick       0.040
-solve_us_per_tick 28.8
-pairs_last_tick   110
-corrections       9010
-headroom_x        416.3
+                   32 bots     256 bots
+ticks              300         300
+ms_per_tick        0.042       1.004
+solve_us_per_tick  30.7        915.9
+pairs_last_tick    110         890
+corrections        9010        76456
+headroom_x         400.3       16.6
 ```
 
 `headroom_x` is how many times over the tick budget is met at this bot count. Treat it as "the
 solver is not the bottleneck yet", not as a benchmark.
+
+The 32-bot column barely moves between builds because fixed per-tick bookkeeping dominates it; the
+256-bot column is the one that responds to the data layout. The review pass in
+`docs/architecture-review.md` §7 halved it (1.96 ms → 1.00 ms per tick) and left `pairs` and
+`corrections` bit-identical.
 
 ### Live round trip
 

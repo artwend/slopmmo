@@ -6,11 +6,11 @@
 //! alone. Nothing here rewinds, and nothing here is "authoritative movement" —
 //! the review calls that out explicitly.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use bevy_math::Vec3;
 
-use crate::collision::{self, Body, Impulse, Mode, Pair};
+use crate::collision::{self, Body, Mode, PairScratch};
 use crate::movement::{self, MoveParams};
 use crate::spatial::SpatialGrid;
 use crate::world::StaticWorld;
@@ -118,15 +118,39 @@ impl ServerPlayer {
     }
 }
 
+/// Per-tick buffers.
+///
+/// The tick runs sixty times a second and is the only thing in the process that
+/// touches every player, so it owns its working memory instead of allocating it.
+/// After the first tick with a given player count, [`Simulation::step`] does not
+/// call the allocator at all.
+#[derive(Default)]
+struct Scratch {
+    bodies: Vec<Body>,
+    positions: Vec<Vec3>,
+    pairs: PairScratch,
+}
+
+/// Authoritative state.
+///
+/// Players live in a dense `Vec` and are addressed by slot, with `slots` mapping
+/// id → slot for the two places that only know an id (ingest, add/remove). The
+/// tick itself walks the array in order, which is what makes it cache friendly:
+/// one linear pass, no tree traversal, no pointer chasing, and the shadow state
+/// of adjacent players lands in adjacent cache lines.
 pub struct Simulation {
     pub config: SimConfig,
     pub stats: SimStats,
     pub tick: proto::Tick,
-    pub players: BTreeMap<u64, ServerPlayer>,
     pub blockers: Vec<Body>,
+    players: Vec<ServerPlayer>,
+    /// `id → index into ↓players`. Only touched on join, leave and ingest.
+    slots: HashMap<u64, u32>,
     grid: SpatialGrid,
-    positions: Vec<Vec3>,
-    ids: Vec<u64>,
+    scratch: Scratch,
+    /// `(player, snapshot)` for the most recent tick, in the same order as
+    /// `players`, so the driver can pair them without a second allocation.
+    snapshots: Vec<(u64, proto::ServerSnapshot)>,
 }
 
 impl Simulation {
@@ -135,22 +159,73 @@ impl Simulation {
             config,
             stats: SimStats::default(),
             tick: proto::Tick::ZERO,
-            players: BTreeMap::new(),
             blockers: Vec::new(),
+            players: Vec::new(),
+            slots: HashMap::new(),
             grid: SpatialGrid::new(proto::NEIGHBOUR_RADIUS * 2.0),
-            positions: Vec::new(),
-            ids: Vec::new(),
+            scratch: Scratch::default(),
+            snapshots: Vec::new(),
         }
     }
 
+    pub fn players(&self) -> &[ServerPlayer] {
+        &self.players
+    }
+
+    pub fn players_mut(&mut self) -> &mut [ServerPlayer] {
+        &mut self.players
+    }
+
+    pub fn player(&self, id: u64) -> Option<&ServerPlayer> {
+        self.slots
+            .get(&id)
+            .map(|&slot| &self.players[slot as usize])
+    }
+
+    pub fn player_mut(&mut self, id: u64) -> Option<&mut ServerPlayer> {
+        // Copy the slot out first: the map borrow must not outlive the body borrow.
+        let slot = *self.slots.get(&id)?;
+        Some(&mut self.players[slot as usize])
+    }
+
+    pub fn contains_player(&self, id: u64) -> bool {
+        self.slots.contains_key(&id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.players.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.players.is_empty()
+    }
+
+    /// Snapshots produced by the last [`Self::step`], paired with their player.
+    pub fn snapshots(&self) -> &[(u64, proto::ServerSnapshot)] {
+        &self.snapshots
+    }
+
     pub fn add_player(&mut self, id: u64, pos: Vec3) -> &mut ServerPlayer {
-        self.players
-            .entry(id)
-            .or_insert_with(|| ServerPlayer::new(id, pos))
+        let slot = match self.slots.get(&id) {
+            Some(&slot) => slot as usize,
+            None => {
+                let slot = self.players.len() as u32;
+                self.players.push(ServerPlayer::new(id, pos));
+                self.slots.insert(id, slot);
+                slot as usize
+            }
+        };
+        &mut self.players[slot]
     }
 
     pub fn remove_player(&mut self, id: u64) -> Option<ServerPlayer> {
-        self.players.remove(&id)
+        let slot = self.slots.remove(&id)? as usize;
+        let removed = self.players.swap_remove(slot);
+        // The tail body now occupies the vacated slot; re-point its id at it.
+        if let Some(moved) = self.players.get(slot) {
+            self.slots.insert(moved.id, slot as u32);
+        }
+        Some(removed)
     }
 
     /// Adds an immovable collider (boss body, destructible scenery, NPC).
@@ -170,13 +245,24 @@ impl Simulation {
     /// of silently clamping — a reject rate is a cheat signal and an
     /// instrumentation metric, not an error to hide.
     pub fn ingest(&mut self, packet: &proto::PlayerMovementPacket) -> Result<(), Reject> {
-        let Some(player) = self.players.get_mut(&packet.player) else {
+        // Field-disjoint borrows: the hot validator below needs the player, the
+        // clock and the counters at the same time.
+        let Self {
+            config,
+            stats,
+            tick,
+            players,
+            slots,
+            ..
+        } = self;
+        let Some(slot) = slots.get(&packet.player).copied() else {
             return Err(Reject::UnknownPlayer);
         };
+        let player = &mut players[slot as usize];
 
         // Wrap-aware monotonic sequence. Equal or older is a duplicate retransmit.
         if packet.seq <= player.last_seq && player.last_seq.wrapping_sub(packet.seq) < 0x8000 {
-            self.stats.duplicate += 1;
+            stats.duplicate += 1;
             return Err(Reject::DuplicateSeq);
         }
 
@@ -188,22 +274,22 @@ impl Simulation {
         // it forever. Replays are the sequence number's job, not the tick's.
         let offset = player
             .tick_offset
-            .get_or_insert(self.tick.0.wrapping_sub(report.tick.0));
+            .get_or_insert(tick.0.wrapping_sub(report.tick.0));
         let mapped = proto::Tick::new(report.tick.0.wrapping_add(*offset));
-        if self.tick.is_stale(mapped, self.config.report_window) {
+        if tick.is_stale(mapped, config.report_window) {
             // Mapped into the future: the client's clock was paused, hitched or
             // restarted. Re-anchor rather than stalling it forever — the sequence
             // number and the displacement check still bound what it can claim.
-            *offset = self.tick.0.wrapping_sub(report.tick.0);
-        } else if mapped.is_stale(self.tick, self.config.report_window) {
-            self.stats.stale += 1;
+            *offset = tick.0.wrapping_sub(report.tick.0);
+        } else if mapped.is_stale(*tick, config.report_window) {
+            stats.stale += 1;
             return Err(Reject::StaleTick);
         }
 
         let vel = Vec3::from_array(report.velocity);
-        let max_v = proto::MAX_SPEED * self.config.speed_slack * 1.6;
+        let max_v = proto::MAX_SPEED * config.speed_slack * 1.6;
         if !vel.is_finite() || vel.length() > max_v {
-            self.stats.too_fast += 1;
+            stats.too_fast += 1;
             return Err(Reject::TooFast);
         }
 
@@ -215,11 +301,11 @@ impl Simulation {
             return Err(Reject::Teleport);
         }
         let ticks = report.tick.since(player.last_tick).max(1) as f32;
-        let allowed = proto::MAX_SPEED * self.config.speed_slack * ticks * self.config.dt()
-            + proto::POSITION_SLACK;
+        let allowed =
+            proto::MAX_SPEED * config.speed_slack * ticks * config.dt() + proto::POSITION_SLACK;
         let travelled = (pos - player.pos).length();
         if travelled > allowed {
-            self.stats.teleport += 1;
+            stats.teleport += 1;
             return Err(Reject::Teleport);
         }
 
@@ -230,46 +316,62 @@ impl Simulation {
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
 
-        self.stats.accepted += 1;
+        stats.accepted += 1;
         Ok(())
     }
 
-    /// One authoritative collision tick. Returns one snapshot per player.
-    pub fn step(&mut self, world: &StaticWorld) -> Vec<proto::ServerSnapshot> {
+    /// One authoritative collision tick.
+    ///
+    /// Snapshots are written into the session's own buffer ([`Self::snapshots`])
+    /// rather than returned, so the tick does not allocate. The whole pass is
+    /// linear over a dense array: build bodies, rebuild the grid, build pairs,
+    /// solve, write snapshots.
+    pub fn step(&mut self, world: &StaticWorld) {
         self.tick = self.tick.add(1);
         let dt = self.config.dt();
 
-        self.ids.clear();
-        self.ids.extend(self.players.keys().copied());
+        // Destructure so the buffers can be borrowed field-disjointly: the
+        // bodies slice and the scratch buffers are all part of `self`.
+        let Self {
+            config,
+            stats,
+            tick,
+            blockers,
+            players,
+            grid,
+            scratch,
+            snapshots,
+            ..
+        } = self;
+        let Scratch {
+            bodies,
+            positions,
+            pairs,
+        } = scratch;
 
-        let mut bodies: Vec<Body> = Vec::with_capacity(self.ids.len() + self.blockers.len());
-        for id in &self.ids {
-            let p = &self.players[id];
-            bodies.push(p.body(Mode::Soft));
-        }
-        bodies.extend(self.blockers.iter().copied());
+        bodies.clear();
+        bodies.reserve(players.len() + blockers.len());
+        bodies.extend(players.iter().map(|p| p.body(Mode::Soft)));
+        bodies.extend(blockers.iter().copied());
 
-        self.positions.clear();
-        self.positions.extend(bodies.iter().map(|b| b.pos));
+        positions.clear();
+        positions.extend(bodies.iter().map(|b| b.pos));
 
-        self.grid.rebuild(&self.positions);
-        let pairs: Vec<Pair> = collision::build_pairs(
-            &bodies,
-            &self.grid,
-            &self.positions,
-            self.config.neighbour_limit,
-            self.config.pairs_per_body,
+        grid.rebuild(positions);
+        pairs.build(
+            bodies,
+            grid,
+            positions,
+            config.neighbour_limit,
+            config.pairs_per_body,
         );
-        self.stats.pairs = pairs.len() as u32;
+        stats.pairs = pairs.pairs().len() as u32;
 
-        let impulses = collision::solve(&bodies, &pairs, self.config.correction_budget);
+        pairs.solve(bodies, config.correction_budget);
+        let impulses = pairs.impulses();
 
         let mut hard = 0u32;
-        for (i, id) in self.ids.iter().enumerate() {
-            let imp = impulses[i];
-            let Some(p) = self.players.get_mut(id) else {
-                continue;
-            };
+        for (p, imp) in players.iter_mut().zip(impulses) {
             p.budget_used = imp.delta_v.length();
             if imp.delta_v != Vec3::ZERO {
                 p.vel += imp.delta_v;
@@ -281,83 +383,21 @@ impl Simulation {
                 hard += 1;
             }
         }
-        self.stats.hard_contacts = hard;
+        stats.hard_contacts = hard;
 
         // Terrain authority is the client's, but a blocker's capsule still has
         // to not swallow the shadow: nudge anything inside a blocker outward.
-        self.push_out_of_blockers(world, dt);
+        push_out_of_blockers(players, world, dt);
 
-        self.build_snapshots(&bodies, &impulses)
-    }
-
-    fn push_out_of_blockers(&mut self, _world: &StaticWorld, _dt: f32) {
-        // Intentional no-op for the first milestone: blockers are static and
-        // already placed outside the test room's walkable area. Real blocker
-        // depenetration lands together with the boss controller.
-    }
-
-    fn build_snapshots(
-        &mut self,
-        bodies: &[Body],
-        impulses: &[Impulse],
-    ) -> Vec<proto::ServerSnapshot> {
-        let mut out = Vec::with_capacity(self.ids.len());
-
-        for (i, id) in self.ids.iter().enumerate() {
-            let imp = impulses[i];
-            let Some(p) = self.players.get_mut(id) else {
-                continue;
-            };
-
-            let correction = if imp.delta_v != Vec3::ZERO {
-                p.correction_seq = p.correction_seq.wrapping_add(1);
-                p.last_correction_tick = Some(self.tick);
-                self.stats.corrections += 1;
-                Some(proto::CollisionCorrection {
-                    seq: p.correction_seq,
-                    tick: self.tick,
-                    epoch: self.config.epoch,
-                    velocity_delta: imp.delta_v.to_array(),
-                    hard_normal: imp.hard_normal.map(|n| n.to_array()),
-                })
-            } else {
-                None
-            };
-
-            // AOI peers: nearest colliders within the neighbour radius, capped.
-            let mut nearby: Vec<(f32, usize)> = bodies
-                .iter()
-                .enumerate()
-                .filter(|(j, b)| *j != i && b.mode != Mode::None)
-                .filter(|(_, b)| barrier_ok(b, p))
-                .map(|(j, b)| ((b.pos - p.pos).length(), j))
-                .collect();
-            nearby.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-            let peers = nearby
-                .iter()
-                .take(proto::MAX_SNAPSHOT_PEERS)
-                .map(|(_, j)| {
-                    let b = &bodies[*j];
-                    proto::PeerCollider {
-                        player: b.id,
-                        position: b.pos.to_array(),
-                        body_yaw: 0.0,
-                        mode: b.mode.as_wire(),
-                    }
-                })
-                .collect();
-
-            out.push(proto::ServerSnapshot {
-                server_tick: self.tick,
-                acked_seq: p.last_seq,
-                shadow_position: p.pos.to_array(),
-                correction,
-                peers,
-            });
-        }
-
-        out
+        build_snapshots(
+            snapshots,
+            players,
+            bodies,
+            impulses,
+            *tick,
+            config.epoch,
+            stats,
+        );
     }
 
     /// Replays the shadow forward for diagnostics and determinism tests.
@@ -367,7 +407,7 @@ impl Simulation {
         id: u64,
         inputs: &[proto::InputFrame],
     ) -> Vec3 {
-        let Some(p) = self.players.get(&id) else {
+        let Some(p) = self.player(id) else {
             return Vec3::ZERO;
         };
         let mut vel = p.vel;
@@ -380,7 +420,102 @@ impl Simulation {
     }
 }
 
-fn barrier_ok(b: &Body, p: &ServerPlayer) -> bool {
-    let d = ((b.pos.x - p.pos.x).powi(2) + (b.pos.z - p.pos.z).powi(2)).sqrt();
-    d <= proto::NEIGHBOUR_RADIUS * 2.0
+fn push_out_of_blockers(_players: &mut [ServerPlayer], _world: &StaticWorld, _dt: f32) {
+    // Intentional no-op for the first milestone: blockers are static and
+    // already placed outside the test room's walkable area. Real blocker
+    // depenetration lands together with the boss controller.
+}
+
+fn build_snapshots(
+    snapshots: &mut Vec<(u64, proto::ServerSnapshot)>,
+    players: &mut [ServerPlayer],
+    bodies: &[Body],
+    impulses: &[collision::Impulse],
+    tick: proto::Tick,
+    epoch: u32,
+    stats: &mut SimStats,
+) {
+    snapshots.clear();
+    let aoi_radius = proto::NEIGHBOUR_RADIUS * 2.0;
+
+    for (i, p) in players.iter_mut().enumerate() {
+        let imp = impulses[i];
+
+        let correction = if imp.delta_v != Vec3::ZERO {
+            p.correction_seq = p.correction_seq.wrapping_add(1);
+            p.last_correction_tick = Some(tick);
+            stats.corrections += 1;
+            Some(proto::CollisionCorrection {
+                seq: p.correction_seq,
+                tick,
+                epoch,
+                velocity_delta: imp.delta_v.to_array(),
+                hard_normal: imp.hard_normal.map(|n| n.to_array()),
+            })
+        } else {
+            None
+        };
+
+        // AOI peers: nearest colliders within the neighbour radius, capped.
+        // Tracked in a fixed inline window, so this costs no allocation and one
+        // pass over the bodies — no per-player `Vec` and no per-player sort.
+        let mut near: [(f32, usize); proto::MAX_SNAPSHOT_PEERS] =
+            [(f32::INFINITY, usize::MAX); proto::MAX_SNAPSHOT_PEERS];
+        let mut near_len = 0usize;
+        for (j, b) in bodies.iter().enumerate() {
+            if j == i || b.mode == Mode::None {
+                continue;
+            }
+            let d = ((b.pos.x - p.pos.x).powi(2) + (b.pos.z - p.pos.z).powi(2)).sqrt();
+            if d > aoi_radius {
+                continue;
+            }
+            keep_nearest(&mut near, &mut near_len, (d, j));
+        }
+
+        let mut peers = proto::PeerList::new();
+        for &(_, j) in &near[..near_len] {
+            let b = &bodies[j];
+            // The window is capped at the list's capacity by construction.
+            let _ = peers.push(proto::PeerCollider {
+                player: b.id,
+                position: b.pos.to_array(),
+                body_yaw: 0.0,
+                mode: b.mode.as_wire(),
+            });
+        }
+
+        snapshots.push((
+            p.id,
+            proto::ServerSnapshot {
+                server_tick: tick,
+                acked_seq: p.last_seq,
+                shadow_position: p.pos.to_array(),
+                correction,
+                peers,
+            },
+        ));
+    }
+}
+
+/// Keeps the smallest `near.len()` entries of a `(distance, body)` stream,
+/// ordered by `(distance, body index)` so the selection does not depend on the
+/// order the bodies happen to be stored in.
+fn keep_nearest(near: &mut [(f32, usize)], near_len: &mut usize, entry: (f32, usize)) {
+    let cap = near.len();
+    if *near_len == cap {
+        if entry >= near[cap - 1] {
+            return;
+        }
+        near[cap - 1] = entry;
+    } else {
+        near[*near_len] = entry;
+        *near_len += 1;
+    }
+    // Bubble the new entry back into place; at most `cap` swaps.
+    let mut k = *near_len - 1;
+    while k > 0 && near[k - 1] > near[k] {
+        near.swap(k - 1, k);
+        k -= 1;
+    }
 }

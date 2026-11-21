@@ -76,10 +76,163 @@ pub const PENETRATION_BIAS: f32 = 6.0;
 /// resolves over several ticks instead of exploding.
 pub const PENETRATION_BIAS_MAX: f32 = 1.5;
 
-/// Nearest-neighbour candidate search, de-duplicated, capped per player.
+/// Reusable buffers for the broadphase and the solve.
 ///
-/// Both a radius and a count limit are applied: `nearest K` alone would create
-/// contacts across an empty field.
+/// Both run once per tick, so anything allocated inside them is allocated sixty
+/// times a second. Every buffer here keeps its capacity across ticks; after the
+/// first tick the pair build and the solve do not touch the allocator at all.
+#[derive(Clone, Debug, Default)]
+pub struct PairScratch {
+    candidates: Vec<u32>,
+    nearest: Vec<(f32, u32)>,
+    raw: Vec<Pair>,
+    load: Vec<u16>,
+    out: Vec<Pair>,
+    impulses: Vec<Impulse>,
+}
+
+impl PairScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accepted pairs from the last [`Self::build`].
+    pub fn pairs(&self) -> &[Pair] {
+        &self.out
+    }
+
+    /// Per-body velocity deltas from the last [`Self::solve`].
+    pub fn impulses(&self) -> &[Impulse] {
+        &self.impulses
+    }
+
+    /// Nearest-neighbour candidate search, de-duplicated, capped per player.
+    ///
+    /// Both a radius and a count limit are applied: `nearest K` alone would
+    /// create contacts across an empty field.
+    pub fn build(
+        &mut self,
+        bodies: &[Body],
+        grid: &SpatialGrid,
+        positions: &[Vec3],
+        neighbour_limit: usize,
+        pairs_per_body: usize,
+    ) {
+        self.out.clear();
+        self.raw.clear();
+        let search_radius = proto::NEIGHBOUR_RADIUS + proto::PLAYER_RADIUS * 2.0;
+
+        for (i, body) in bodies.iter().enumerate() {
+            if body.mode == Mode::None {
+                continue;
+            }
+            grid.candidates(positions[i], search_radius, &mut self.candidates);
+
+            self.nearest.clear();
+            for &j in &self.candidates {
+                let j = j as usize;
+                if j == i || bodies[j].mode == Mode::None {
+                    continue;
+                }
+                if !vertical_overlap(body, &bodies[j]) {
+                    continue;
+                }
+                let d = horizontal_distance(body.pos, bodies[j].pos);
+                let reach = body.radius + bodies[j].radius;
+                if d > reach + proto::SOFT_MARGIN || d > search_radius {
+                    continue;
+                }
+                // Keep the list sorted and bounded as we go: `nearest K` over a
+                // candidate set of thirty is cheaper to insert into than to sort.
+                insert_nearest(&mut self.nearest, (d, j as u32), neighbour_limit);
+            }
+
+            for &(d, j) in &self.nearest {
+                // Each contact is discovered from both sides; keep the one where
+                // the scanning body has the lower index so the list is
+                // de-duplicated.
+                if (i as u32) > j {
+                    continue;
+                }
+                let (lo, hi) = if (i as u32) < j {
+                    (i as u32, j)
+                } else {
+                    (j, i as u32)
+                };
+                let a = &bodies[lo as usize];
+                let b = &bodies[hi as usize];
+                let delta = b.pos - a.pos;
+                let horizontal = Vec3::new(delta.x, 0.0, delta.z);
+                let len = horizontal.length();
+                // Perfectly coincident centres: pick a deterministic direction.
+                let normal = if len > 1e-4 {
+                    horizontal / len
+                } else {
+                    Vec3::new(1.0, 0.0, 0.0)
+                };
+                let reach = a.radius + b.radius;
+                self.raw.push(Pair {
+                    a: lo,
+                    b: hi,
+                    normal,
+                    distance: d,
+                    penetration: (reach - d).max(0.0),
+                    mode: contact_mode(a, b),
+                });
+            }
+        }
+
+        // Deepest first, then id order: stable and independent of cell order.
+        self.raw.sort_by(|x, y| {
+            y.penetration
+                .total_cmp(&x.penetration)
+                .then(x.a.cmp(&y.a))
+                .then(x.b.cmp(&y.b))
+        });
+
+        self.load.clear();
+        self.load.resize(bodies.len(), 0);
+        self.out.reserve(self.raw.len());
+        for p in &self.raw {
+            if self.load[p.a as usize] as usize >= pairs_per_body
+                || self.load[p.b as usize] as usize >= pairs_per_body
+            {
+                continue;
+            }
+            self.load[p.a as usize] += 1;
+            self.load[p.b as usize] += 1;
+            self.out.push(*p);
+        }
+    }
+
+    /// Solves the pairs from the last [`Self::build`].
+    ///
+    /// The result is a pure function of `(bodies, pairs, budget)`, so the same
+    /// call can be replayed for determinism tests.
+    pub fn solve(&mut self, bodies: &[Body], budget: f32) {
+        solve_into(bodies, &self.out, budget, &mut self.impulses);
+    }
+}
+
+/// Inserts `entry` into a `(distance, index)`-ordered window of at most
+/// `limit` entries, dropping the farthest one when the window is full.
+fn insert_nearest(nearest: &mut Vec<(f32, u32)>, entry: (f32, u32), limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if nearest.len() >= limit
+        && let Some(last) = nearest.last()
+        && (entry.0, entry.1) >= (last.0, last.1)
+    {
+        return;
+    }
+    let at = nearest.partition_point(|e| (e.0, e.1) < entry);
+    nearest.insert(at, entry);
+    nearest.truncate(limit);
+}
+
+/// Allocating convenience wrapper around [`PairScratch::build`], for tests and
+/// one-shot analysis. The tick uses the scratch form.
 pub fn build_pairs(
     bodies: &[Body],
     grid: &SpatialGrid,
@@ -87,92 +240,9 @@ pub fn build_pairs(
     neighbour_limit: usize,
     pairs_per_body: usize,
 ) -> Vec<Pair> {
-    let mut candidates: Vec<u32> = Vec::with_capacity(32);
-    let mut nearest: Vec<(f32, u32)> = Vec::with_capacity(32);
-    let mut raw: Vec<Pair> = Vec::new();
-    let search_radius = proto::NEIGHBOUR_RADIUS + proto::PLAYER_RADIUS * 2.0;
-
-    for (i, body) in bodies.iter().enumerate() {
-        if body.mode == Mode::None {
-            continue;
-        }
-        grid.candidates(positions[i], search_radius, &mut candidates);
-
-        nearest.clear();
-        for &j in &candidates {
-            let j = j as usize;
-            if j == i || bodies[j].mode == Mode::None {
-                continue;
-            }
-            if !vertical_overlap(body, &bodies[j]) {
-                continue;
-            }
-            let d = horizontal_distance(body.pos, bodies[j].pos);
-            let reach = body.radius + bodies[j].radius;
-            if d > reach + proto::SOFT_MARGIN || d > search_radius {
-                continue;
-            }
-            nearest.push((d, j as u32));
-        }
-
-        nearest.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        nearest.truncate(neighbour_limit);
-
-        for &(d, j) in &nearest {
-            // Each contact is discovered from both sides; keep the one where the
-            // scanning body has the lower index so the list is de-duplicated.
-            if (i as u32) > j {
-                continue;
-            }
-            let (lo, hi) = if (i as u32) < j {
-                (i as u32, j)
-            } else {
-                (j, i as u32)
-            };
-            let a = &bodies[lo as usize];
-            let b = &bodies[hi as usize];
-            let delta = b.pos - a.pos;
-            let horizontal = Vec3::new(delta.x, 0.0, delta.z);
-            let len = horizontal.length();
-            // Perfectly coincident centres: pick a deterministic direction.
-            let normal = if len > 1e-4 {
-                horizontal / len
-            } else {
-                Vec3::new(1.0, 0.0, 0.0)
-            };
-            let reach = a.radius + b.radius;
-            raw.push(Pair {
-                a: lo,
-                b: hi,
-                normal,
-                distance: d,
-                penetration: (reach - d).max(0.0),
-                mode: contact_mode(a, b),
-            });
-        }
-    }
-
-    // Deepest first, then id order: stable and independent of hash iteration.
-    raw.sort_by(|x, y| {
-        y.penetration
-            .total_cmp(&x.penetration)
-            .then(x.a.cmp(&y.a))
-            .then(x.b.cmp(&y.b))
-    });
-
-    let mut load = vec![0u16; bodies.len()];
-    let mut out = Vec::with_capacity(raw.len());
-    for p in raw {
-        if load[p.a as usize] as usize >= pairs_per_body
-            || load[p.b as usize] as usize >= pairs_per_body
-        {
-            continue;
-        }
-        load[p.a as usize] += 1;
-        load[p.b as usize] += 1;
-        out.push(p);
-    }
-    out
+    let mut scratch = PairScratch::new();
+    scratch.build(bodies, grid, positions, neighbour_limit, pairs_per_body);
+    scratch.out
 }
 
 fn vertical_overlap(a: &Body, b: &Body) -> bool {
@@ -209,7 +279,15 @@ pub struct Impulse {
 /// The result is a pure function of `(bodies, pairs, budget)`, so the same call
 /// can be replayed for determinism tests.
 pub fn solve(bodies: &[Body], pairs: &[Pair], budget: f32) -> Vec<Impulse> {
-    let mut out = vec![Impulse::default(); bodies.len()];
+    let mut out = Vec::new();
+    solve_into(bodies, pairs, budget, &mut out);
+    out
+}
+
+/// [`solve`] without the allocation: `out` keeps its capacity across ticks.
+pub fn solve_into(bodies: &[Body], pairs: &[Pair], budget: f32, out: &mut Vec<Impulse>) {
+    out.clear();
+    out.resize(bodies.len(), Impulse::default());
 
     for p in pairs {
         let a = &bodies[p.a as usize];
@@ -250,12 +328,10 @@ pub fn solve(bodies: &[Body], pairs: &[Pair], budget: f32) -> Vec<Impulse> {
     }
 
     // Vector-sum budget, applied once per body.
-    for imp in &mut out {
+    for imp in out.iter_mut() {
         let len = imp.delta_v.length();
         if len > budget && len > f32::EPSILON {
             imp.delta_v *= budget / len;
         }
     }
-
-    out
 }

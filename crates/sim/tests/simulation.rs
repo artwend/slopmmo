@@ -311,10 +311,10 @@ fn duplicate_and_stale_packets_are_rejected_without_moving_the_shadow() {
 
     let first = packet(5, 200, 1, Vec3::new(0.01, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&first), Ok(()));
-    let shadow = sim.players[&1].pos;
+    let shadow = sim.player(1).unwrap().pos;
 
     assert_eq!(sim.ingest(&first), Err(Reject::DuplicateSeq));
-    assert_eq!(sim.players[&1].pos, shadow);
+    assert_eq!(sim.player(1).unwrap().pos, shadow);
 
     // Older than the report window.
     let old = packet(
@@ -339,7 +339,7 @@ fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
     // The client counts ticks from its own start; that is not a protocol error.
     let first = packet(1, 0, 1, Vec3::new(0.0, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&first), Ok(()));
-    assert_eq!(sim.players[&1].tick_offset, Some(5000));
+    assert_eq!(sim.player(1).unwrap().tick_offset, Some(5000));
 
     let next = packet(2, 1, 1, Vec3::new(0.02, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&next), Ok(()));
@@ -349,7 +349,7 @@ fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
     let jumped = packet(3, 20_000, 1, Vec3::new(0.05, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&jumped), Ok(()));
     assert_eq!(
-        sim.players[&1].tick_offset,
+        sim.player(1).unwrap().tick_offset,
         Some(sim.tick.0.wrapping_sub(20_000))
     );
 }
@@ -362,12 +362,13 @@ fn server_corrects_overlapping_players_and_stays_deterministic() {
         sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
         sim.add_player(2, Vec3::new(0.45, 0.9, 0.0));
         sim.tick = Tick::new(10);
-        sim.players.get_mut(&1).unwrap().vel = Vec3::new(2.0, 0.0, 0.0);
-        sim.players.get_mut(&2).unwrap().vel = Vec3::new(-2.0, 0.0, 0.0);
+        sim.player_mut(1).unwrap().vel = Vec3::new(2.0, 0.0, 0.0);
+        sim.player_mut(2).unwrap().vel = Vec3::new(-2.0, 0.0, 0.0);
 
         let mut snaps = Vec::new();
         for _ in 0..30 {
-            for s in sim.step(&world) {
+            sim.step(&world);
+            for (_, s) in sim.snapshots() {
                 snaps.push(format!(
                     "{:?} {:?} {:?}",
                     s.server_tick,
@@ -393,9 +394,10 @@ fn snapshot_lists_nearby_peers_within_aoi_only() {
     sim.add_player(2, Vec3::new(1.0, 0.9, 0.0));
     sim.add_player(3, Vec3::new(9.0, 0.9, 9.0));
 
-    let snaps = sim.step(&world);
+    sim.step(&world);
+    let snaps = sim.snapshots();
     assert_eq!(snaps.len(), 3);
-    let near = &snaps[0];
+    let near = &snaps[0].1;
     assert!(
         near.peers.iter().any(|p| p.player == 2),
         "near peer missing from snapshot"
