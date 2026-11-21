@@ -231,7 +231,7 @@ impl Args {
         let mut out = Self {
             bots: 0,
             duration: 10.0,
-            listen: Some("127.0.0.1:4000".to_string()),
+            listen: Some("0.0.0.0:4000".to_string()),
         };
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -246,7 +246,7 @@ impl Args {
                         "usage: server [--bots N --duration S] [--listen ADDR]\n\
                          \n  --bots N        run N deterministic bots, no sockets, print metrics\n\
                          \n  --duration S    bot benchmark length in seconds (default 10)\n\
-                         \n  --listen ADDR   UDP bind address (default 127.0.0.1:4000)\n"
+                         \n  --listen ADDR   UDP bind address (default 0.0.0.0:4000)\n"
                     );
                     std::process::exit(0);
                 }
