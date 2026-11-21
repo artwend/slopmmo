@@ -124,6 +124,11 @@ cargo run --release -p server -- --listen 127.0.0.1:4000
 cargo run -p client -- --headless --connect 127.0.0.1:4000
 ```
 
+The server default is loopback; pass `--listen 0.0.0.0:4000` to accept peers from other hosts
+(Windows will ask about the firewall rule the first time), and `--connect <host>:4000` on the
+client to reach them. The client always binds an unspecified local address so it can reach any
+server, not just a local one.
+
 The headless script is replayed against the real server over Lightyear, paced to real time so
 round trips can complete. It reports `net_sent`, `net_snaps` and `net_corrections`, and fails if
 no snapshot arrives:
@@ -147,6 +152,36 @@ pushes its clock into the future. Without it a join would be rejected as `StaleT
 One trap worth knowing: the headless runner drives `App::update` by hand, and Lightyear installs
 its message send/receive systems in `Plugin::finish`. Without an explicit `app.finish()` /
 `app.cleanup()` the client happily buffers 600 reports and transmits nothing at all.
+
+The scripted session is about 20 s of simulated time, so `--seconds` must be larger than that or
+the run ends with `failure script was truncated by --seconds`.
+
+### Observing the traffic
+
+Two things make an empty capture likely, and neither is a bug in the transport:
+
+1. Without `--connect` the client is fully offline — it never opens a UDP socket, so nothing can
+   appear anywhere. Check first:
+
+   ```powershell
+   Get-NetUDPEndpoint -LocalPort 4000          # the server must own it
+   Get-NetUDPEndpoint -OwningProcess <client pid>   # empty means that client is offline
+   ```
+
+2. `127.0.0.1` traffic never touches a NIC on Windows. It is only visible on Npcap's loopback
+   adapter, listed by Wireshark as **Adapter for loopback traffic capture** (`\Device\NPF_Loopback`).
+   Capturing on Wi-Fi or Ethernet shows nothing local. Command line equivalent:
+
+   ```powershell
+   & 'C:\Program Files\Wireshark\dumpcap.exe' -i \Device\NPF_Loopback -f "udp port 4000" -w lo.pcapng
+   ```
+
+   then filter `udp.port == 4000`. A 20 s round trip is ~1100 frames: 60 Hz snapshots of ~69 B
+   server to client, ~30 Hz reports of ~106-123 B the other way (they grow with redundancy), a
+   one-off ~500 B channel registry on connect, and small ~45-57 B ping/ack frames both ways.
+
+If both of those check out and the capture is still empty, run the server with
+`RUST_LOG=lightyear_udp=trace` — it logs `Received UDP packet from new address` per new peer.
 
 ### Windowed client
 

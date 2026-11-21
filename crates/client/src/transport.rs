@@ -59,7 +59,8 @@ impl Plugin for ClientNetPlugin {
 }
 
 fn spawn_client(mut commands: Commands, server: Res<Server>) {
-    // Port 0: let the OS pick, the server learns the address from the packet.
+    // Port 0: let the OS pick, the server learns the address from the packet. The bind address
+    // must stay unspecified, not loopback, or the socket cannot reach a non-local server.
     let client = commands
         .spawn((
             RawClient,

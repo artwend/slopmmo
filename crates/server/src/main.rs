@@ -237,7 +237,7 @@ impl Args {
         let mut out = Self {
             bots: 0,
             duration: 10.0,
-            listen: Some("0.0.0.0:4000".to_string()),
+            listen: Some("127.0.0.1:4000".to_string()),
         };
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
