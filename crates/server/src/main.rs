@@ -1,18 +1,17 @@
 //! Headless server.
 //!
-//! Two modes, both driven by the same [`crate::Game`] tick:
+//! Two modes, both driven by the same [`Game`] tick:
 //!
 //! * `--bots N --duration S` — no sockets, N deterministic bots, metrics on
 //!   exit. This is the CI target.
-//! * `--listen 0.0.0.0:4000` — UDP, real packets, snapshots back to clients.
+//! * `--listen 0.0.0.0:4000` — UDP through lightyear, snapshots back to clients.
 //!
 //! The server never owns terrain and never rewinds. See
 //! `docs/architecture-review.md` for why.
 
 mod bots;
-mod net;
+mod transport;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -21,6 +20,14 @@ use bevy::prelude::*;
 use sim::authority::{SimConfig, Simulation};
 use sim::movement::MoveParams;
 use sim::world::StaticWorld;
+
+/// Frame order: packets in, simulate, snapshots out.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SimSet {
+    Ingest,
+    Drive,
+    Dispatch,
+}
 
 pub struct Game {
     pub sim: Simulation,
@@ -83,20 +90,7 @@ impl Game {
 }
 
 #[derive(Resource)]
-struct GameRes(Game);
-
-/// Socket plus the address map we need to reply to anonymous UDP senders.
-#[derive(Resource)]
-struct NetRes {
-    server: net::UdpServer,
-    peers: HashMap<u64, SocketAddr>,
-    /// Last packet seen per peer. UDP has no disconnect, so silence is the only
-    /// signal that a client is gone.
-    last_seen: HashMap<u64, Instant>,
-}
-
-/// A peer that has been silent this long is dropped, along with its shadow body.
-const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub struct GameRes(pub Game);
 
 fn main() {
     let args = Args::parse();
@@ -109,31 +103,27 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
         .add_plugins(bevy::log::LogPlugin::default())
+        .configure_sets(
+            Update,
+            (SimSet::Ingest, SimSet::Drive, SimSet::Dispatch).chain(),
+        )
         .insert_resource(GameRes(Game::new()))
-        .add_systems(Update, drive);
+        .add_systems(Update, drive.in_set(SimSet::Drive));
 
-    if let Some(addr) = args.listen.clone() {
-        match net::UdpServer::bind(&addr) {
-            Ok(server) => {
-                let bound = server
-                    .local_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|_| addr.clone());
-                info!("listening on {bound}, tick rate {} Hz", proto::TICK_HZ);
-                app.insert_resource(NetRes {
-                    server,
-                    peers: HashMap::new(),
-                    last_seen: HashMap::new(),
-                })
-                .add_systems(Update, pump_net.after(drive));
+    match args.listen_addr() {
+        Some(addr) => {
+            // Probe the address ourselves so a bad `--listen` is still a clean
+            // exit instead of a logged error from inside a lightyear observer.
+            match std::net::UdpSocket::bind(addr) {
+                Ok(socket) => drop(socket),
+                Err(e) => {
+                    error!("cannot bind {addr}: {e}");
+                    std::process::exit(2);
+                }
             }
-            Err(e) => {
-                error!("cannot bind {addr}: {e}");
-                std::process::exit(2);
-            }
+            app.add_plugins(transport::NetPlugin { addr });
         }
-    } else {
-        info!("no socket, tick rate {} Hz", proto::TICK_HZ);
+        None => info!("no socket, tick rate {} Hz", proto::TICK_HZ),
     }
 
     app.run();
@@ -145,64 +135,6 @@ fn drive(time: Res<Time>, mut game: ResMut<GameRes>) {
         // Let the runner idle instead of spinning on an empty frame.
         std::thread::sleep(std::time::Duration::from_micros(500));
     }
-}
-
-fn pump_net(mut net: ResMut<NetRes>, mut game: ResMut<GameRes>) {
-    let incoming = net.server.drain();
-    for (from, pkt) in incoming {
-        // First contact: admit the peer and give it a shadow body at the pose it
-        // reports. A real deployment authenticates the session and spawns at a
-        // zone-defined point instead of trusting the client's first position.
-        if !game.0.sim.players.contains_key(&pkt.player) {
-            let pos = Vec3::from_array(pkt.report.position);
-            game.0.sim.add_player(pkt.player, pos);
-            info!("admitted player {} from {from}", pkt.player);
-        }
-        // Always track the newest address: a NAT rebind must not orphan the peer.
-        net.peers.insert(pkt.player, from);
-        net.last_seen.insert(pkt.player, Instant::now());
-        if let Err(reject) = game.0.sim.ingest(&pkt)
-            && reject != sim::authority::Reject::DuplicateSeq
-        {
-            info!("rejected packet from {from}: {reject:?}");
-        }
-    }
-
-    // A silent peer is gone. Dropping its sequence state as well as its address
-    // means a reconnect is not mistaken for a stale or replayed packet.
-    let now = Instant::now();
-    let expired: Vec<u64> = net
-        .last_seen
-        .iter()
-        .filter(|(_, seen)| now.duration_since(**seen) > PEER_TIMEOUT)
-        .map(|(id, _)| *id)
-        .collect();
-    let gone: Vec<u64> = net
-        .peers
-        .keys()
-        .copied()
-        .filter(|id| !game.0.sim.players.contains_key(id))
-        .collect();
-    for id in expired.into_iter().chain(gone) {
-        net.peers.remove(&id);
-        net.last_seen.remove(&id);
-        net.server.forget(id);
-        game.0.sim.remove_player(id);
-        info!("dropped player {id}");
-    }
-
-    if net.peers.is_empty() || !game.0.snapshots_pending {
-        return;
-    }
-
-    // Send whatever the most recent completed tick produced, exactly once.
-    for (id, snapshot) in &game.0.last_snapshots {
-        let addr = net.peers.get(id).copied();
-        if let Some(addr) = addr {
-            net.server.send(addr, snapshot);
-        }
-    }
-    game.0.snapshots_pending = false;
 }
 
 /// Deterministic N-bot soak test. Prints a machine-readable summary.
@@ -289,6 +221,18 @@ pub struct Args {
 }
 
 impl Args {
+    /// Parses `--listen` into an address, exiting with code 2 if it is unusable.
+    fn listen_addr(&self) -> Option<SocketAddr> {
+        let raw = self.listen.as_ref()?;
+        match raw.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                eprintln!("invalid --listen address {raw:?}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     fn parse() -> Self {
         let mut out = Self {
             bots: 0,

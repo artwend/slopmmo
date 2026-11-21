@@ -10,15 +10,17 @@ running code instead of arguing about them.
 
 - **Rust** 1.100.0 (pinned in `rust-toolchain.toml`)
 - **Bevy** 0.20 (`MinimalPlugins` on the server, `DefaultPlugins` in the client window)
+- **Lightyear** 0.31 for the wire (UDP, channels, message framing)
 - 60 Hz fixed server tick, 30 Hz client input send with redundancy
 
 ## Layout
 
 | Crate | Role |
 | --- | --- |
-| `crates/proto` | Wire format, constants, packet types. No Bevy, no logic. `no_std`-friendly |
+| `crates/proto` | Wire format, constants, packet types. No Bevy, no logic; serde for the Lightyear path and a hand-rolled codec for the size budget |
+| `crates/net` | The Lightyear protocol: two channels and the two messages, added identically by both binaries |
 | `crates/sim` | Pure simulation: capsule KCC, spatial hash, pair solver, server authority model |
-| `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, UDP endpoint |
+| `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, Lightyear endpoint |
 | `crates/client` | Bevy window (WASD + Q/E + Space) and a headless scripted CI mode |
 
 `proto` and `sim` are deliberately engine-free apart from `bevy_math` vectors, so the same code
@@ -34,9 +36,10 @@ runs unchanged on the client (prediction) and on the server (shadow).
 | [`docs/architecture-review.md`](docs/architecture-review.md) | Critical review of the dialogue: what was wrong, what replaced it |
 
 Status legend for the ADRs: **Implemented**, **Partial**, **Open** (decided, not built),
-**Deviation** (we knowingly do something else). The one deviation that matters is
-[ADR 006](docs/decisions/006-netcode-lightyear.md): the dialogue chose **Lightyear**, and this
-prototype currently speaks raw UDP. The ADR records why and what converging takes.
+**Deviation** (we knowingly do something else). [ADR 006](docs/decisions/006-netcode-lightyear.md)
+is now **Partial**: the wire is Lightyear 0.31 on two `SequencedUnreliable` channels; client-side
+prediction, reconciliation and interpolation are still ours, because the two sides simulate
+different collision sets.
 
 ## Design in one page
 
@@ -70,7 +73,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 32 tests: proto, sim, server, client
+cargo test --workspace          # 33 tests: proto, net, sim, server, client
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -114,21 +117,36 @@ headroom_x        416.3
 `headroom_x` is how many times over the tick budget is met at this bot count. Treat it as "the
 solver is not the bottleneck yet", not as a benchmark.
 
-### Live UDP round trip
+### Live round trip
 
 ```sh
 cargo run --release -p server -- --listen 127.0.0.1:4000
 cargo run -p client -- --headless --connect 127.0.0.1:4000
 ```
 
-The headless script is replayed against the real server, paced to real time so round trips can
-complete. It reports `net_sent`, `net_snaps`, `net_corrections` and `net_malformed`, and fails if
-no snapshot arrives. First contact admits the player and spawns its shadow at the reported pose.
-A peer silent for 10 s is dropped together with its shadow and its sequence state.
+The headless script is replayed against the real server over Lightyear, paced to real time so
+round trips can complete. It reports `net_sent`, `net_snaps` and `net_corrections`, and fails if
+no snapshot arrives:
+
+```
+net_sent        600
+net_snaps       1185
+net_corrections 0        # same KCC on both sides, so the wall slide needs no correction
+result          ok
+```
+
+There is no `Hello`: the first movement packet's `player` field binds that link to a player id and
+spawns its shadow at the reported pose. Two clients claiming one id is a known limitation — the
+newest link wins and the body is not released from under it. A peer silent for 10 s is dropped
+together with its shadow and its sequence state.
 
 The client's tick counter starts at zero while the server's has been running since launch, so
 every player carries an offset, anchored on its first report and re-anchored when a long hitch
 pushes its clock into the future. Without it a join would be rejected as `StaleTick` forever.
+
+One trap worth knowing: the headless runner drives `App::update` by hand, and Lightyear installs
+its message send/receive systems in `Plugin::finish`. Without an explicit `app.finish()` /
+`app.cleanup()` the client happily buffers 600 reports and transmits nothing at all.
 
 ### Windowed client
 
@@ -153,7 +171,7 @@ implementation here diverges where the review concluded the design was wrong:
 | "authoritative movement state" | shadow state | the client owns its position |
 | corrections applied blindly | `(seq, tick, epoch)` gate | UDP duplicates are normal |
 | report tick compared with the server tick | per-player offset mapping | the two clocks start at different times |
-| Lightyear + built-in transport | raw UDP + hand-rolled codec | scaffold deliberately dependency-free; **deviation**, see ADR 006 |
+| Lightyear + built-in transport | Lightyear 0.31 transport, our prediction | ADR 006 is Partial: prediction/interpolation migration is the remaining step |
 
 Open questions are listed in `docs/architecture-review.md`; the biggest is zone handover, which is
 not implemented at all.

@@ -6,4 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Lightyear serialises these types with postcard; the hand-rolled codec in
+# `src/wire.rs` stays as the reference layout and its size budget.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 

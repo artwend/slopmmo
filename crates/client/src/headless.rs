@@ -1,19 +1,22 @@
 //! Scripted, deterministic client run. This is what CI executes.
 //!
 //! Exits non-zero when a movement invariant breaks, so it is usable as a smoke
-//! test rather than a print-and-hope binary.
+//! test rather than a print-and-hope binary. Offline runs add no networking at
+//! all, so the invariants never depend on the transport.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use bevy::math::Vec3;
+use bevy::prelude::*;
 
-use crate::net::ClientLink;
-use crate::{Args, CorrectionLog, LocalPlayer};
+use crate::transport::{ClientNetPlugin, NetSet, NetStats};
+use crate::{Args, Local, WorldRes};
 
 const FORWARD: i8 = -127;
 const RIGHT: i8 = 127;
 
+#[derive(Clone, Copy)]
 struct Phase {
     name: &'static str,
     ticks: u32,
@@ -69,6 +72,88 @@ fn phases() -> Vec<Phase> {
     ]
 }
 
+fn total_ticks() -> u32 {
+    phases().iter().map(|p| p.ticks).sum()
+}
+
+/// Where the script has got to, plus the extremes needed by the invariants.
+#[derive(Resource)]
+struct Script {
+    phases: Vec<Phase>,
+    index: usize,
+    left: u32,
+    budget: u32,
+    ticks: u32,
+    peak_y: f32,
+    max_abs_x: f32,
+    max_abs_z: f32,
+    /// Wall-clock origin for a live run; `None` means run as fast as possible.
+    started: Option<Instant>,
+    finished: bool,
+}
+
+impl Script {
+    fn new(budget: u32, live: bool) -> Self {
+        let phases = phases();
+        Self {
+            left: phases[0].ticks,
+            peak_y: 0.9,
+            budget,
+            started: live.then(Instant::now),
+            phases,
+            index: 0,
+            ticks: 0,
+            max_abs_x: 0.0,
+            max_abs_z: 0.0,
+            finished: false,
+        }
+    }
+}
+
+/// One script tick per App update, so the wire systems keep their normal place.
+fn script_tick(world: Res<WorldRes>, mut local: ResMut<Local>, mut script: ResMut<Script>) {
+    if script.finished {
+        return;
+    }
+    if script.ticks >= script.budget || script.index >= script.phases.len() {
+        script.finished = true;
+        return;
+    }
+
+    let phase = script.phases[script.index];
+    local.step(
+        &world.0,
+        proto::InputFrame {
+            move_x: phase.move_x,
+            move_z: phase.move_z,
+            buttons: phase.buttons,
+            ..default()
+        },
+    );
+    script.ticks += 1;
+    script.peak_y = script.peak_y.max(local.player.pos.y);
+    script.max_abs_x = script.max_abs_x.max(local.player.pos.x.abs());
+    script.max_abs_z = script.max_abs_z.max(local.player.pos.z.abs());
+
+    script.left -= 1;
+    if script.left == 0 {
+        script.index += 1;
+        if let Some(next) = script.phases.get(script.index) {
+            script.left = next.ticks;
+        }
+    }
+
+    // A live run has to follow the wall clock, otherwise the script is over
+    // before a single round-trip can complete.
+    if let Some(start) = script.started {
+        let want = f64::from(script.ticks) * f64::from(proto::TICK_DT);
+        let elapsed = start.elapsed().as_secs_f64();
+        if want > elapsed {
+            std::thread::sleep(Duration::from_secs_f64(want - elapsed));
+        }
+    }
+}
+
 struct Report {
     pos: Vec3,
     vel: Vec3,
@@ -78,103 +163,64 @@ struct Report {
     max_abs_z: f32,
     ticks: u32,
     sent: u64,
-    snaps: u64,
+    received: u64,
     corrections: u64,
 }
 
-fn total_ticks() -> u32 {
-    phases().iter().map(|p| p.ticks).sum()
-}
+fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
+    let budget = ((seconds * proto::TICK_HZ as f32) as u32).max(1);
 
-fn run_script(seconds_limit: f32, mut net: Option<&mut ClientLink>) -> Report {
-    let world = sim::StaticWorld::test_room();
-    let mut player = LocalPlayer::spawn();
-    let mut log = CorrectionLog::default();
-    let budget = (seconds_limit * proto::TICK_HZ as f32) as u32;
-    let send_every = (proto::TICK_HZ / proto::INPUT_SEND_HZ).max(1);
-    // With a live server the script has to run at real time, otherwise the whole
-    // session is over before a single round-trip can complete.
-    let pacer = net.as_ref().map(|_| Instant::now());
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .insert_resource(WorldRes(sim::StaticWorld::test_room()))
+        .init_resource::<Local>()
+        .init_resource::<NetStats>()
+        .insert_resource(Script::new(budget, connect.is_some()))
+        .add_systems(
+            Update,
+            script_tick.after(NetSet::Receive).before(NetSet::Send),
+        );
 
-    let mut tick = 0u32;
-    let mut seq = 0u16;
-    let mut corrections = 0u64;
-    let mut peak_y = player.pos.y;
-    let mut max_abs_x: f32 = 0.0;
-    let mut max_abs_z: f32 = 0.0;
-
-    for phase in phases() {
-        for _ in 0..phase.ticks {
-            if tick >= budget {
-                break;
-            }
-            let input = proto::InputFrame {
-                tick: proto::Tick::new(tick),
-                move_x: phase.move_x,
-                move_z: phase.move_z,
-                buttons: phase.buttons,
-                camera_yaw: 0,
-            };
-            player.tick(&world, &input, proto::TICK_DT);
-            tick += 1;
-            peak_y = peak_y.max(player.pos.y);
-            max_abs_x = max_abs_x.max(player.pos.x.abs());
-            max_abs_z = max_abs_z.max(player.pos.z.abs());
-
-            if let Some(link) = net.as_deref_mut() {
-                for snap in link.drain_snapshots() {
-                    if let Some(c) = &snap.correction
-                        && log.accept(c)
-                    {
-                        player.apply_correction(c);
-                        corrections += 1;
-                    }
-                }
-                if tick.is_multiple_of(send_every) {
-                    seq = seq.wrapping_add(1);
-                    link.send(&proto::PlayerMovementPacket {
-                        seq,
-                        player: link.player_id,
-                        report: proto::MovementReport {
-                            tick: proto::Tick::new(tick),
-                            position: player.pos.to_array(),
-                            velocity: player.vel.to_array(),
-                            body_yaw: player.yaw,
-                            grounded: player.grounded,
-                            applied_correction_seq: log.last_seq(),
-                        },
-                        inputs: Vec::new(),
-                    });
-                }
-            }
-
-            if let Some(start) = pacer {
-                let want = f64::from(tick) * f64::from(proto::TICK_DT);
-                let elapsed = start.elapsed().as_secs_f64();
-                if want > elapsed {
-                    std::thread::sleep(Duration::from_secs_f64(want - elapsed));
-                }
-            }
-        }
+    if let Some(addr) = connect {
+        // A live run has to be debuggable; the offline run stays quiet so its
+        // report is the only output.
+        app.add_plugins(bevy::log::LogPlugin::default())
+            .add_plugins(ClientNetPlugin {
+                server: addr,
+                player_id,
+            });
     }
 
+    // `App::run` would do this for us, but we drive `update` by hand. Lightyear
+    // registers her message send/receive systems in `Plugin::finish`, so skipping
+    // these two calls silently drops every packet in both directions.
+    app.finish();
+    app.cleanup();
+
+    while !app.world().resource::<Script>().finished {
+        app.update();
+    }
+
+    let local = app.world().resource::<Local>();
+    let script = app.world().resource::<Script>();
+    let stats = app.world().resource::<NetStats>();
     Report {
-        pos: player.pos,
-        vel: player.vel,
-        grounded: player.grounded,
-        peak_y,
-        max_abs_x,
-        max_abs_z,
-        ticks: tick,
-        sent: net.as_ref().map_or(0, |l| l.sent),
-        snaps: net.as_ref().map_or(0, |l| l.received),
-        corrections,
+        pos: local.player.pos,
+        vel: local.player.vel,
+        grounded: local.player.grounded,
+        peak_y: script.peak_y,
+        max_abs_x: script.max_abs_x,
+        max_abs_z: script.max_abs_z,
+        ticks: script.ticks,
+        sent: stats.sent,
+        received: stats.received,
+        corrections: stats.corrections,
     }
 }
 
 pub fn run(args: &Args) -> ExitCode {
-    let a = run_script(args.seconds, None);
-    let b = run_script(args.seconds, None);
+    let a = run_script(args.seconds, None, args.player_id);
+    let b = run_script(args.seconds, None, args.player_id);
 
     println!("script:");
     for p in phases() {
@@ -197,29 +243,18 @@ pub fn run(args: &Args) -> ExitCode {
     let mut failures = Vec::new();
 
     // Optional live round-trip: the script is replayed against a real server so
-    // the encode/decode path and the correction idempotency are exercised.
-    if let Some(addr) = &args.connect {
-        match ClientLink::connect(addr, args.player_id) {
-            Ok(mut link) => {
-                println!("net_peer        {}", link.peer());
-                let r = run_script(args.seconds, Some(&mut link));
-                println!("net_sent        {}", r.sent);
-                println!("net_snaps       {}", r.snaps);
-                println!("net_corrections {}", r.corrections);
-                println!("net_malformed   {}", link.malformed);
-                if r.snaps == 0 {
-                    failures.push("no snapshots from the server");
-                }
-                if link.malformed > 0 {
-                    failures.push("decoded a malformed snapshot");
-                }
-            }
-            Err(e) => {
-                eprintln!("connect to {addr} failed: {e}");
-                failures.push("could not connect to the server");
-            }
+    // the encode/decode path and correction idempotency are exercised.
+    if let Some(addr) = args.connect_addr() {
+        println!("net_server      {addr}");
+        let r = run_script(args.seconds, Some(addr), args.player_id);
+        println!("net_sent        {}", r.sent);
+        println!("net_snaps       {}", r.received);
+        println!("net_corrections {}", r.corrections);
+        if r.received == 0 {
+            failures.push("no snapshots from the server");
         }
     }
+
     if !deterministic {
         failures.push("two identical runs diverged");
     }
@@ -253,7 +288,7 @@ pub fn run(args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CorrectionLog, LocalPlayer};
+    use crate::CorrectionLog;
 
     #[test]
     fn corrections_are_idempotent() {
@@ -282,20 +317,43 @@ mod tests {
     }
 
     #[test]
+    fn a_resent_snapshot_is_applied_once() {
+        let mut local = Local::default();
+        let snapshot = proto::ServerSnapshot {
+            correction: Some(proto::CollisionCorrection {
+                seq: 4,
+                tick: proto::Tick::new(10),
+                epoch: 1,
+                velocity_delta: [0.5, 0.0, 0.0],
+                hard_normal: None,
+            }),
+            ..default()
+        };
+        assert!(local.accept_snapshot(&snapshot));
+        let after_first = local.player.vel;
+        assert!(!local.accept_snapshot(&snapshot), "duplicate applied twice");
+        assert_eq!(local.player.vel, after_first);
+    }
+
+    #[test]
     fn hard_normal_removes_velocity_into_the_wall() {
-        let mut p = LocalPlayer::spawn();
-        p.vel = Vec3::new(-4.0, 0.0, 0.0);
-        p.apply_correction(&proto::CollisionCorrection {
-            seq: 1,
-            tick: proto::Tick::new(1),
-            epoch: 1,
-            velocity_delta: [0.0, 0.0, 0.0],
-            hard_normal: Some([1.0, 0.0, 0.0]),
+        let mut local = Local::default();
+        local.player.vel = Vec3::new(-4.0, 0.0, 0.0);
+        let applied = local.accept_snapshot(&proto::ServerSnapshot {
+            correction: Some(proto::CollisionCorrection {
+                seq: 1,
+                tick: proto::Tick::new(1),
+                epoch: 1,
+                velocity_delta: [0.0, 0.0, 0.0],
+                hard_normal: Some([1.0, 0.0, 0.0]),
+            }),
+            ..default()
         });
+        assert!(applied);
         assert!(
-            p.vel.x >= -1e-4,
+            local.player.vel.x >= -1e-4,
             "velocity into the wall survived: {}",
-            p.vel.x
+            local.player.vel.x
         );
     }
 }

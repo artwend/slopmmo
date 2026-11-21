@@ -252,9 +252,9 @@ handoff. Treat the target as a constraint that shapes the design, not as a resul
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented |
 | Correction protocol with `(seq, tick, epoch)` | Implemented |
-| UDP transport with admission, timeout, error dedupe | Implemented |
+| Lightyear UDP transport with admission, timeout, orphan release | Implemented |
 | Per-player clock offset mapping | Implemented |
-| Lightyear netcode | **Deviation** — raw UDP (ADR 006) |
+| Lightyear netcode | **Partial** — Lightyear 0.31 owns the wire, prediction/interpolation still ours (ADR 006) |
 | Roles, raids, parties | Absent |
 | Combat, abilities, hard-mode switching | Absent |
 | NPC / boss simulation | Absent |

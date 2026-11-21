@@ -7,8 +7,13 @@ publish = false
 
 [dependencies]
 proto.workspace = true
+net.workspace = true
 bevy_math = "0.20"
 sim.workspace = true
 
 # Headless only: no render, no window, no asset pipeline.
 bevy = { version = "0.20", default-features = false, features = ["std", "multi_threaded", "async_executor", "bevy_log"] }
+
+# `raw_connection`: lightyear's thin connection layer over a bare UDP endpoint.
+# Admission is ours (no netcode handshake yet), so there is nothing to negotiate.
+lightyear = { version = "0.31", default-features = false, features = ["std", "server", "udp", "raw_connection"] }

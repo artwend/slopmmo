@@ -6,10 +6,13 @@
 
 mod app;
 mod headless;
-mod net;
+mod transport;
 
-use bevy::math::Vec3;
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::Duration;
+
+use bevy::prelude::{Resource, Vec3};
 
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
@@ -37,6 +40,18 @@ pub struct Args {
 }
 
 impl Args {
+    /// Parses `--connect` into an address, exiting with code 2 if it is unusable.
+    pub fn connect_addr(&self) -> Option<SocketAddr> {
+        let raw = self.connect.as_ref()?;
+        match raw.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                eprintln!("invalid --connect address {raw:?}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     fn parse() -> Self {
         let mut out = Self {
             mode: Mode::Window,
@@ -148,3 +163,88 @@ impl CorrectionLog {
 
 pub const INPUT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / proto::INPUT_SEND_HZ as u64);
+
+/// Shared world geometry for both the local solve and the rendered boxes.
+#[derive(Resource)]
+pub struct WorldRes(pub sim::StaticWorld);
+
+/// Everything the client's own tick needs, shared by the window and the script.
+///
+/// Both modes run exactly this code, so a headless pass means something for the
+/// windowed build.
+#[derive(Resource)]
+pub struct Local {
+    pub player: LocalPlayer,
+    pub tick: proto::Tick,
+    pub seq: u16,
+    /// Newest-first inputs, re-sent with each report so a lost one can be filled in.
+    pub recent: VecDeque<proto::InputFrame>,
+    pub corrections: CorrectionLog,
+    /// Tick of the last report, so a redelivered frame cannot double-send.
+    sent_at: Option<proto::Tick>,
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Self {
+            player: LocalPlayer::spawn(),
+            tick: proto::Tick::ZERO,
+            seq: 0,
+            recent: VecDeque::with_capacity(proto::MAX_INPUT_FRAMES),
+            corrections: CorrectionLog::default(),
+            sent_at: None,
+        }
+    }
+}
+
+impl Local {
+    /// One fixed tick with `input`; the tick number is stamped on the frame.
+    pub fn step(&mut self, world: &sim::StaticWorld, input: proto::InputFrame) {
+        self.tick = self.tick.add(1);
+        let input = proto::InputFrame {
+            tick: self.tick,
+            ..input
+        };
+        self.player.tick(world, &input, proto::TICK_DT);
+        self.recent.push_front(input);
+        self.recent.truncate(proto::MAX_INPUT_FRAMES);
+    }
+
+    /// The report due for the current tick, or `None` off-cadence.
+    pub fn report(&mut self, player_id: u64) -> Option<proto::PlayerMovementPacket> {
+        if self.sent_at == Some(self.tick) {
+            return None;
+        }
+        let every = (proto::TICK_HZ / proto::INPUT_SEND_HZ).max(1);
+        if !self.tick.0.is_multiple_of(every) {
+            return None;
+        }
+        self.sent_at = Some(self.tick);
+        self.seq = self.seq.wrapping_add(1);
+        Some(proto::PlayerMovementPacket {
+            seq: self.seq,
+            player: player_id,
+            report: proto::MovementReport {
+                tick: self.tick,
+                position: self.player.pos.to_array(),
+                velocity: self.player.vel.to_array(),
+                body_yaw: self.player.yaw,
+                grounded: self.player.grounded,
+                applied_correction_seq: self.corrections.last_seq(),
+            },
+            inputs: self.recent.iter().copied().collect(),
+        })
+    }
+
+    /// Applies a snapshot's correction; false when it was a duplicate or absent.
+    pub fn accept_snapshot(&mut self, snapshot: &proto::ServerSnapshot) -> bool {
+        let Some(c) = &snapshot.correction else {
+            return false;
+        };
+        if !self.corrections.accept(c) {
+            return false;
+        }
+        self.player.apply_correction(c);
+        true
+    }
+}

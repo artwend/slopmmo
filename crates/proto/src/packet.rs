@@ -8,6 +8,7 @@ use crate::{
     MAX_INPUT_FRAMES, Tick, dequantise_normal, dequantise_position, quantise_normal,
     quantise_position,
 };
+use serde::{Deserialize, Serialize};
 
 pub const KIND_PLAYER_MOVEMENT: u8 = 1;
 pub const KIND_SERVER_SNAPSHOT: u8 = 2;
@@ -27,7 +28,7 @@ pub mod peer_mode {
 ///
 /// This is *state*, not a command: the server uses it as the base of its shadow
 /// simulation and validates the implied displacement.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MovementReport {
     pub tick: Tick,
     pub position: [f32; 3],
@@ -78,7 +79,7 @@ impl MovementReport {
 
 /// Client→server. Input and report are merged into one packet: they describe
 /// the same tick window, and splitting them doubled the header cost.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlayerMovementPacket {
     /// Per-connection packet counter, used for loss statistics.
     pub seq: u16,
@@ -138,7 +139,7 @@ impl PlayerMovementPacket {
 
 /// A replicated collider. The client feeds these into its own solver instead of
 /// waiting for the server to move it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PeerCollider {
     pub player: u64,
     pub position: [f32; 3],
@@ -177,7 +178,7 @@ impl PeerCollider {
 
 /// Aggregated per-player correction. Deliberately carries no position delta:
 /// the server cannot guarantee such an offset would not land inside a wall.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CollisionCorrection {
     /// Idempotency key. A replayed `(seq, tick)` pair must be applied once.
     pub seq: u16,
@@ -237,7 +238,7 @@ impl CollisionCorrection {
 }
 
 /// Server→client.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerSnapshot {
     pub server_tick: Tick,
     pub acked_seq: u16,

@@ -20,7 +20,7 @@ Status legend:
 | [003](003-town-shards-and-channels.md) | Cities and newbie zones are static shards with multiple channels | Open |
 | [004](004-social-economy-backend.md) | Trade, mail, chat, guilds, inventory split into a separate secured backend | Open |
 | [005](005-transport-split.md) | QUIC + TLS 1.3 for backend traffic, Lightyear UDP for the game channel | Open |
-| [006](006-netcode-lightyear.md) | Netcode library: Lightyear plus its built-in transport | Deviation |
+| [006](006-netcode-lightyear.md) | Netcode library: Lightyear plus its built-in transport | Partial |
 | [007](007-movement-packet.md) | One merged `PlayerMovementPacket`, unreliable, 30 Hz send / 60 Hz sim | Implemented |
 | [008](008-hybrid-physics-model.md) | Hybrid physics: kinematic character on Avian `MoveAndSlide` | Partial |
 | [009](009-collision-ownership.md) | Client owns terrain collision, server owns player and boss collision | Implemented |

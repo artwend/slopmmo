@@ -1,6 +1,8 @@
 # ADR 006 — Netcode library: Lightyear with its built-in transport
 
-- **Status:** **Deviation.** The decision stands; the current scaffold does not implement it.
+- **Status:** **Partial.** The transport half is implemented (Lightyear 0.31 owns the wire);
+  prediction/reconciliation/interpolation are still hand-rolled and moved over deliberately.
+
 - **Decided by:** project owner, first dialogue, turns 7 and 8.
 - **Verbatim:** *«Для соединения клиент<-> game server я хочу использовать это
   https://docs.rs/bevy_replicon/latest/bevy_replicon/ или
@@ -39,42 +41,58 @@ Non-goals that were made explicit in the dialogue:
 - Do not rely on Lightyear's standard input buffer for the merged movement packet (ADR 007); the
   owner merged input and movement report into one message, so redundancy is our own concern.
 
-## Deviation in this repository
+## Implementation status
 
-The prototype talks **raw UDP** (`crates/server/src/net.rs`, `crates/client/src/net.rs`) with a
-hand-rolled binary codec in `proto`. It reproduces the *protocol shape* decided in the dialogue
-(tick, sequence, redundancy, correction ids) and none of the *netcode machinery* (prediction
-history, rollback, interpolation, delta compression, channel scheduling).
+**Done — Lightyear owns the wire.** The raw UDP path (`crates/server/src/net.rs`,
+`crates/client/src/net.rs`) is deleted.
 
-Why, stated plainly: the first scaffold was meant to be testable in one `cargo run` with no
-dependency risk, and the Bevy version was pinned to 0.20 by the project brief while Lightyear's
-compatible release had to be verified first. That is a scheduling argument, not a design one —
-the decision in this ADR is unchanged.
+- `crates/net` declares the protocol: `InputChannel` (client → server,
+  `SequencedUnreliable`, `send_frequency = INPUT_SEND_HZ`, priority 2) and `SnapshotChannel`
+  (server → client, `SequencedUnreliable`, every tick, priority 1), plus the two messages
+  (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel
+  and message hashes agreed at handshake.
+- `crates/server/src/transport.rs`: a `ServerUdpIo` endpoint; lightyear spawns one link per remote
+  address, and our admission system binds a `player` id to that link on the first movement packet.
+  Peer timeout, superseded-link release and snapshot fan-out live here.
+- `crates/client/src/transport.rs`: `RawClient` + `UdpIo` + `LocalAddr(0.0.0.0:0)` +
+  `PeerAddr(server)`, `Connect`, then a plain `MessageSender`/`MessageReceiver` pair.
+- Verified live: `client --headless --connect 127.0.0.1:4000` → `net_sent 600`,
+  `net_snaps 1185`, server logs `admitted player 1`.
 
-## Convergence plan
+**Still ours, on purpose.** The client keeps its own KCC, its own redundancy window
+(`Local::report`), its own `CorrectionLog` idempotency and its own visual smoothing. Lightyear's
+`PredictionHistory`/`VisualCorrection` are not used yet: the two sides simulate *different*
+collision sets (ADR 009), so a correction is a velocity/normal hint plus a replay of the local
+KCC, which is exactly what a stock state-copy prediction would get wrong.
 
-1. Pin and build the Bevy 0.20-compatible Lightyear release in an isolated crate (`crates/net`)
-   before touching gameplay code; add a `--transport lightyear` flag to both binaries.
-2. Register the message types from `proto` on a Lightyear protocol: `PlayerMovementPacket` on an
-   *unreliable, sequenced* channel at `INPUT_SEND_HZ`, `ServerSnapshot` on an unreliable channel,
-   collision events on reliable-ordered.
-3. Replicate the peer-collider set as components (`Replicate`) instead of encoding
+**Deliberately not done yet.**
+
+- Peer colliders are still hand-encoded into `MAX_SNAPSHOT_PEERS` (ADR 011). Replicating them as
+  entities with a visibility filter is the next step; the K = 8 AOI cap stays.
+- No delta compression or prioritisation — one snapshot per player per tick, padded to
+  `DATAGRAM_BUDGET = 1200` worst case.
+- A running client that never sends is never admitted (no `Hello`): identity is the `player` field
+  of the first movement packet, per ADR 007.
+
+## Remaining convergence plan
+
+1. Replicate the peer-collider set as components (`Replicate`) instead of encoding
    `MAX_SNAPSHOT_PEERS` by hand, keeping the K = 8 AOI cap in the visibility filter.
-4. Move the client's local character into Lightyear prediction: the KCC becomes the predicted
+2. Move the client's local character into Lightyear prediction: the KCC becomes the predicted
    system, corrections arrive as replicated components, and the client replays from its own
    history rather than from a shadow position.
-5. Keep the headless harness as the acceptance test: identical invariant output, `net_snaps`
+3. Keep the headless harness as the acceptance test: identical invariant output, `net_snaps`
    replaced by a snapshot-count metric from the Lightyear client, same zero-malformed guarantee.
-6. Only then delete the raw UDP path.
 
 Acceptance: the live round trip passes through Lightyear, the headless invariant script produces
 the same `peak_y`/`deterministic` result, and the bot benchmark still fits the tick budget.
+The first clause is green today (`cargo test --workspace` = 33 tests, plus the live check).
 
 ## Open questions
 
-- Which Lightyear release pairs with Bevy 0.20 (0.31 was the candidate at decision time)?
-- Does Lightyear's unreliable channel support the *sequenced* (drop-older) semantics we rely on,
-  or do we need a custom message-ordering wrapper?
+- ~~Which Lightyear release pairs with Bevy 0.20?~~ Answered: Lightyear 0.31.0 on Bevy 0.20.1.
+- ~~Does Lightyear's unreliable channel support sequenced (drop-older) semantics?~~ Answered:
+  `ChannelMode::SequencedUnreliable` does, and it is what both channels use.
 - Simplification worth considering: because the server cannot verify terrain, the predicted
   component may only need `position/velocity/applied_correction_seq`, with the KCC replayed from
   server-provided collision events — that is a smaller prediction surface than a stock setup.

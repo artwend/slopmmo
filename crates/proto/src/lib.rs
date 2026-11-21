@@ -18,6 +18,7 @@ pub use packet::{
 pub use wire::{Reader, WireError, Writer};
 
 use core::f32::consts::TAU;
+use serde::{Deserialize, Serialize};
 
 /// Authoritative simulation rate.
 pub const TICK_HZ: u32 = 60;
@@ -64,7 +65,7 @@ pub const QUANT_NORMAL: f32 = 1000.0;
 ///
 /// Ordering is only meaningful modulo `u32` wrap; always compare with
 /// [`Tick::since`] rather than `Ord`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Tick(pub u32);
 
 impl Tick {
@@ -92,7 +93,7 @@ impl Tick {
 ///
 /// `move_x`/`move_z` are the camera-relative stick, quantised to `-127..=127`.
 /// `camera_yaw` is sent because the server must never reconstruct it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputFrame {
     pub tick: Tick,
     pub move_x: i8,

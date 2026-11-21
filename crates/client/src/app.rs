@@ -2,24 +2,13 @@
 
 use bevy::prelude::*;
 
-use crate::{Args, LocalPlayer};
+use crate::transport::{ClientNetPlugin, NetSet};
+use crate::{Args, Local, WorldRes};
 
-/// Shared world geometry for both the local solve and the rendered boxes.
-#[derive(Resource)]
-struct WorldRes(sim::StaticWorld);
-
-#[derive(Resource)]
+#[derive(Resource, Default)]
 struct PlayerRes {
-    player: LocalPlayer,
     accumulator: f32,
     input: proto::InputFrame,
-    tick: proto::Tick,
-    seq: u16,
-    /// Last few inputs, re-sent for redundancy on a lossy link.
-    recent: Vec<proto::InputFrame>,
-    /// Network client, when `--connect` was supplied.
-    net: Option<crate::net::ClientLink>,
-    corrections: crate::CorrectionLog,
 }
 
 #[derive(Component)]
@@ -38,40 +27,24 @@ pub fn run(args: &Args) {
     }))
     .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
     .insert_resource(WorldRes(sim::StaticWorld::test_room()))
-    .insert_resource(PlayerRes {
-        player: LocalPlayer::spawn(),
-        accumulator: 0.0,
-        input: proto::InputFrame::default(),
-        tick: proto::Tick::ZERO,
-        seq: 0,
-        recent: Vec::with_capacity(proto::MAX_INPUT_FRAMES),
-        net: args.connect.as_ref().and_then(|a| {
-            match crate::net::ClientLink::connect(a, args.player_id) {
-                Ok(link) => {
-                    println!("linked to {} as player {}", link.peer(), args.player_id);
-                    Some(link)
-                }
-                Err(e) => {
-                    eprintln!("connect to {a} failed: {e}");
-                    None
-                }
-            }
-        }),
-        corrections: crate::CorrectionLog::default(),
-    })
+    .init_resource::<Local>()
+    .init_resource::<PlayerRes>()
     .add_systems(Startup, setup)
     .add_systems(
         Update,
-        (
-            sample_input,
-            simulate,
-            uplink,
-            sync_avatar,
-            follow,
-            pump_net,
-        )
-            .chain(),
+        (sample_input, simulate, sync_avatar, follow)
+            .chain()
+            // Corrections land before the solve, reports leave after it.
+            .after(NetSet::Receive)
+            .before(NetSet::Send),
     );
+
+    if let Some(addr) = args.connect_addr() {
+        app.add_plugins(ClientNetPlugin {
+            server: addr,
+            player_id: args.player_id,
+        });
+    }
 
     app.run();
 }
@@ -142,7 +115,12 @@ fn setup(
     ));
 }
 
-fn sample_input(keys: Res<ButtonInput<KeyCode>>, mut res: ResMut<PlayerRes>, time: Res<Time>) {
+fn sample_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut res: ResMut<PlayerRes>,
+    mut local: ResMut<Local>,
+    time: Res<Time>,
+) {
     let axis = |pos: KeyCode, neg: KeyCode| -> f32 {
         let p = keys.pressed(pos) as i32;
         let n = keys.pressed(neg) as i32;
@@ -160,28 +138,27 @@ fn sample_input(keys: Res<ButtonInput<KeyCode>>, mut res: ResMut<PlayerRes>, tim
     }
 
     let turn = (keys.pressed(KeyCode::KeyE) as i32 - keys.pressed(KeyCode::KeyQ) as i32) as f32;
-    res.player.yaw -= turn * 2.5 * time.delta_secs();
+    local.player.yaw -= turn * 2.5 * time.delta_secs();
 
     res.input = proto::InputFrame {
-        tick: res.tick,
         move_x: (x * 127.0).clamp(-127.0, 127.0) as i8,
         move_z: (z * 127.0).clamp(-127.0, 127.0) as i8,
         buttons,
-        camera_yaw: proto::quantise_yaw(res.player.yaw),
+        camera_yaw: proto::quantise_yaw(local.player.yaw),
+        ..default()
     };
 }
 
-fn simulate(time: Res<Time>, world: Res<WorldRes>, mut res: ResMut<PlayerRes>) {
+fn simulate(
+    time: Res<Time>,
+    world: Res<WorldRes>,
+    mut local: ResMut<Local>,
+    mut res: ResMut<PlayerRes>,
+) {
     res.accumulator += time.delta_secs();
     let mut steps = 0;
     while res.accumulator >= proto::TICK_DT && steps < 8 {
-        res.tick = res.tick.add(1);
-        let input = res.input;
-        res.player.tick(&world.0, &input, proto::TICK_DT);
-        res.recent.push(input);
-        if res.recent.len() > proto::MAX_INPUT_FRAMES {
-            res.recent.remove(0);
-        }
+        local.step(&world.0, res.input);
         res.accumulator -= proto::TICK_DT;
         steps += 1;
     }
@@ -190,75 +167,18 @@ fn simulate(time: Res<Time>, world: Res<WorldRes>, mut res: ResMut<PlayerRes>) {
     }
 }
 
-/// Sends a report at `INPUT_SEND_HZ` with a few redundant inputs attached.
-fn uplink(mut res: ResMut<PlayerRes>) {
-    let PlayerRes {
-        net,
-        player,
-        recent,
-        tick,
-        seq,
-        ..
-    } = &mut *res;
-    let Some(link) = net.as_mut() else {
-        return;
-    };
-
-    let every = (proto::TICK_HZ / proto::INPUT_SEND_HZ).max(1);
-    if tick.0 % every != 0 {
-        return;
-    }
-
-    *seq = seq.wrapping_add(1);
-    let mut inputs = recent.clone();
-    inputs.reverse();
-    let packet = proto::PlayerMovementPacket {
-        seq: *seq,
-        player: link.player_id,
-        report: proto::MovementReport {
-            tick: *tick,
-            position: player.pos.to_array(),
-            velocity: player.vel.to_array(),
-            body_yaw: player.yaw,
-            grounded: player.grounded,
-            applied_correction_seq: 0,
-        },
-        inputs,
-    };
-    link.send(&packet);
-}
-
-fn sync_avatar(mut q: Query<&mut Transform, With<Avatar>>, res: Res<PlayerRes>) {
+fn sync_avatar(mut q: Query<&mut Transform, With<Avatar>>, local: Res<Local>) {
     for mut t in &mut q {
-        t.translation = res.player.pos;
-        t.rotation = Quat::from_rotation_y(res.player.yaw);
+        t.translation = local.player.pos;
+        t.rotation = Quat::from_rotation_y(local.player.yaw);
     }
 }
 
-fn follow(res: Res<PlayerRes>, mut q: Query<&mut Transform, With<Camera3d>>) {
-    let rotated = Quat::from_rotation_y(res.player.yaw) * Vec3::new(0.0, 6.0, 9.0);
-    let eye = res.player.pos + rotated;
+fn follow(local: Res<Local>, mut q: Query<&mut Transform, With<Camera3d>>) {
+    let rotated = Quat::from_rotation_y(local.player.yaw) * Vec3::new(0.0, 6.0, 9.0);
+    let eye = local.player.pos + rotated;
     for mut t in &mut q {
         t.translation = eye;
-        t.look_at(res.player.pos + Vec3::Y * 0.6, Vec3::Y);
-    }
-}
-
-fn pump_net(mut res: ResMut<PlayerRes>) {
-    let PlayerRes {
-        net,
-        player,
-        corrections,
-        ..
-    } = &mut *res;
-    let Some(link) = net.as_mut() else {
-        return;
-    };
-    for snapshot in link.drain_snapshots() {
-        if let Some(c) = snapshot.correction
-            && corrections.accept(&c)
-        {
-            player.apply_correction(&c);
-        }
+        t.look_at(local.player.pos + Vec3::Y * 0.6, Vec3::Y);
     }
 }

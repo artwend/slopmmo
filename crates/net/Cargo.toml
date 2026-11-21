@@ -1,0 +1,17 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+proto.workspace = true
+bevy_app = "0.20"
+
+# Both ends of the protocol live here so the registration order — and therefore
+# the protocol hash — is identical on the client and the server.
+lightyear = { version = "0.31", default-features = false, features = ["std", "client", "server"] }
+
+[dev-dependencies]
+postcard = { version = "1", features = ["alloc"] }
