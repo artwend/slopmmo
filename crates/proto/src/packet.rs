@@ -366,10 +366,16 @@ impl CollisionCorrection {
 pub struct ServerSnapshot {
     pub server_tick: Tick,
     pub acked_seq: u16,
-    /// Server shadow position. Informational: the client must not adopt it.
+    /// Server shadow position. Informational: the client must not adopt it,
+    /// except while `resync` is set.
     pub shadow_position: [f32; 3],
     pub correction: Option<CollisionCorrection>,
     pub peers: PeerList,
+    /// Set while a resumed session has not yet been seen at the server's
+    /// placement: the client must adopt `shadow_position`. Kept set until an
+    /// accepted report arrives, so a lost unreliable snapshot cannot strand a
+    /// resumed client far from its shadow.
+    pub resync: bool,
 }
 
 impl ServerSnapshot {
@@ -381,12 +387,12 @@ impl ServerSnapshot {
         for v in self.shadow_position {
             w.i32(quantise_position(v));
         }
-        match &self.correction {
-            Some(c) => {
-                w.u8(1);
-                c.write(&mut w);
-            }
-            None => w.u8(0),
+        // Bit 0: correction present, bit 1: resync. Packed so the resync flag
+        // costs no byte in the designed layout.
+        let flags = u8::from(self.correction.is_some()) | (u8::from(self.resync) << 1);
+        w.u8(flags);
+        if let Some(c) = &self.correction {
+            c.write(&mut w);
         }
         let n = self.peers.len();
         w.u8(n as u8);
@@ -408,11 +414,13 @@ impl ServerSnapshot {
         for v in &mut shadow_position {
             *v = dequantise_position(r.i32()?);
         }
-        let correction = if r.u8()? != 0 {
+        let flags = r.u8()?;
+        let correction = if flags & 1 != 0 {
             Some(CollisionCorrection::read(&mut r)?)
         } else {
             None
         };
+        let resync = flags & 2 != 0;
         let n = r.count(MAX_SNAPSHOT_PEERS)?;
         let mut peers = PeerList::new();
         for _ in 0..n {
@@ -426,6 +434,7 @@ impl ServerSnapshot {
             shadow_position,
             correction,
             peers,
+            resync,
         })
     }
 
@@ -483,6 +492,7 @@ mod tests {
             acked_seq: 3,
             shadow_position: [1.0, 0.0, 2.0],
             correction: None,
+            resync: false,
             peers: core::iter::once(PeerCollider {
                 player: 1,
                 position: [0.1, 0.2, 0.3],
@@ -493,6 +503,7 @@ mod tests {
         };
         let back = ServerSnapshot::decode(&empty.encode()).unwrap();
         assert!(back.correction.is_none());
+        assert!(!back.resync);
         assert_eq!(back.peers.len(), 1);
         assert_eq!(back.peers.as_slice()[0].mode, peer_mode::SOFT);
 
@@ -512,6 +523,24 @@ mod tests {
         assert_eq!(c.epoch, 7);
         assert!((c.velocity_delta[0] - 0.5).abs() < 1e-3);
         assert!(c.hard_normal.is_some());
+        assert!(!back.resync, "resync invented from the correction flag");
+
+        // The flag is independent of the correction, in both combinations.
+        let resync_only = ServerSnapshot {
+            resync: true,
+            ..empty
+        };
+        let back = ServerSnapshot::decode(&resync_only.encode()).unwrap();
+        assert!(back.resync);
+        assert!(back.correction.is_none());
+
+        let both = ServerSnapshot {
+            resync: true,
+            ..with
+        };
+        let back = ServerSnapshot::decode(&both.encode()).unwrap();
+        assert!(back.resync);
+        assert!(back.correction.is_some());
     }
 
     #[test]

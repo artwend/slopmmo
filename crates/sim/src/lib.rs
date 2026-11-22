@@ -18,7 +18,7 @@ pub mod movement;
 pub mod spatial;
 pub mod world;
 
-pub use authority::{Reject, ServerPlayer, SimConfig, SimStats, Simulation};
+pub use authority::{Reject, Resume, ServerPlayer, SimConfig, SimStats, Simulation};
 pub use collision::{Body, Impulse, Mode, Pair, PairScratch};
 pub use kcc::{Capsule, KccParams, MoveOutput};
 pub use movement::{MoveParams, step_velocity};

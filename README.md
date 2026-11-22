@@ -61,11 +61,13 @@ Consequences that are enforced in code, not just documented:
   contact normal, with `(seq, tick, epoch)` so re-delivery is idempotent
   (`client::CorrectionLog`). Snapping the client's position would fight its own solver.
 - **The server's position is a shadow.** It is reported back as `shadow_position`, marked
-  informational in the packet type, and the client must not adopt it.
+  informational in the packet type, and the client must not adopt it — except while the `resync`
+  flag is set, which happens only when a resumed session's claim had to be clamped.
 - **No rewind anywhere.** Lag compensation is not implemented; the review argues it should be
   built on collider state, not on motion, and that is the shape the peer colliders take.
-- **Rejects are counted, never clamped.** `Reject::{DuplicateSeq, StaleTick, TooFast, Teleport}`
-  are metrics and cheat signals.
+- **Report rejects are counted, never clamped.** `Reject::{DuplicateSeq, StaleTick, TooFast,
+  Teleport}` are metrics and cheat signals. The one deliberate clamp is a resume: the reported
+  position is limited to the travel possible from the parked shadow (`architecture-review.md` §8).
 - **Terrain is client-side**, so a boss-vs-terrain contact that only the client can see is
   reported as a hard contact rather than resolved server-side.
 - **The tick does not allocate.** The grid, the solver scratch and the snapshot buffer are owned and
@@ -76,7 +78,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 39 tests: proto, net, sim, server, client
+cargo test --workspace          # 47 tests: proto, net, sim, server, client
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -140,20 +142,25 @@ client to reach them. The client always binds an unspecified local address so it
 server, not just a local one.
 
 The headless script is replayed against the real server over Lightyear, paced to real time so
-round trips can complete. It reports `net_sent`, `net_snaps` and `net_corrections`, and fails if
-no snapshot arrives:
+round trips can complete. It reports `net_sent`, `net_snaps`, `net_corrections` and `net_resyncs`,
+and fails if no snapshot arrives:
 
 ```
 net_sent        600
 net_snaps       1185
 net_corrections 0        # same KCC on both sides, so the wall slide needs no correction
+net_resyncs     0        # a continuous session is never placed by the server
 result          ok
 ```
 
 There is no `Hello`: the first movement packet's `player` field binds that link to a player id and
 spawns its shadow at the reported pose. Two clients claiming one id is a known limitation — the
-newest link wins and the body is not released from under it. A peer silent for 10 s is dropped
-together with its shadow and its sequence state.
+newest link wins while the body is live. A peer silent for 10 s is dropped, but its shadow is parked
+for `RESUME_WINDOW` (120 s); the next link for the same id is placed from that shadow, and its
+claimed position is clamped to the travel possible since the last accepted report. A clamped resume
+makes the client adopt `shadow_position` (`net_resyncs` counts those snapshots), so the session
+continues from where the server put it instead of being rejected as a teleport for the rest of its
+life. After the window, the id is a first admission again.
 
 The client's tick counter starts at zero while the server's has been running since launch, so
 every player carries an offset, anchored on its first report and re-anchored when a long hitch

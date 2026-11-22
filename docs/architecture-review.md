@@ -129,12 +129,11 @@ dead zone around the contact distance.
    reproduced exactly once during replay, not sit in a "current impulse" field.
 4. **No arithmetic**, despite "performance first". 10k players × 8 pairs × 30 Hz ≈ 2.4M pair
    evaluations/s plus 300k grid inserts/s. Feasible in a few ms/core — but it must be measured.
-5. **Reconnect/resume** with a client-authoritative position.
-6. **Tick mapping** between a 60 Hz client and a 30 Hz server: two client ticks fall into one
+5. **Tick mapping** between a 60 Hz client and a 30 Hz server: two client ticks fall into one
    server tick. Which server tick does a correction attach to?
-7. **Combat lag compensation** reuses server entity history — the dialogue says combat is a
+6. **Combat lag compensation** reuses server entity history — the dialogue says combat is a
    separate system but never says where that history lives.
-8. **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
+7. **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
    Lightyear 0.30 `PredictionHistory` / `ConfirmedHistory` / `VisualCorrection` were asserted
    without verification against the docs.
 
@@ -326,3 +325,47 @@ Honest list, so the next review does not have to rediscover them:
 - Lightyear serialises outgoing messages into its own buffers; that cost is inside
   `MessageSender::send` and is not covered by the allocation guard.
 - `std::net::UdpSocket::bind` probe in `main` is a one-shot startup check, not a hot path.
+
+---
+
+## 8. Reconnect/resume: the shadow now outlives the link
+
+Moved out of §3 (*what was never considered*), because it is now considered and fixed. The dialogue
+never connected reconnection to the movement model, and the transport resolved it the worst possible
+way: a silent peer's shadow body was deleted, and the first report on the next link was admitted at
+whatever position it claimed. Dropping the connection and reconnecting was therefore an instant,
+repeatable teleport — the one check the server *does* have, the displacement rule in
+`Simulation::ingest`, was skipped entirely.
+
+The fix keeps that check's baseline instead of deleting it:
+
+- **Departure parks the shadow.** `Peers::release` calls `Simulation::detach_player`, which removes
+  the body from the world but keeps its pose, velocity, yaw and grounded flag in a small parked
+  table keyed by player id.
+- **Resume is clamped to the shadow.** `Simulation::resume_player` reinstates the parked state and
+  accepts the reported position only as far as `SimConfig::resume_travel` allows — the same
+  `MAX_SPEED × speed_slack × REPORT_WINDOW` budget the displacement validator gives a report that is
+  half a second late, plus `POSITION_SLACK` (5.4 m with today's constants). A claim beyond that is
+  clamped along the claimed direction; the claimed velocity is discarded and the shadow's last
+  validated velocity is restored.
+- **The admission report arms the baseline.** The resumed player's `last_seq`/`last_tick` come from
+  the report that performed the resume, so the *next* packet is measured from the placement. Without
+  that, a client with a high tick counter would get an unbounded allowance on its next report and
+  undo the clamp immediately.
+- **Travel is bounded by server time.** The displacement allowance is computed from the server ticks
+  elapsed since the last accepted report, not from the difference between the report's own tick
+  fields. The report tick is client data; measuring with it let a forged tick jump — which the clock
+  re-anchor deliberately accepts — buy an unbounded allowance, so the clamp could be walked back one
+  packet later.
+- **The client is told to adopt the placement.** A clamped resume sets `resync` on the player's
+  snapshots. The client applies `shadow_position` (and zeroes its velocity) while the flag is set;
+  the server clears it on the first accepted report. Repeating it matters: the snapshot channel is
+  unreliable, and a one-shot flag lost on the wire would leave the client forever outside the
+  displacement budget.
+- **Parked shadows expire.** After `RESUME_WINDOW` (120 s) a resume is no longer possible and the id
+  is a first admission again.
+
+What this does *not* fix, stated plainly: identity is still the `player` field of the first packet
+(ADR 006), so an attacker who does not care about a particular id can join as a fresh one, and the
+first admission still trusts the report. Both belong to the unbuilt auth and spawn-point path; this
+change makes sure that *keeping* an identity is not a way around validation.

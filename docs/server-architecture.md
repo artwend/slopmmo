@@ -121,6 +121,11 @@ Invariants:
 - No rewind. There is no historical collision state; lag compensation is unbuilt and belongs to the
   combat design (ADR 013).
 - Extrapolation is bounded by `REPORT_WINDOW` (30 ticks), then the actor is frozen.
+- A departed player's shadow is parked for `RESUME_WINDOW`; a resume is placed from that shadow and
+  its claim is clamped to the travel possible since the last accepted report. Reconnecting is never
+  a way to move.
+- Travel is measured against the **server's** ticks since the last accepted report, never against
+  the client-declared report tick. The report tick decides staleness and ordering only.
 - Everything is deterministic: fixed `dt`, tie-broken iteration order, no wall-clock input.
 - The steady state **does not allocate** and does not block. See §3.5.
 
@@ -153,7 +158,7 @@ once.
 | Channel | Reliability | Rate | Content |
 | --- | --- | --- | --- |
 | client → server movement | unreliable, sequenced | 30 Hz, newest + 3 inputs | `PlayerMovementPacket` |
-| server → client snapshot | unreliable, sequenced | tick rate (adaptive not built) | tick, ack, shadow pos, correction, peers |
+| server → client snapshot | unreliable, sequenced | tick rate (adaptive not built) | tick, ack, shadow pos, correction, peers, `resync` |
 | corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
 | discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
 
@@ -172,7 +177,7 @@ than an accident (see `architecture-review.md` §7 for the audit that got here).
 | Spatial grid | CSR: flat `items` ordered by cell + `starts` prefix table + `cursor` scatter buffer | counting sort instead of hashing; no per-cell `Vec`; buffers reused every rebuild |
 | Broadphase / solver | `PairScratch` owned by the simulation | four `Vec`s and an `Impulse` array that never reallocate after the first tick |
 | Snapshots | `Vec<(u64, ServerSnapshot)>` owned by the simulation, peers inline (`PeerList`) | `ServerSnapshot` is `Copy`, so the transport sends a copy instead of cloning a heap vector |
-| AOI peer selection | inline `[(f32, usize); 16]` window per player | no per-player `Vec`, no per-player sort |
+| AOI peer selection | grid candidates → inline `[(f32, usize); 16]` window per player | the grid culls the scan to nearby cells instead of every body; no per-player `Vec`, no per-player sort |
 
 `crates/sim/tests/allocations.rs` guards this: a counting global allocator asserts that 64
 steady-state ticks perform zero allocations. A `vec![]`, a `collect()` or a heap `clone()` added to
@@ -257,6 +262,8 @@ create → auth → character select → place in zone instance → play → han
 | Neighbour cap | 8 | `proto::MAX_NEIGHBOURS` |
 | Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
 | Report window | 30 ticks (0.5 s) | `proto::REPORT_WINDOW` |
+| Resume window | 120 s (7200 ticks) | `sim::authority::RESUME_WINDOW` |
+| Resume travel allowance | 5.4 m | `SimConfig::resume_travel()` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
 | Measured tick cost | 0.039 ms at 32 bots, 0.993 ms at 256 bots | `server --bots N --duration 3` |
@@ -283,6 +290,7 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |
 | Correction protocol with `(seq, tick, epoch)` | Implemented |
 | Lightyear UDP transport with admission, timeout, orphan release | Implemented |
+| Reconnect/resume clamp: parked shadow, clamped claim, `resync` adoption | Implemented |
 | Per-player clock offset mapping | Implemented |
 | Lightyear netcode | **Partial** — Lightyear 0.31 owns the wire, prediction/interpolation still ours (ADR 006) |
 | Roles, raids, parties | Absent |

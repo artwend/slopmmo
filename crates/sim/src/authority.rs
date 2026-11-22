@@ -5,6 +5,11 @@
 //! plausible and (b) run the capsule-vs-capsule solve that the client cannot do
 //! alone. Nothing here rewinds, and nothing here is "authoritative movement" —
 //! the review calls that out explicitly.
+//!
+//! A departed player keeps its shadow in a small parked table. Admission cannot
+//! be allowed to trust a first report on a new link: deleting the shadow would
+//! make "disconnect, reconnect, claim any position" a free teleport. A resume is
+//! placed from the parked shadow instead.
 
 use std::collections::HashMap;
 
@@ -24,6 +29,8 @@ pub struct SimConfig {
     /// Multiplier on `MAX_SPEED` for the velocity sanity check.
     pub speed_slack: f32,
     pub report_window: u32,
+    /// Ticks a departed player's shadow stays available for a resume.
+    pub resume_window: u32,
     pub epoch: u32,
 }
 
@@ -36,14 +43,32 @@ impl Default for SimConfig {
             correction_budget: proto::CORRECTION_BUDGET,
             speed_slack: 1.35,
             report_window: proto::REPORT_WINDOW,
+            resume_window: RESUME_WINDOW,
             epoch: 1,
         }
     }
 }
 
+/// How long a departed player's shadow stays available to validate a resume.
+///
+/// Long enough for a crash-restart or a network outage; short enough that the
+/// parked poses of players who are gone for good cannot accumulate.
+pub const RESUME_WINDOW: u32 = 120 * proto::TICK_HZ;
+
 impl SimConfig {
     pub fn dt(&self) -> f32 {
         1.0 / self.tick_hz.max(1) as f32
+    }
+
+    /// Largest displacement a resume may claim from the shadow it left behind.
+    ///
+    /// A disconnected client cannot legitimately move at all, so the allowance
+    /// is the same one the displacement validator gives a report that is
+    /// [`Self::report_window`] ticks late — the most the client can have moved
+    /// after its last accepted report.
+    pub fn resume_travel(&self) -> f32 {
+        proto::MAX_SPEED * self.speed_slack * self.report_window as f32 * self.dt()
+            + proto::POSITION_SLACK
     }
 }
 
@@ -64,15 +89,39 @@ pub struct SimStats {
     pub stale: u32,
     pub too_fast: u32,
     pub teleport: u32,
+    pub resumed: u32,
+    pub resume_clamped: u32,
     pub pairs: u32,
     pub corrections: u32,
     pub hard_contacts: u32,
 }
 
+/// Where a resume landed, and whether the claim had to be clamped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Resume {
+    /// Position the shadow was reinstated at.
+    pub pos: Vec3,
+    /// Position the client claimed on the new link.
+    pub reported: Vec3,
+    /// True when the claim exceeded [`SimConfig::resume_travel`].
+    pub clamped: bool,
+}
+
+/// The shadow of a player that left, kept until a resume or the window expires.
+#[derive(Clone, Copy, Debug)]
+struct ParkedShadow {
+    pos: Vec3,
+    vel: Vec3,
+    body_yaw: f32,
+    grounded: bool,
+    at: proto::Tick,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerPlayer {
     pub id: u64,
-    /// Shadow pose. Never sent as a target, only as an informational reference.
+    /// Shadow pose. Sent as an informational reference, except for the
+    /// `resync` placement that follows a clamped resume.
     pub pos: Vec3,
     pub vel: Vec3,
     pub body_yaw: f32,
@@ -86,6 +135,13 @@ pub struct ServerPlayer {
     /// accepted report and re-anchored when the domains drift apart, because the
     /// client's tick counter has nothing to do with the server's absolute tick.
     pub tick_offset: Option<u32>,
+    /// Server tick of the last accepted report. The displacement check is
+    /// measured on this clock, never on the client-declared report tick.
+    pub last_server_tick: proto::Tick,
+    /// Set when a resume had to clamp the client's claim. Snapshots carry the
+    /// placement while this is set; the first accepted report clears it, so a
+    /// lost unreliable snapshot cannot strand the client.
+    pub needs_resync: bool,
 }
 
 impl ServerPlayer {
@@ -102,6 +158,8 @@ impl ServerPlayer {
             last_correction_tick: None,
             budget_used: 0.0,
             tick_offset: None,
+            last_server_tick: proto::Tick::ZERO,
+            needs_resync: false,
         }
     }
 
@@ -129,6 +187,8 @@ struct Scratch {
     bodies: Vec<Body>,
     positions: Vec<Vec3>,
     pairs: PairScratch,
+    /// AOI candidate indices for the snapshot build, reused every tick.
+    candidates: Vec<u32>,
 }
 
 /// Authoritative state.
@@ -146,6 +206,8 @@ pub struct Simulation {
     players: Vec<ServerPlayer>,
     /// `id → index into ↓players`. Only touched on join, leave and ingest.
     slots: HashMap<u64, u32>,
+    /// Shadows of players that left, keyed by id, until a resume or expiry.
+    detached: HashMap<u64, ParkedShadow>,
     grid: SpatialGrid,
     scratch: Scratch,
     /// `(player, snapshot)` for the most recent tick, in the same order as
@@ -162,6 +224,7 @@ impl Simulation {
             blockers: Vec::new(),
             players: Vec::new(),
             slots: HashMap::new(),
+            detached: HashMap::new(),
             grid: SpatialGrid::new(proto::NEIGHBOUR_RADIUS * 2.0),
             scratch: Scratch::default(),
             snapshots: Vec::new(),
@@ -206,11 +269,18 @@ impl Simulation {
     }
 
     pub fn add_player(&mut self, id: u64, pos: Vec3) -> &mut ServerPlayer {
+        // A fresh admission supersedes any shadow left by an earlier session.
+        self.detached.remove(&id);
+        let now = self.tick;
         let slot = match self.slots.get(&id) {
             Some(&slot) => slot as usize,
             None => {
                 let slot = self.players.len() as u32;
-                self.players.push(ServerPlayer::new(id, pos));
+                let mut player = ServerPlayer::new(id, pos);
+                // Travel is measured from the moment the body appeared, not
+                // from whatever tick the client puts in its first report.
+                player.last_server_tick = now;
+                self.players.push(player);
                 self.slots.insert(id, slot);
                 slot as usize
             }
@@ -219,6 +289,7 @@ impl Simulation {
     }
 
     pub fn remove_player(&mut self, id: u64) -> Option<ServerPlayer> {
+        self.detached.remove(&id);
         let slot = self.slots.remove(&id)? as usize;
         let removed = self.players.swap_remove(slot);
         // The tail body now occupies the vacated slot; re-point its id at it.
@@ -226,6 +297,96 @@ impl Simulation {
             self.slots.insert(moved.id, slot as u32);
         }
         Some(removed)
+    }
+
+    /// Takes a live player out of the world but keeps the shadow it leaves
+    /// behind, so a later resume can be validated against it.
+    ///
+    /// Deleting the pose instead would make "disconnect and reconnect" a free
+    /// teleport: admission has nothing else to compare the first report to.
+    pub fn detach_player(&mut self, id: u64) -> bool {
+        self.expire_detached();
+        let Some(removed) = self.remove_player(id) else {
+            return false;
+        };
+        self.detached.insert(
+            id,
+            ParkedShadow {
+                pos: removed.pos,
+                vel: removed.vel,
+                body_yaw: removed.body_yaw,
+                grounded: removed.grounded,
+                at: self.tick,
+            },
+        );
+        true
+    }
+
+    /// Reinstates a detached player from the shadow it left behind.
+    ///
+    /// The report on the new link is checked, not trusted: a disconnected
+    /// client cannot legitimately move, so a claim farther from the parked
+    /// shadow than [`SimConfig::resume_travel`] is clamped to that radius.
+    /// The admission report also becomes the baseline for the ordinary
+    /// displacement check — otherwise a client with a high tick counter would
+    /// get an unbounded allowance on its next packet and could undo the clamp
+    /// immediately.
+    ///
+    /// Returns `None` when no unexpired shadow exists for the id; the caller
+    /// then treats the packet as a first admission.
+    pub fn resume_player(&mut self, packet: &proto::PlayerMovementPacket) -> Option<Resume> {
+        if self.contains_player(packet.player) {
+            return None;
+        }
+        self.expire_detached();
+        let shadow = self.detached.remove(&packet.player)?;
+
+        let report = &packet.report;
+        let reported = Vec3::from_array(report.position);
+        let offset = reported - shadow.pos;
+        let claim = offset.length();
+        let allowed = self.config.resume_travel();
+        let clamped = !claim.is_finite() || claim > allowed;
+        let pos = if !claim.is_finite() {
+            shadow.pos
+        } else if clamped {
+            shadow.pos + offset / claim * allowed
+        } else {
+            reported
+        };
+
+        let now = self.tick.0;
+        let player = self.add_player(packet.player, pos);
+        // The shadow's own state is restored; the claim's velocity is not part
+        // of the placement and is not re-validated here.
+        player.vel = shadow.vel;
+        player.body_yaw = shadow.body_yaw;
+        player.grounded = shadow.grounded;
+        player.last_seq = packet.seq;
+        player.last_tick = report.tick;
+        player.tick_offset = Some(now.wrapping_sub(report.tick.0));
+        player.needs_resync = clamped;
+
+        self.stats.resumed += 1;
+        if clamped {
+            self.stats.resume_clamped += 1;
+        }
+        Some(Resume {
+            pos,
+            reported,
+            clamped,
+        })
+    }
+
+    /// Drops parked shadows older than [`SimConfig::resume_window`].
+    ///
+    /// Called whenever a shadow is parked or consumed, so a server that keeps
+    /// seeing departures never accumulates them.
+    fn expire_detached(&mut self) {
+        let now = self.tick;
+        let window = self.config.resume_window.min(i32::MAX as u32) as i32;
+        self.detached
+            .retain(|_, p| (0..=window).contains(&p.at.since(now)));
     }
 
     /// Adds an immovable collider (boss body, destructible scenery, NPC).
@@ -295,14 +456,18 @@ impl Simulation {
 
         // Displacement check: the report may not claim more travel than the
         // elapsed ticks could produce. This is the check the dialogue missed —
-        // validating velocity alone lets a client teleport slowly.
+        // validating velocity alone lets a client teleport slowly. The elapsed
+        // time is the *server's*, because the report's own tick is client data:
+        // measuring with it would let a forged tick jump (which the clock
+        // re-anchor above deliberately accepts) buy an unbounded allowance and
+        // undo a resume clamp on the very next packet.
         let pos = Vec3::from_array(report.position);
         if !pos.is_finite() {
             return Err(Reject::Teleport);
         }
-        let ticks = report.tick.since(player.last_tick).max(1) as f32;
+        let elapsed = tick.since(player.last_server_tick).max(1) as f32;
         let allowed =
-            proto::MAX_SPEED * config.speed_slack * ticks * config.dt() + proto::POSITION_SLACK;
+            proto::MAX_SPEED * config.speed_slack * elapsed * config.dt() + proto::POSITION_SLACK;
         let travelled = (pos - player.pos).length();
         if travelled > allowed {
             stats.teleport += 1;
@@ -315,6 +480,9 @@ impl Simulation {
         player.grounded = report.grounded;
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
+        player.last_server_tick = *tick;
+        // An accepted report proves the session is at the server's placement.
+        player.needs_resync = false;
 
         stats.accepted += 1;
         Ok(())
@@ -347,6 +515,7 @@ impl Simulation {
             bodies,
             positions,
             pairs,
+            candidates,
         } = scratch;
 
         bodies.clear();
@@ -394,6 +563,8 @@ impl Simulation {
             players,
             bodies,
             impulses,
+            grid,
+            candidates,
             *tick,
             config.epoch,
             stats,
@@ -431,6 +602,8 @@ fn build_snapshots(
     players: &mut [ServerPlayer],
     bodies: &[Body],
     impulses: &[collision::Impulse],
+    grid: &SpatialGrid,
+    candidates: &mut Vec<u32>,
     tick: proto::Tick,
     epoch: u32,
     stats: &mut SimStats,
@@ -457,13 +630,22 @@ fn build_snapshots(
         };
 
         // AOI peers: nearest colliders within the neighbour radius, capped.
-        // Tracked in a fixed inline window, so this costs no allocation and one
-        // pass over the bodies — no per-player `Vec` and no per-player sort.
+        // The grid narrows the scan to the cells around the player instead of
+        // every body; the exact distance test below is unchanged, so the peer set
+        // is identical to a full scan. The inline window keeps this allocation
+        // free, and its (distance, index) order makes the result independent of
+        // the order the grid hands candidates back.
         let mut near: [(f32, usize); proto::MAX_SNAPSHOT_PEERS] =
             [(f32::INFINITY, usize::MAX); proto::MAX_SNAPSHOT_PEERS];
         let mut near_len = 0usize;
-        for (j, b) in bodies.iter().enumerate() {
-            if j == i || b.mode == Mode::None {
+        grid.candidates(p.pos, aoi_radius, candidates);
+        for &j in candidates.iter() {
+            let j = j as usize;
+            if j == i {
+                continue;
+            }
+            let b = &bodies[j];
+            if b.mode == Mode::None {
                 continue;
             }
             let d = ((b.pos.x - p.pos.x).powi(2) + (b.pos.z - p.pos.z).powi(2)).sqrt();
@@ -493,6 +675,7 @@ fn build_snapshots(
                 shadow_position: p.pos.to_array(),
                 correction,
                 peers,
+                resync: p.needs_resync,
             },
         ));
     }

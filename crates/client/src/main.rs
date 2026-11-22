@@ -236,8 +236,17 @@ impl Local {
         })
     }
 
-    /// Applies a snapshot's correction; false when it was a duplicate or absent.
+    /// Applies a snapshot's placement and correction; false when no correction
+    /// was applied (a resync-only snapshot returns false).
     pub fn accept_snapshot(&mut self, snapshot: &proto::ServerSnapshot) -> bool {
+        if snapshot.resync {
+            // A resumed session is placed by the server. This is the one case
+            // where the shadow position is adopted instead of predicted;
+            // dropping the local velocity stops the snap from turning into a
+            // burst of movement.
+            self.player.pos = Vec3::from_array(snapshot.shadow_position);
+            self.player.vel = Vec3::ZERO;
+        }
         let Some(c) = &snapshot.correction else {
             return false;
         };

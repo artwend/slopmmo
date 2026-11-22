@@ -24,6 +24,7 @@ pub struct NetStats {
     pub sent: u64,
     pub received: u64,
     pub corrections: u64,
+    pub resyncs: u64,
 }
 
 pub struct ClientNetPlugin {
@@ -85,6 +86,13 @@ fn drain_snapshots(
         };
         for snapshot in receiver.receive() {
             stats.received += 1;
+            if snapshot.resync {
+                stats.resyncs += 1;
+                info!(
+                    "server placed this session at {:?}",
+                    snapshot.shadow_position
+                );
+            }
             if local.accept_snapshot(&snapshot) {
                 stats.corrections += 1;
             }

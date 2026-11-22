@@ -32,7 +32,8 @@ Rank every validation by cost/benefit and accept the gaps:
 
 Heuristic level, stated honestly: a modified client can walk through walls, teleport slowly, and
 climb geometry. It cannot move faster than `MAX_SPEED` per window, cannot skip ticks, cannot win a
-PvP collision, and cannot replay old input. That is the intended bar: *"don't make cheating trivial"*.
+PvP collision, cannot replay old input, and cannot turn a reconnect into a teleport. That is the
+intended bar: *"don't make cheating trivial"*.
 
 ## Consequences
 
@@ -41,6 +42,9 @@ PvP collision, and cannot replay old input. That is the intended bar: *"don't ma
 - The `TooFast` reject in `authority.rs` is deliberately tolerant (`POSITION_SLACK = 1.35`) because a
   legitimate step-up, jump arc or slope changes the horizontal/vertical ratio. A tight bound
   produces false positives on stairs, which are far more damaging than a small speed hack.
+- The displacement window is measured on the **server tick counter** since the last accepted report,
+  not on the client's report tick. The report tick orders and ages the report; letting it also scale
+  the allowance would mean a modified client could widen its own budget by forging a jump.
 - Detection is out of scope for the simulation node; if it is ever added it belongs to a separate
   analytics service consuming the same reports, not to the tick loop.
 - Server cost grows with players, not with terrain area — a design constraint that ADR 002's
@@ -51,6 +55,11 @@ PvP collision, and cannot replay old input. That is the intended bar: *"don't ma
 `crates/sim/src/authority.rs` implements exactly the "kept" rows: displacement check with slack,
 report-window/stale-tick rejection, duplicate `seq` rejection, per-player clock offset mapping.
 There is no analytics, no logging of suspicious events beyond a counter, and no terrain.
+
+Two gaps this ADR's list did not name are now closed: the displacement baseline survives a
+departure (the shadow is parked and a resume is clamped to it, `architecture-review.md` §8), and a
+fresh admission — still unauthenticated and still trusting the report — is the only remaining
+"spawn wherever you claim" path.
 
 ## Open questions
 

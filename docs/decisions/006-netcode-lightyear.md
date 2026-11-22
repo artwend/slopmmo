@@ -53,7 +53,9 @@ Non-goals that were made explicit in the dialogue:
   and message hashes agreed at handshake.
 - `crates/server/src/transport.rs`: a `ServerUdpIo` endpoint; lightyear spawns one link per remote
   address, and our admission system binds a `player` id to that link on the first movement packet.
-  Peer timeout, superseded-link release and snapshot fan-out live here.
+  Peer timeout, superseded-link release and snapshot fan-out live here. A timed-out or torn-down link
+  parks its shadow (`Simulation::detach_player`), so the next link for the same id resumes from the
+  server's pose rather than being admitted wherever it claims.
 - `crates/client/src/transport.rs`: `RawClient` + `UdpIo` + `LocalAddr(0.0.0.0:0)` +
   `PeerAddr(server)`, `Connect`, then a plain `MessageSender`/`MessageReceiver` pair.
 - Verified live: `client --headless --connect 127.0.0.1:4000` → `net_sent 600`,

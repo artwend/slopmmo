@@ -42,9 +42,10 @@ PlayerMovementPacket {
 - Exactly **one** movement report per packet — the current one. No report history is retransmitted.
 - The simulation runs at `TICK_HZ = 60`, regardless of the send rate; input frames are addressed
   by tick, never by arrival time.
-- Server→client uses `ServerSnapshot { server_tick, acked_seq, shadow_position, correction, peers }`
-  where `correction` is `Option<CollisionCorrection { seq, tick, epoch, velocity_delta,
-  hard_normal }>`.
+- Server→client uses `ServerSnapshot { server_tick, acked_seq, shadow_position, correction, peers,
+  resync }` where `correction` is `Option<CollisionCorrection { seq, tick, epoch, velocity_delta,
+  hard_normal }>` and `resync` is the resume-placement flag added later
+  (`../architecture-review.md` §8).
 
 ## Why input must not be reliable-ordered
 
@@ -75,6 +76,9 @@ Implemented in `crates/proto/src/packet.rs`:
   budget. Recorded here because it changes the loss tolerance from 1 to 3 packets.
 - `CollisionCorrection` carries `seq`/`tick`/`epoch` and is applied idempotently
   (`crates/client/src/headless.rs` `CorrectionLog` tracks applied ids).
+- `ServerSnapshot` carries `resync`: set while a clamped resume has not yet been acknowledged by an
+  accepted report, so the client adopts the server's placement. This is the only case in which a
+  client applies a position from the server; corrections remain velocity deltas and normals.
 - No `position_delta` in corrections — the review (`../architecture-review.md`) rejected it: a
   server that cannot see terrain cannot promise an offset lands outside a wall.
 

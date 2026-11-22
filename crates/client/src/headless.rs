@@ -165,6 +165,7 @@ struct Report {
     sent: u64,
     received: u64,
     corrections: u64,
+    resyncs: u64,
 }
 
 fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
@@ -215,6 +216,7 @@ fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Repo
         sent: stats.sent,
         received: stats.received,
         corrections: stats.corrections,
+        resyncs: stats.resyncs,
     }
 }
 
@@ -250,6 +252,7 @@ pub fn run(args: &Args) -> ExitCode {
         println!("net_sent        {}", r.sent);
         println!("net_snaps       {}", r.received);
         println!("net_corrections {}", r.corrections);
+        println!("net_resyncs     {}", r.resyncs);
         if r.received == 0 {
             failures.push("no snapshots from the server");
         }

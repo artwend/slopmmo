@@ -355,6 +355,183 @@ fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
 }
 
 #[test]
+fn a_resume_is_clamped_to_the_shadow_it_left() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    let spawn = Vec3::new(2.0, 0.9, -3.0);
+    sim.add_player(1, spawn);
+    {
+        let p = sim.player_mut(1).unwrap();
+        p.vel = Vec3::new(1.0, 0.0, 2.0);
+        p.body_yaw = 1.25;
+        p.grounded = true;
+    }
+
+    assert!(sim.detach_player(1));
+    assert!(!sim.contains_player(1), "detached body still in the world");
+
+    // The reconnect claims the far corner of the map.
+    let claim = Vec3::new(15.0, 0.9, 15.0);
+    let resume = sim
+        .resume_player(&packet(1, 0, 1, claim, Vec3::new(50.0, 0.0, 0.0)))
+        .expect("the shadow was not kept for a resume");
+    assert!(resume.clamped, "a cross-map claim was accepted");
+    assert_eq!(resume.reported, claim);
+    assert_eq!(sim.stats.resumed, 1);
+    assert_eq!(sim.stats.resume_clamped, 1);
+    assert!(sim.contains_player(1));
+
+    let allowed = sim.config.resume_travel();
+    let from_shadow = resume.pos - spawn;
+    assert!(
+        (from_shadow.length() - allowed).abs() < 1e-3,
+        "clamped to {} instead of {allowed}",
+        from_shadow.length()
+    );
+    assert!(
+        from_shadow
+            .normalize()
+            .abs_diff_eq((claim - spawn).normalize(), 1e-3),
+        "the clamp changed the claimed direction"
+    );
+
+    // The parked state is restored; the unvalidated claim's velocity is not.
+    let p = sim.player(1).unwrap();
+    assert_eq!(p.pos, resume.pos);
+    assert_eq!(p.vel, Vec3::new(1.0, 0.0, 2.0));
+    assert!((p.body_yaw - 1.25).abs() < 1e-6);
+    assert!(p.grounded);
+}
+
+#[test]
+fn a_resumed_session_cannot_walk_its_clamp_back() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.detach_player(1);
+
+    // The admission report is consumed by the resume and becomes the baseline
+    // for the displacement check. Without that, the client's absolute tick
+    // counter would grant an unbounded allowance and the very next packet
+    // would move the shadow to the claimed spot.
+    let claim = Vec3::new(40.0, 0.0, 0.0);
+    let resume = sim
+        .resume_player(&packet(7, 0, 1, claim, Vec3::ZERO))
+        .expect("resume lost");
+    assert!(resume.clamped);
+
+    assert_eq!(
+        sim.ingest(&packet(8, 2, 1, claim, Vec3::ZERO)),
+        Err(Reject::Teleport),
+        "the claim undid its own clamp"
+    );
+    assert_eq!(sim.player(1).unwrap().pos, resume.pos);
+
+    // A forged jump in the client tick must not buy the allowance back: the
+    // clock re-anchor accepts the new domain, but travel is bounded by server
+    // time since the last accepted report.
+    assert_eq!(
+        sim.ingest(&packet(9, 1_000_000, 1, claim, Vec3::ZERO)),
+        Err(Reject::Teleport),
+        "a tick jump undid the clamp"
+    );
+
+    // A report from the server's placement is accepted normally.
+    assert_eq!(
+        sim.ingest(&packet(10, 1_000_002, 1, resume.pos, Vec3::ZERO)),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_tick_jump_does_not_buy_a_teleport() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    assert_eq!(sim.ingest(&packet(1, 0, 1, Vec3::ZERO, Vec3::ZERO)), Ok(()));
+
+    sim.tick = Tick::new(101);
+    let jumped = packet(2, 1_000_000, 1, Vec3::new(100.0, 0.0, 0.0), Vec3::ZERO);
+    assert_eq!(sim.ingest(&jumped), Err(Reject::Teleport));
+    assert_eq!(sim.player(1).unwrap().pos, Vec3::ZERO);
+
+    // The re-anchor still lets the session continue from where it is.
+    let ok = packet(3, 1_000_002, 1, Vec3::new(0.05, 0.0, 0.0), Vec3::ZERO);
+    assert_eq!(sim.ingest(&ok), Ok(()));
+}
+
+#[test]
+fn a_shadow_older_than_the_resume_window_is_forgotten() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.config.resume_window = 10;
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.detach_player(1);
+
+    sim.tick = Tick::new(111);
+    assert!(
+        sim.resume_player(&packet(1, 0, 1, Vec3::new(40.0, 0.0, 0.0), Vec3::ZERO))
+            .is_none(),
+        "a stale shadow was used to place a resume"
+    );
+    assert!(!sim.contains_player(1));
+}
+
+#[test]
+fn a_clamped_resume_asks_for_a_resync_until_a_report_lands() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.detach_player(1);
+
+    let resume = sim
+        .resume_player(&packet(1, 0, 1, Vec3::new(40.0, 0.0, 0.0), Vec3::ZERO))
+        .expect("resume lost");
+    assert!(resume.clamped);
+
+    // The flag must be repeated: a lost unreliable snapshot must not leave the
+    // client stranded where the server refused to put it.
+    for _ in 0..2 {
+        sim.step(&world);
+        let snap = sim
+            .snapshots()
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .expect("snapshot missing")
+            .1;
+        assert!(
+            snap.resync,
+            "the client was never told to adopt the placement"
+        );
+        assert_eq!(snap.shadow_position, resume.pos.to_array());
+    }
+
+    let synced = packet(2, 2, 1, sim.player(1).unwrap().pos, Vec3::ZERO);
+    assert_eq!(sim.ingest(&synced), Ok(()));
+    sim.step(&world);
+    let snap = sim.snapshots().iter().find(|(id, _)| *id == 1).unwrap().1;
+    assert!(!snap.resync, "resync was not cleared by an accepted report");
+}
+
+#[test]
+fn an_unclamped_resume_is_taken_as_reported() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.detach_player(1);
+
+    let reported = Vec3::new(0.0, 0.9, 1.0);
+    let resume = sim
+        .resume_player(&packet(1, 0, 1, reported, Vec3::ZERO))
+        .expect("resume lost");
+    assert!(!resume.clamped);
+    assert_eq!(resume.pos, reported);
+    assert_eq!(sim.stats.resume_clamped, 0);
+    assert!(!sim.player(1).unwrap().needs_resync);
+}
+
+#[test]
 fn server_corrects_overlapping_players_and_stays_deterministic() {
     let run = || {
         let world = StaticWorld::test_room();
@@ -406,6 +583,55 @@ fn snapshot_lists_nearby_peers_within_aoi_only() {
         !near.peers.iter().any(|p| p.player == 3),
         "far peer leaked into AOI"
     );
+}
+
+#[test]
+fn grid_aoi_matches_a_full_scan_across_cell_boundaries() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+
+    // A spread of players straddling the 4 m grid cells, plus a few far away.
+    // Spacing keeps capsules out of penetration, so the solve never moves the
+    // shadow and the AOI query centre equals the indexed position.
+    let mut id = 1u64;
+    for gx in 0..7 {
+        for gz in 0..7 {
+            let x = -9.0 + gx as f32 * 1.3;
+            let z = -9.0 + gz as f32 * 1.3;
+            sim.add_player(id, Vec3::new(x, 0.9, z));
+            id += 1;
+        }
+    }
+    sim.add_player(id, Vec3::new(60.0, 0.9, 60.0));
+    id += 1;
+    sim.add_player(id, Vec3::new(-60.0, 0.9, 2.0));
+
+    sim.step(&world);
+
+    let aoi = proto::NEIGHBOUR_RADIUS * 2.0;
+    let players = sim.players();
+    let snaps = sim.snapshots();
+    assert_eq!(snaps.len(), players.len());
+    for (i, p) in players.iter().enumerate() {
+        // Brute-force reference: every other body within the AOI radius, the
+        // nearest MAX_SNAPSHOT_PEERS ordered by (distance, body index) — the
+        // same total order the inline window keeps, so the result is unique.
+        let mut want: Vec<(f32, usize)> = Vec::new();
+        for (j, q) in players.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let d = ((q.pos.x - p.pos.x).powi(2) + (q.pos.z - p.pos.z).powi(2)).sqrt();
+            if d <= aoi {
+                want.push((d, j));
+            }
+        }
+        want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        want.truncate(proto::MAX_SNAPSHOT_PEERS);
+        let want_ids: Vec<u64> = want.iter().map(|&(_, j)| players[j].id).collect();
+        let got_ids: Vec<u64> = snaps[i].1.peers.iter().map(|pc| pc.player).collect();
+        assert_eq!(got_ids, want_ids, "AOI peers diverge for player {}", p.id);
+    }
 }
 
 #[test]

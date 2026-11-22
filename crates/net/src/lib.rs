@@ -102,6 +102,7 @@ mod tests {
                 velocity_delta: [-120.0, -120.0, 120.0],
                 hard_normal: Some([-1.0, 0.0, 1.0]),
             }),
+            resync: true,
             peers: (0..MAX_SNAPSHOT_PEERS)
                 .map(|i| PeerCollider {
                     player: u64::MAX - i as u64,
