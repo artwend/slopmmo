@@ -8,14 +8,12 @@
 //!   collider state and, rarely, a velocity correction.
 
 mod packet;
-mod wire;
 
 pub use packet::peer_mode;
 pub use packet::{
-    CollisionCorrection, KIND_PLAYER_MOVEMENT, KIND_SERVER_SNAPSHOT, MAX_SNAPSHOT_PEERS,
-    MovementReport, PeerCollider, PeerList, PlayerMovementPacket, ServerSnapshot,
+    CollisionCorrection, MAX_SNAPSHOT_PEERS, MovementReport, PeerCollider, PeerList,
+    PlayerMovementPacket, ServerSnapshot,
 };
-pub use wire::{Reader, WireError, Writer};
 
 use core::f32::consts::TAU;
 use serde::{Deserialize, Serialize};

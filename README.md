@@ -17,7 +17,7 @@ running code instead of arguing about them.
 
 | Crate | Role |
 | --- | --- |
-| `crates/proto` | Wire format, constants, packet types. No Bevy, no logic; serde for the Lightyear path and a hand-rolled codec for the size budget |
+| `crates/proto` | Wire format, constants, packet types. No Bevy, no logic; serde types that Lightyear serialises with postcard |
 | `crates/net` | The Lightyear protocol: two channels and the two messages, added identically by both binaries |
 | `crates/sim` | Pure simulation: capsule KCC, spatial hash, pair solver, server authority model |
 | `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, Lightyear endpoint |

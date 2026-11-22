@@ -6,7 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Lightyear serialises these types with postcard; the hand-rolled codec in
-# `src/wire.rs` stays as the reference layout and its size budget.
+# Lightyear serialises these types with postcard; the layout is defined by the
+# derives in `src/packet.rs`.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+# The round-trip tests use the same codec Lightyear does.
+postcard = { version = "1", features = ["alloc"] }
 

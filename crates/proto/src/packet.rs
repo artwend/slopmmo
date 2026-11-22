@@ -1,21 +1,15 @@
 //! Message layout for both directions.
 //!
-//! Size budget is part of the design, so fields are quantised and there is no
-//! nesting beyond one repeated array. A client packet costs about 60 bytes,
-//! a server snapshot about 30 + 15 bytes per peer.
+//! Size budget is part of the design, so some fields are quantised and there is
+//! no nesting beyond one repeated array. Lightyear serialises both messages
+//! with postcard; `net`'s tests enforce the datagram ceiling on the result.
 
 use core::fmt;
 
-use crate::{
-    MAX_INPUT_FRAMES, Tick, dequantise_normal, dequantise_position, quantise_normal,
-    quantise_position,
-};
+use crate::Tick;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-pub const KIND_PLAYER_MOVEMENT: u8 = 1;
-pub const KIND_SERVER_SNAPSHOT: u8 = 2;
 
 /// Peers a snapshot may carry. Independent of the server's `K`: the client is
 /// allowed to know about slightly more colliders than the server solves.
@@ -43,44 +37,6 @@ pub struct MovementReport {
     pub applied_correction_seq: u16,
 }
 
-impl MovementReport {
-    fn write(&self, w: &mut crate::Writer) {
-        w.u32(self.tick.0);
-        for v in self.position {
-            w.i32(quantise_position(v));
-        }
-        for v in self.velocity {
-            w.i32(quantise_position(v));
-        }
-        w.u16(crate::quantise_yaw(self.body_yaw));
-        w.u16(self.applied_correction_seq);
-        w.u8(self.grounded as u8);
-    }
-
-    fn read(r: &mut crate::Reader<'_>) -> Result<Self, crate::WireError> {
-        let tick = Tick(r.u32()?);
-        let mut position = [0.0; 3];
-        for v in &mut position {
-            *v = dequantise_position(r.i32()?);
-        }
-        let mut velocity = [0.0; 3];
-        for v in &mut velocity {
-            *v = dequantise_position(r.i32()?);
-        }
-        let body_yaw = crate::yaw_dequantise(r.u16()?);
-        let applied_correction_seq = r.u16()?;
-        let grounded = r.u8()? != 0;
-        Ok(Self {
-            tick,
-            position,
-            velocity,
-            body_yaw,
-            grounded,
-            applied_correction_seq,
-        })
-    }
-}
-
 /// Client→server. Input and report are merged into one packet: they describe
 /// the same tick window, and splitting them doubled the header cost.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -91,54 +47,6 @@ pub struct PlayerMovementPacket {
     pub report: MovementReport,
     /// Newest first. Empty on a report-only packet.
     pub inputs: Vec<crate::InputFrame>,
-}
-
-impl PlayerMovementPacket {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = crate::Writer::with_capacity(96);
-        w.u8(KIND_PLAYER_MOVEMENT);
-        w.u16(self.seq);
-        w.u64(self.player);
-        self.report.write(&mut w);
-        let n = self.inputs.len().min(MAX_INPUT_FRAMES);
-        w.u8(n as u8);
-        for f in self.inputs.iter().take(n) {
-            w.u32(f.tick.0);
-            w.i8(f.move_x);
-            w.i8(f.move_z);
-            w.u8(f.buttons);
-            w.u16(f.camera_yaw);
-        }
-        w.finish()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, crate::WireError> {
-        let mut r = crate::Reader::new(buf);
-        match r.u8()? {
-            KIND_PLAYER_MOVEMENT => {}
-            other => return Err(crate::WireError::UnknownKind(other)),
-        }
-        let seq = r.u16()?;
-        let player = r.u64()?;
-        let report = MovementReport::read(&mut r)?;
-        let n = r.count(MAX_INPUT_FRAMES)?;
-        let mut inputs = Vec::with_capacity(n);
-        for _ in 0..n {
-            inputs.push(crate::InputFrame {
-                tick: Tick(r.u32()?),
-                move_x: r.i8()?,
-                move_z: r.i8()?,
-                buttons: r.u8()?,
-                camera_yaw: r.u16()?,
-            });
-        }
-        Ok(Self {
-            seq,
-            player,
-            report,
-            inputs,
-        })
-    }
 }
 
 /// A replicated collider. The client feeds these into its own solver instead of
@@ -152,8 +60,6 @@ pub struct PeerCollider {
 }
 
 impl PeerCollider {
-    const SIZE: usize = 8 + 12 + 2 + 1;
-
     /// Neutral value used to fill the tail of a [`PeerList`].
     pub const EMPTY: Self = Self {
         player: 0,
@@ -161,31 +67,6 @@ impl PeerCollider {
         body_yaw: 0.0,
         mode: peer_mode::NONE,
     };
-
-    fn write(&self, w: &mut crate::Writer) {
-        w.u64(self.player);
-        for v in self.position {
-            w.i32(quantise_position(v));
-        }
-        w.u16(crate::quantise_yaw(self.body_yaw));
-        w.u8(self.mode);
-    }
-
-    fn read(r: &mut crate::Reader<'_>) -> Result<Self, crate::WireError> {
-        let player = r.u64()?;
-        let mut position = [0.0; 3];
-        for v in &mut position {
-            *v = dequantise_position(r.i32()?);
-        }
-        let body_yaw = crate::yaw_dequantise(r.u16()?);
-        let mode = r.u8()?;
-        Ok(Self {
-            player,
-            position,
-            body_yaw,
-            mode,
-        })
-    }
 }
 
 /// Inline, fixed-capacity peer list.
@@ -314,53 +195,6 @@ pub struct CollisionCorrection {
     pub hard_normal: Option<[f32; 3]>,
 }
 
-impl CollisionCorrection {
-    fn write(&self, w: &mut crate::Writer) {
-        w.u16(self.seq);
-        w.u32(self.tick.0);
-        w.u32(self.epoch);
-        for v in self.velocity_delta {
-            w.i32(quantise_position(v));
-        }
-        match self.hard_normal {
-            Some(n) => {
-                w.u8(1);
-                for v in n {
-                    w.i16(quantise_normal(v));
-                }
-            }
-            None => {
-                w.u8(0);
-                for _ in 0..3 {
-                    w.i16(0);
-                }
-            }
-        }
-    }
-
-    fn read(r: &mut crate::Reader<'_>) -> Result<Self, crate::WireError> {
-        let seq = r.u16()?;
-        let tick = Tick(r.u32()?);
-        let epoch = r.u32()?;
-        let mut velocity_delta = [0.0; 3];
-        for v in &mut velocity_delta {
-            *v = dequantise_position(r.i32()?);
-        }
-        let has_normal = r.u8()? != 0;
-        let mut n = [0.0; 3];
-        for v in &mut n {
-            *v = dequantise_normal(r.i16()?);
-        }
-        Ok(Self {
-            seq,
-            tick,
-            epoch,
-            velocity_delta,
-            hard_normal: has_normal.then_some(n),
-        })
-    }
-}
-
 /// Server→client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerSnapshot {
@@ -378,70 +212,6 @@ pub struct ServerSnapshot {
     pub resync: bool,
 }
 
-impl ServerSnapshot {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = crate::Writer::with_capacity(64 + self.peers.len() * PeerCollider::SIZE);
-        w.u8(KIND_SERVER_SNAPSHOT);
-        w.u32(self.server_tick.0);
-        w.u16(self.acked_seq);
-        for v in self.shadow_position {
-            w.i32(quantise_position(v));
-        }
-        // Bit 0: correction present, bit 1: resync. Packed so the resync flag
-        // costs no byte in the designed layout.
-        let flags = u8::from(self.correction.is_some()) | (u8::from(self.resync) << 1);
-        w.u8(flags);
-        if let Some(c) = &self.correction {
-            c.write(&mut w);
-        }
-        let n = self.peers.len();
-        w.u8(n as u8);
-        for p in self.peers.iter() {
-            p.write(&mut w);
-        }
-        w.finish()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, crate::WireError> {
-        let mut r = crate::Reader::new(buf);
-        match r.u8()? {
-            KIND_SERVER_SNAPSHOT => {}
-            other => return Err(crate::WireError::UnknownKind(other)),
-        }
-        let server_tick = Tick(r.u32()?);
-        let acked_seq = r.u16()?;
-        let mut shadow_position = [0.0; 3];
-        for v in &mut shadow_position {
-            *v = dequantise_position(r.i32()?);
-        }
-        let flags = r.u8()?;
-        let correction = if flags & 1 != 0 {
-            Some(CollisionCorrection::read(&mut r)?)
-        } else {
-            None
-        };
-        let resync = flags & 2 != 0;
-        let n = r.count(MAX_SNAPSHOT_PEERS)?;
-        let mut peers = PeerList::new();
-        for _ in 0..n {
-            let peer = PeerCollider::read(&mut r)?;
-            // `count` already capped `n` at the list capacity.
-            let _ = peers.push(peer);
-        }
-        Ok(Self {
-            server_tick,
-            acked_seq,
-            shadow_position,
-            correction,
-            peers,
-            resync,
-        })
-    }
-
-    /// Upper bound on the encoded size, for buffer sizing on both ends.
-    pub const MAX_ENCODED: usize = 64 + MAX_SNAPSHOT_PEERS * PeerCollider::SIZE;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +225,15 @@ mod tests {
             buttons: buttons::JUMP | buttons::SPRINT,
             camera_yaw: crate::quantise_yaw(1.25),
         }
+    }
+
+    /// Round-trips through the same codec Lightyear uses for these messages.
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let bytes = postcard::to_allocvec(value).expect("serialise");
+        postcard::from_bytes(&bytes).expect("deserialise")
     }
 
     #[test]
@@ -472,8 +251,7 @@ mod tests {
             },
             inputs: (0..=INPUT_REDUNDANCY as u32).map(frame).collect(),
         };
-        let bytes = pkt.encode();
-        let back = PlayerMovementPacket::decode(&bytes).unwrap();
+        let back: PlayerMovementPacket = roundtrip(&pkt);
         assert_eq!(back.seq, pkt.seq);
         assert_eq!(back.player, pkt.player);
         assert_eq!(back.inputs.len(), pkt.inputs.len());
@@ -501,7 +279,7 @@ mod tests {
             })
             .collect(),
         };
-        let back = ServerSnapshot::decode(&empty.encode()).unwrap();
+        let back: ServerSnapshot = roundtrip(&empty);
         assert!(back.correction.is_none());
         assert!(!back.resync);
         assert_eq!(back.peers.len(), 1);
@@ -517,7 +295,7 @@ mod tests {
             }),
             ..empty
         };
-        let back = ServerSnapshot::decode(&with.encode()).unwrap();
+        let back: ServerSnapshot = roundtrip(&with);
         let c = back.correction.expect("correction survives");
         assert_eq!(c.seq, 42);
         assert_eq!(c.epoch, 7);
@@ -530,7 +308,7 @@ mod tests {
             resync: true,
             ..empty
         };
-        let back = ServerSnapshot::decode(&resync_only.encode()).unwrap();
+        let back: ServerSnapshot = roundtrip(&resync_only);
         assert!(back.resync);
         assert!(back.correction.is_none());
 
@@ -538,7 +316,7 @@ mod tests {
             resync: true,
             ..with
         };
-        let back = ServerSnapshot::decode(&both.encode()).unwrap();
+        let back: ServerSnapshot = roundtrip(&both);
         assert!(back.resync);
         assert!(back.correction.is_some());
     }
@@ -559,7 +337,7 @@ mod tests {
             peers: full,
             ..Default::default()
         };
-        let back = ServerSnapshot::decode(&snap.encode()).unwrap();
+        let back: ServerSnapshot = roundtrip(&snap);
         assert_eq!(back.peers, full, "last peer was truncated on the wire");
 
         // Capacity is enforced at insertion, so an overfull list cannot exist.
@@ -572,29 +350,31 @@ mod tests {
             "peer list grew past its capacity"
         );
         assert_eq!(list.len(), MAX_SNAPSHOT_PEERS);
-    }
 
-    #[test]
-    fn oversized_counts_are_rejected() {
-        let mut bytes = PlayerMovementPacket::default().encode();
-        // The input count is the byte right after the kind tag, seq, id and report.
-        let idx = bytes.len() - 1;
-        bytes[idx] = 200;
-        assert!(matches!(
-            PlayerMovementPacket::decode(&bytes),
-            Err(crate::WireError::TooManyEntries { .. })
-        ));
+        // A list claiming more colliders than the cap is rejected while
+        // decoding instead of being silently truncated.
+        let overfull: Vec<PeerCollider> = (0..=MAX_SNAPSHOT_PEERS as u64)
+            .map(|i| PeerCollider {
+                player: i + 1,
+                ..PeerCollider::EMPTY
+            })
+            .collect();
+        let bytes = postcard::to_allocvec(&overfull).expect("serialise");
+        assert!(
+            postcard::from_bytes::<PeerList>(&bytes).is_err(),
+            "decoded more peers than the list can hold"
+        );
     }
 
     #[test]
     fn truncated_packets_fail_cleanly() {
-        let bytes = PlayerMovementPacket {
+        let bytes = postcard::to_allocvec(&PlayerMovementPacket {
             inputs: vec![frame(1)],
             ..Default::default()
-        }
-        .encode();
+        })
+        .expect("serialise");
         for cut in 0..bytes.len() {
-            assert!(PlayerMovementPacket::decode(&bytes[..cut]).is_err());
+            assert!(postcard::from_bytes::<PlayerMovementPacket>(&bytes[..cut]).is_err());
         }
     }
 }
