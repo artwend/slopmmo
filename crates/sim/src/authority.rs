@@ -32,6 +32,14 @@ pub struct SimConfig {
     /// Ticks a departed player's shadow stays available for a resume.
     pub resume_window: u32,
     pub epoch: u32,
+    /// Build the peer-collider list into snapshots.
+    ///
+    /// Off by default: the client has no consumer for it yet — it predicts its
+    /// own pose and applies corrections, but there is no local peer solve — so
+    /// scanning for peers and putting them on the wire is pure cost. Turn this
+    /// on with the client-side consumer (ADR 011, ADR 015); the selection logic
+    /// and its tests are kept ready for that.
+    pub replicate_peers: bool,
 }
 
 impl Default for SimConfig {
@@ -45,6 +53,7 @@ impl Default for SimConfig {
             report_window: proto::REPORT_WINDOW,
             resume_window: RESUME_WINDOW,
             epoch: 1,
+            replicate_peers: false,
         }
     }
 }
@@ -625,15 +634,7 @@ impl Simulation {
         push_out_of_blockers(players, world, dt);
 
         build_snapshots(
-            snapshots,
-            players,
-            bodies,
-            impulses,
-            grid,
-            candidates,
-            *tick,
-            config.epoch,
-            stats,
+            snapshots, players, bodies, impulses, grid, candidates, *tick, config, stats,
         );
     }
 
@@ -671,11 +672,10 @@ fn build_snapshots(
     grid: &SpatialGrid,
     candidates: &mut Vec<u32>,
     tick: proto::Tick,
-    epoch: u32,
+    config: &SimConfig,
     stats: &mut SimStats,
 ) {
     snapshots.clear();
-    let aoi_radius = proto::NEIGHBOUR_RADIUS * 2.0;
 
     for (i, p) in players.iter_mut().enumerate() {
         let imp = impulses[i];
@@ -687,7 +687,7 @@ fn build_snapshots(
             Some(proto::CollisionCorrection {
                 seq: p.correction_seq,
                 tick,
-                epoch,
+                epoch: config.epoch,
                 velocity_delta: imp.delta_v.to_array(),
                 hard_normal: imp.hard_normal.map(|n| n.to_array()),
             })
@@ -695,43 +695,13 @@ fn build_snapshots(
             None
         };
 
-        // AOI peers: nearest colliders within the neighbour radius, capped.
-        // The grid narrows the scan to the cells around the player instead of
-        // every body; the exact distance test below is unchanged, so the peer set
-        // is identical to a full scan. The inline window keeps this allocation
-        // free, and its (distance, index) order makes the result independent of
-        // the order the grid hands candidates back.
-        let mut near: [(f32, usize); proto::MAX_SNAPSHOT_PEERS] =
-            [(f32::INFINITY, usize::MAX); proto::MAX_SNAPSHOT_PEERS];
-        let mut near_len = 0usize;
-        grid.candidates(p.pos, aoi_radius, candidates);
-        for &j in candidates.iter() {
-            let j = j as usize;
-            if j == i {
-                continue;
-            }
-            let b = &bodies[j];
-            if b.mode == Mode::None {
-                continue;
-            }
-            let d = ((b.pos.x - p.pos.x).powi(2) + (b.pos.z - p.pos.z).powi(2)).sqrt();
-            if d > aoi_radius {
-                continue;
-            }
-            keep_nearest(&mut near, &mut near_len, (d, j));
-        }
-
-        let mut peers = proto::PeerList::new();
-        for &(_, j) in &near[..near_len] {
-            let b = &bodies[j];
-            // The window is capped at the list's capacity by construction.
-            let _ = peers.push(proto::PeerCollider {
-                player: b.id,
-                position: b.pos.to_array(),
-                body_yaw: 0.0,
-                mode: b.mode.as_wire(),
-            });
-        }
+        // Nothing reads peers yet, so the default build skips the AOI scan as
+        // well as the wire bytes. See `SimConfig::replicate_peers`.
+        let peers = if config.replicate_peers {
+            aoi_peers(i, p, bodies, grid, candidates)
+        } else {
+            proto::PeerList::new()
+        };
 
         snapshots.push((
             p.id,
@@ -745,6 +715,55 @@ fn build_snapshots(
             },
         ));
     }
+}
+
+/// Nearest peer colliders within the AOI radius, capped by the inline window.
+///
+/// The grid narrows the scan to the cells around the player instead of every
+/// body; the exact distance test below is unchanged, so the peer set is
+/// identical to a full scan. The inline window keeps this allocation free, and
+/// its `(distance, index)` order makes the result independent of the order the
+/// grid hands candidates back.
+fn aoi_peers(
+    index: usize,
+    p: &ServerPlayer,
+    bodies: &[Body],
+    grid: &SpatialGrid,
+    candidates: &mut Vec<u32>,
+) -> proto::PeerList {
+    let aoi_radius = proto::NEIGHBOUR_RADIUS * 2.0;
+    let mut near: [(f32, usize); proto::MAX_SNAPSHOT_PEERS] =
+        [(f32::INFINITY, usize::MAX); proto::MAX_SNAPSHOT_PEERS];
+    let mut near_len = 0usize;
+    grid.candidates(p.pos, aoi_radius, candidates);
+    for &j in candidates.iter() {
+        let j = j as usize;
+        if j == index {
+            continue;
+        }
+        let b = &bodies[j];
+        if b.mode == Mode::None {
+            continue;
+        }
+        let d = ((b.pos.x - p.pos.x).powi(2) + (b.pos.z - p.pos.z).powi(2)).sqrt();
+        if d > aoi_radius {
+            continue;
+        }
+        keep_nearest(&mut near, &mut near_len, (d, j));
+    }
+
+    let mut peers = proto::PeerList::new();
+    for &(_, j) in &near[..near_len] {
+        let b = &bodies[j];
+        // The window is capped at the list's capacity by construction.
+        let _ = peers.push(proto::PeerCollider {
+            player: b.id,
+            position: b.pos.to_array(),
+            body_yaw: 0.0,
+            mode: b.mode.as_wire(),
+        });
+    }
+    peers
 }
 
 /// Keeps the smallest `near.len()` entries of a `(distance, body)` stream,

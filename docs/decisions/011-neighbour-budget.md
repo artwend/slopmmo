@@ -44,8 +44,10 @@ first:
 
 `crates/sim/src/spatial.rs` — `SpatialGrid` with `insert`/`nearest(pos, k, radius)`; deterministic
 tie-breaking by id. `crates/sim/src/collision.rs` builds the pair set with the union rule and the
-per-player cap. `MAX_SNAPSHOT_PEERS = 16` on the wire is deliberately larger than `K = 8`, so the
-client can know about colliders the server is not currently solving and avoid walking into them.
+per-player cap. `MAX_SNAPSHOT_PEERS = 16` is deliberately larger than `K = 8`, so the client can
+know about colliders the server is not currently solving and avoid walking into them. The list is
+only built when `SimConfig::replicate_peers` is on; it defaults to off because the client-side
+consumer does not exist yet (ADR 015), and paying to scan and transmit it would be pure cost.
 
 ## Open questions
 

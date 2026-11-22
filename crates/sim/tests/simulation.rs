@@ -694,9 +694,33 @@ fn a_clamped_resume_does_not_drift_before_the_next_report() {
 }
 
 #[test]
-fn snapshot_lists_nearby_peers_within_aoi_only() {
+fn peer_colliders_are_not_built_until_a_client_consumes_them() {
     let world = StaticWorld::test_room();
     let mut sim = Simulation::new(SimConfig::default());
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+    sim.add_player(2, Vec3::new(1.0, 0.9, 0.0));
+
+    sim.step(&world);
+    for (_, snapshot) in sim.snapshots() {
+        assert!(
+            snapshot.peers.is_empty(),
+            "peer colliders were built for a client that does not read them"
+        );
+    }
+    assert!(
+        !sim.config.replicate_peers,
+        "the shipped configuration must not pay for the peer list"
+    );
+}
+
+#[test]
+fn snapshot_lists_nearby_peers_within_aoi_only() {
+    let world = StaticWorld::test_room();
+    let config = SimConfig {
+        replicate_peers: true,
+        ..Default::default()
+    };
+    let mut sim = Simulation::new(config);
     sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
     sim.add_player(2, Vec3::new(1.0, 0.9, 0.0));
     sim.add_player(3, Vec3::new(9.0, 0.9, 9.0));
@@ -718,7 +742,11 @@ fn snapshot_lists_nearby_peers_within_aoi_only() {
 #[test]
 fn grid_aoi_matches_a_full_scan_across_cell_boundaries() {
     let world = StaticWorld::test_room();
-    let mut sim = Simulation::new(SimConfig::default());
+    let config = SimConfig {
+        replicate_peers: true,
+        ..Default::default()
+    };
+    let mut sim = Simulation::new(config);
 
     // A spread of players straddling the 4 m grid cells, plus a few far away.
     // Spacing keeps capsules out of penetration, so the solve never moves the

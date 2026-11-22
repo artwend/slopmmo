@@ -150,8 +150,11 @@ corrections carry velocity, not position.
 ### 3.3 Pair budget (ADR 011)
 
 `MAX_NEIGHBOURS = 8`, `NEIGHBOUR_RADIUS = 2.0 m`, `MAX_PAIRS_PER_PLAYER = 8` after de-duplication,
-deterministic order by distance then id. `MAX_SNAPSHOT_PEERS = 16` on the wire so a client knows
-about colliders the server is not currently solving.
+deterministic order by distance then id. `MAX_SNAPSHOT_PEERS = 16` is the AOI replication cap, so a
+client can learn about colliders the server is not currently solving. It is **not built or sent by
+default**: the client has no local peer solve yet, so `SimConfig::replicate_peers` is `false` and the
+shipped server skips both the scan and the bytes. The selection logic and its tests are kept for the
+consumer that lands with ADR 006's remaining plan.
 
 ### 3.4 Replication (ADR 001, ADR 007)
 
@@ -161,21 +164,25 @@ once.
 | Channel | Reliability | Rate | Content |
 | --- | --- | --- | --- |
 | client → server movement | unreliable, sequenced | 30 Hz while active; 4 Hz idle keepalive | `PlayerMovementPacket` |
-| server → client snapshot | unreliable, sequenced | on change; 4 Hz heartbeat | tick, ack, shadow pos, correction, peers, `resync` |
+| server → client snapshot | unreliable, sequenced | on change; adaptive heartbeat (2×RTT, 100 ms–1 s); peers ≤ 30 Hz | tick, ack, shadow pos, correction, peers, `resync` |
 | corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
 | discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
 
 Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while moving, dropping to ≈ 200 B/s
-when idle (4 Hz keepalive with no redundancy frames); server ≈ 28 B + 23 B per peer per snapshot →
-1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope and are the
-reason AOI exists.
+when idle (4 Hz keepalive with no redundancy frames). Server: ≈ 28 B per changed snapshot with the
+peer list off (the shipped default), or ≈ 28 B + 23 B per peer when `SimConfig::replicate_peers` is
+enabled — 1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope;
+the peer list is the reason AOI exists, and it stays dark until a client consumes it.
 
 Neither side streams on a fixed cadence any more (ADR 015). The client stays silent while its input,
 pose, grounding and correction acknowledgement are unchanged. The server compares each tick's
 snapshot with the last one it sent for that player — at millimetre precision — and only transmits a
 change in a correction, `resync` or the peer set. `server_tick`, `acked_seq` and `shadow_position`
 do not force a datagram because the client predicts its own pose and only adopts the shadow during
-`resync`. A lost final update is repaired by the heartbeat, so a quiet tick costs nothing.
+`resync`. A lost final update is repaired by a heartbeat that scales with the link's measured RTT, so
+a quiet tick costs nothing and a slow path is not sent redundant datagrams. Peer colliders have a
+third, independent cadence: they refresh at `PEER_UPDATE_HZ` (30 Hz) and a correction between
+refreshes carries the last list, so corrections stay tick-rate without dragging peers with them.
 
 ### 3.5 Data layout and allocation discipline
 
@@ -268,10 +275,11 @@ create → auth → character select → place in zone instance → play → han
 | Client prediction | 60 Hz (16.7 ms) | `proto::CLIENT_TICK_HZ` |
 | Client send rate | 30 Hz | `proto::INPUT_SEND_HZ` |
 | Idle client send rate | 4 Hz keepalive, no redundancy frames | `proto::IDLE_SEND_HZ` |
-| Snapshot heartbeat | 4 Hz when nothing changed | `server::transport::SNAPSHOT_HEARTBEAT` |
+| Snapshot heartbeat | adaptive: 2×RTT, clamped 100 ms–1 s (250 ms until a sample) | `server::transport::heartbeat_interval` |
+| Peer refresh rate | 30 Hz, independent of the tick | `proto::PEER_UPDATE_HZ` |
 | Client packet | ~81 B | `proto::PlayerMovementPacket` |
 | Snapshot | 28 B + 23 B per peer | `proto::ServerSnapshot` |
-| Peer cap in snapshot | 16 | `proto::MAX_SNAPSHOT_PEERS` |
+| Peer cap in snapshot | 16 when enabled; list omitted in the shipped config | `proto::MAX_SNAPSHOT_PEERS`, `SimConfig::replicate_peers` |
 | Neighbour cap | 8 | `proto::MAX_NEIGHBOURS` |
 | Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
 | Report window | 30 server ticks (0.5 s) | `proto::REPORT_WINDOW` |
@@ -279,7 +287,7 @@ create → auth → character select → place in zone instance → play → han
 | Resume travel allowance | 5.4 m fixed cap; not yet scaled by time since detach | `SimConfig::resume_travel()` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.042 ms at 32 bots, 1.128 ms at 256 bots | `server --bots N --duration 5` |
+| Measured tick cost | 0.023 ms at 32 bots, 0.436 ms at 256 bots (0.040 / 1.139 with the peer AOI enabled) | `server --bots N --duration 5` |
 | Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
@@ -298,7 +306,7 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | --- | --- |
 | Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
 | Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc-avian`) |
-| Client-side peer-collider solve | Absent — colliders are on the wire but not fed into the local solve |
+| Client-side peer-collider solve | Absent — and the wire side is off by default (`SimConfig::replicate_peers`) so nothing is paid for until the solve exists |
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
 | Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |

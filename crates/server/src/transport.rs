@@ -23,13 +23,61 @@ use sim::authority::Reject;
 /// UDP has no disconnect, so silence is the only signal that a client is gone.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A snapshot that carries nothing new is still re-sent this often.
+/// How often the peer list may change on the wire.
+///
+/// Peer motion is interpolated on the client, so a peer update does not need the
+/// server tick rate. A correction is unaffected: it goes out on the tick that
+/// produces it, carrying whatever peer list was last sent.
+pub const PEER_UPDATE_INTERVAL: Duration =
+    Duration::from_nanos(1_000_000_000 / proto::PEER_UPDATE_HZ as u64);
+
+/// Heartbeat bounds for a snapshot that carries nothing new.
 ///
 /// The snapshot channel is unreliable and sequenced: the datagram carrying the
 /// last change can be lost, so the heartbeat bounds how long a client can stay
 /// stale. It also refreshes `acked_seq` and `shadow_position`, which are
 /// informational and deliberately do not force a send on their own.
-pub const SNAPSHOT_HEARTBEAT: Duration = Duration::from_millis(250);
+pub const SNAPSHOT_HEARTBEAT_MIN: Duration = Duration::from_millis(100);
+pub const SNAPSHOT_HEARTBEAT_DEFAULT: Duration = Duration::from_millis(250);
+pub const SNAPSHOT_HEARTBEAT_MAX: Duration = Duration::from_secs(1);
+
+/// Two round trips: one for the datagram to arrive and be acted on, one to
+/// cover the acknowledgement not existing at all on an unreliable channel.
+const HEARTBEAT_RTT_MULTIPLIER: u32 = 2;
+
+/// Heartbeat interval for a link with the given measured RTT.
+///
+/// A lost final update is repaired after roughly one round trip, so the
+/// heartbeat scales with the path instead of paying the same 250 ms on a
+/// loopback link and a transatlantic one. `rtt == 0` means the ping manager has
+/// not produced a sample yet (or the transport does not measure one), and the
+/// fixed default applies.
+fn heartbeat_interval(rtt: Duration) -> Duration {
+    if rtt.is_zero() {
+        return SNAPSHOT_HEARTBEAT_DEFAULT;
+    }
+    rtt.saturating_mul(HEARTBEAT_RTT_MULTIPLIER)
+        .clamp(SNAPSHOT_HEARTBEAT_MIN, SNAPSHOT_HEARTBEAT_MAX)
+}
+
+/// What was last put on the wire for a player, and when each part was current.
+#[derive(Clone, Copy)]
+struct SentSnapshot {
+    snapshot: proto::ServerSnapshot,
+    /// When this snapshot was sent.
+    at: Instant,
+    /// When `snapshot.peers` was captured. Older than `at` when a correction
+    /// rode out with a peer list that was not due for a refresh.
+    peers_at: Instant,
+}
+
+/// What the next tick should do for one player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendPlan {
+    send: bool,
+    /// Replace the outgoing snapshot's peer list with the current one.
+    refresh_peers: bool,
+}
 
 /// Bookkeeping for the links lightyear opens on our behalf, keyed by link entity.
 #[derive(Resource, Default)]
@@ -39,9 +87,9 @@ pub struct Peers {
     last_seen: HashMap<Entity, Instant>,
     /// Reused every frame by `evict_silent`.
     expired: Vec<Entity>,
-    /// Last snapshot put on the wire for a player, and when. The next tick's
-    /// snapshot is compared against it so an unchanged one is not sent.
-    last_sent: HashMap<u64, (proto::ServerSnapshot, Instant)>,
+    /// Last snapshot put on the wire for a player. The next tick's snapshot is
+    /// compared against it so an unchanged one is not sent.
+    last_sent: HashMap<u64, SentSnapshot>,
     pub admitted: u64,
     pub dropped: u64,
     pub resumed: u64,
@@ -222,18 +270,29 @@ fn evict_orphans(
     }
 }
 
+/// The per-link components `dispatch` needs: the snapshot sender and the
+/// transport link, whose measured RTT drives the heartbeat.
+type ClientLinks<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static mut MessageSender<proto::ServerSnapshot>>,
+        Option<&'static Link>,
+    ),
+    With<ClientOf>,
+>;
+
 /// Sends the most recent completed tick's snapshots, at most once each.
 ///
 /// A snapshot is put on the wire only when it carries something the client can
-/// act on — a correction, a resync, or a changed peer set — or when the
-/// heartbeat is due. The server still builds a snapshot for every player every
-/// tick ([`sim::authority::Simulation::step`]); this filter is about the network
-/// bill, not about skipping work that other readers may want.
-fn dispatch(
-    mut game: ResMut<GameRes>,
-    mut peers: ResMut<Peers>,
-    mut clients: Query<(Entity, Option<&mut MessageSender<proto::ServerSnapshot>>), With<ClientOf>>,
-) {
+/// act on — a correction, a resync, or a peer refresh — or when the heartbeat is
+/// due. Peer motion is refreshed at [`PEER_UPDATE_INTERVAL`] instead of the tick
+/// rate; a correction still leaves on the tick that produced it, carrying the
+/// last peer list so the two cadences stay independent. The server still builds
+/// a snapshot for every player every tick
+/// ([`sim::authority::Simulation::step`]); this filter is about the network bill.
+fn dispatch(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut clients: ClientLinks) {
     if !game.0.snapshots_pending {
         return;
     }
@@ -242,52 +301,94 @@ fn dispatch(
         let Some(entity) = peers.entity_of.get(&id).copied() else {
             continue;
         };
-        let Ok((_, sender)) = clients.get_mut(entity) else {
+        let Ok((_, sender, link)) = clients.get_mut(entity) else {
             continue;
         };
         let Some(mut sender) = sender else {
             continue;
         };
-        let resend = peers.last_sent.get(&id).is_none_or(|(prev, at)| {
-            // `resync` stays set until a report is accepted, so it must keep
-            // repeating: the one datagram that would place a resumed client can
-            // be the one that is lost.
-            snapshot.resync
-                || snapshot_changed(prev, &snapshot)
-                || now.duration_since(*at) >= SNAPSHOT_HEARTBEAT
-        });
-        if !resend {
+        let heartbeat = heartbeat_interval(link.map_or(Duration::ZERO, |l| l.stats.rtt));
+        let prev = peers.last_sent.get(&id).copied();
+        let plan = plan_snapshot(prev.as_ref(), &snapshot, now, heartbeat);
+        if !plan.send {
             peers.snapshots_skipped += 1;
             continue;
         }
+        let mut out = snapshot;
+        let peers_at = if plan.refresh_peers {
+            now
+        } else {
+            prev.map_or(now, |p| p.peers_at)
+        };
+        if !plan.refresh_peers
+            && let Some(prev) = prev
+        {
+            out.peers = prev.snapshot.peers;
+        }
         // `ServerSnapshot` is `Copy` and its peer list is inline, so this is a
         // flat copy instead of a per-player heap clone.
-        sender.send::<net::SnapshotChannel>(snapshot);
+        sender.send::<net::SnapshotChannel>(out);
         peers.snapshots_out += 1;
-        peers.last_sent.insert(id, (snapshot, now));
+        peers.last_sent.insert(
+            id,
+            SentSnapshot {
+                snapshot: out,
+                at: now,
+                peers_at,
+            },
+        );
     }
     game.0.snapshots_pending = false;
 }
 
-/// Whether `next` tells the client something `prev` did not.
+/// Decides whether the next snapshot goes out, and whether it carries a fresh
+/// peer list.
 ///
-/// `server_tick`, `acked_seq` and `shadow_position` are deliberately excluded:
-/// the client predicts its own pose and only adopts the shadow while `resync`
-/// is set, so those fields changing on their own do not justify a datagram (the
-/// heartbeat refreshes them). Peer state is compared at millimetre precision,
-/// the resolution the wire already cares about, so solver noise cannot defeat
-/// suppression.
-fn snapshot_changed(prev: &proto::ServerSnapshot, next: &proto::ServerSnapshot) -> bool {
-    if prev.resync != next.resync {
-        return true;
+/// `server_tick`, `acked_seq` and `shadow_position` are deliberately excluded
+/// from the comparison: the client predicts its own pose and only adopts the
+/// shadow while `resync` is set, so those fields changing on their own do not
+/// justify a datagram (the heartbeat refreshes them). Peer state is compared at
+/// millimetre precision, the resolution the wire already cares about, so solver
+/// noise cannot defeat suppression.
+fn plan_snapshot(
+    prev: Option<&SentSnapshot>,
+    next: &proto::ServerSnapshot,
+    now: Instant,
+    heartbeat: Duration,
+) -> SendPlan {
+    let Some(prev) = prev else {
+        return SendPlan {
+            send: true,
+            refresh_peers: true,
+        };
+    };
+    let urgent = prev.snapshot.resync != next.resync
+        || correction_changed(&prev.snapshot.correction, &next.correction);
+    let peers_changed = peers_differ(&prev.snapshot.peers, &next.peers);
+    // `resync` is a placement request the client cannot act on without the
+    // current collider set, and it is rare, so it refreshes peers immediately.
+    let refresh_peers =
+        next.resync || (peers_changed && now.duration_since(prev.peers_at) >= PEER_UPDATE_INTERVAL);
+    SendPlan {
+        send: urgent || refresh_peers || now.duration_since(prev.at) >= heartbeat,
+        refresh_peers,
     }
-    match (&prev.correction, &next.correction) {
-        (None, None) => {}
-        (Some(a), Some(b)) if a.seq == b.seq && a.epoch == b.epoch => {}
-        _ => return true,
+}
+
+fn correction_changed(
+    prev: &Option<proto::CollisionCorrection>,
+    next: &Option<proto::CollisionCorrection>,
+) -> bool {
+    match (prev, next) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a.seq != b.seq || a.epoch != b.epoch,
+        _ => true,
     }
-    prev.peers.len() != next.peers.len()
-        || prev.peers.iter().zip(next.peers.iter()).any(|(a, b)| {
+}
+
+fn peers_differ(prev: &proto::PeerList, next: &proto::PeerList) -> bool {
+    prev.len() != next.len()
+        || prev.iter().zip(next.iter()).any(|(a, b)| {
             a.player != b.player
                 || a.mode != b.mode
                 || a.body_yaw.to_bits() != b.body_yaw.to_bits()
@@ -431,50 +532,193 @@ mod tests {
         }
     }
 
+    fn sent_at(snapshot: proto::ServerSnapshot, at: Instant, peers_at: Instant) -> SentSnapshot {
+        SentSnapshot {
+            snapshot,
+            at,
+            peers_at,
+        }
+    }
+
+    fn correction(seq: u16) -> proto::CollisionCorrection {
+        proto::CollisionCorrection {
+            seq,
+            tick: proto::Tick::new(9),
+            epoch: 0,
+            velocity_delta: [0.5, 0.0, 0.0],
+            hard_normal: None,
+        }
+    }
+
+    /// A heartbeat long enough that only the property under test can trigger a send.
+    const QUIET_HEARTBEAT: Duration = Duration::from_secs(10);
+
     #[test]
     fn informational_fields_alone_do_not_justify_a_datagram() {
-        let prev = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+        let now = Instant::now();
+        let base = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+        let prev = sent_at(base, now, now);
         let next = proto::ServerSnapshot {
             server_tick: proto::Tick::new(10),
             acked_seq: 4,
             shadow_position: [5.0, 0.9, -5.0],
-            ..prev
+            ..base
         };
-        assert!(!snapshot_changed(&prev, &next));
+        let plan = plan_snapshot(Some(&prev), &next, now, QUIET_HEARTBEAT);
+        assert!(!plan.send, "informational fields forced a datagram");
     }
 
     #[test]
-    fn actionable_changes_justify_a_datagram() {
-        let prev = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+    fn a_correction_leaves_immediately_without_refreshing_peers() {
+        let now = Instant::now();
+        let base = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+        let prev = sent_at(base, now, now);
+        // Peer moved *and* a correction arrived. Both facts are new, but the
+        // peer list is not due, so the correction must not drag it along.
+        let mut next = snapshot_with(&[(2, [0.0, 0.9, 1.5])]);
+        next.correction = Some(correction(1));
 
-        let moved = snapshot_with(&[(2, [0.0, 0.9, 1.001])]);
-        assert!(snapshot_changed(&prev, &moved));
+        let plan = plan_snapshot(
+            Some(&prev),
+            &next,
+            now + Duration::from_millis(5),
+            QUIET_HEARTBEAT,
+        );
+        assert!(plan.send);
+        assert!(
+            !plan.refresh_peers,
+            "a correction bypassed the peer cadence"
+        );
+
+        // A repeat of the applied correction and an unchanged peer list is not news.
+        let delivered = proto::ServerSnapshot {
+            correction: Some(correction(1)),
+            ..base
+        };
+        let delivered_prev = sent_at(delivered, now, now);
+        let plan = plan_snapshot(
+            Some(&delivered_prev),
+            &delivered,
+            now + Duration::from_millis(5),
+            QUIET_HEARTBEAT,
+        );
+        assert!(!plan.send);
+    }
+
+    #[test]
+    fn peer_movement_waits_for_the_peer_cadence() {
+        let base = Instant::now();
+        let prev = sent_at(snapshot_with(&[(2, [0.0, 0.9, 1.0])]), base, base);
+        let moved = snapshot_with(&[(2, [0.0, 0.9, 1.5])]);
+
+        let early = plan_snapshot(
+            Some(&prev),
+            &moved,
+            base + Duration::from_millis(10),
+            QUIET_HEARTBEAT,
+        );
+        assert!(!early.send, "a peer update bypassed its cadence");
+
+        let due = plan_snapshot(
+            Some(&prev),
+            &moved,
+            base + PEER_UPDATE_INTERVAL,
+            QUIET_HEARTBEAT,
+        );
+        assert!(due.send);
+        assert!(due.refresh_peers);
 
         // Solver noise below the millimetre the wire cares about is not a change.
         let noise = snapshot_with(&[(2, [0.0, 0.9, 1.0004])]);
-        assert!(!snapshot_changed(&prev, &noise));
+        let plan = plan_snapshot(
+            Some(&prev),
+            &noise,
+            base + PEER_UPDATE_INTERVAL,
+            QUIET_HEARTBEAT,
+        );
+        assert!(!plan.send);
+    }
 
+    #[test]
+    fn peer_membership_changes_still_wait_for_the_cadence() {
+        let base = Instant::now();
+        let prev = sent_at(snapshot_with(&[(2, [0.0, 0.9, 1.0])]), base, base);
         let joined = snapshot_with(&[(2, [0.0, 0.9, 1.0]), (3, [0.0, 0.9, 2.0])]);
-        assert!(snapshot_changed(&prev, &joined));
 
-        let corrected = proto::ServerSnapshot {
-            correction: Some(proto::CollisionCorrection {
-                seq: 1,
-                tick: proto::Tick::new(9),
-                epoch: 0,
-                velocity_delta: [0.5, 0.0, 0.0],
-                hard_normal: None,
-            }),
-            ..prev
-        };
-        assert!(snapshot_changed(&prev, &corrected));
-        assert!(!snapshot_changed(&corrected, &corrected));
+        let early = plan_snapshot(
+            Some(&prev),
+            &joined,
+            base + Duration::from_millis(10),
+            QUIET_HEARTBEAT,
+        );
+        assert!(!early.send);
 
-        let resync = proto::ServerSnapshot {
-            resync: true,
-            ..prev
-        };
-        assert!(snapshot_changed(&prev, &resync));
+        let due = plan_snapshot(
+            Some(&prev),
+            &joined,
+            base + PEER_UPDATE_INTERVAL,
+            QUIET_HEARTBEAT,
+        );
+        assert!(due.send && due.refresh_peers);
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_waits_for_the_heartbeat() {
+        let base = Instant::now();
+        let snap = snapshot_with(&[]);
+        let prev = sent_at(snap, base, base);
+        let heartbeat = Duration::from_millis(250);
+
+        let early = plan_snapshot(
+            Some(&prev),
+            &snap,
+            base + Duration::from_millis(100),
+            heartbeat,
+        );
+        assert!(!early.send);
+
+        let due = plan_snapshot(Some(&prev), &snap, base + heartbeat, heartbeat);
+        assert!(due.send);
+        assert!(!due.refresh_peers, "a heartbeat should not refresh peers");
+    }
+
+    #[test]
+    fn resync_refreshes_peers_immediately_and_keeps_repeating() {
+        let base = Instant::now();
+        let prev = sent_at(snapshot_with(&[]), base, base);
+        let mut resync = snapshot_with(&[]);
+        resync.resync = true;
+        resync.peers = snapshot_with(&[(2, [0.0, 0.9, 2.0])]).peers;
+
+        let first = plan_snapshot(Some(&prev), &resync, base, QUIET_HEARTBEAT);
+        assert!(first.send && first.refresh_peers);
+
+        // While resync is still set, the unchanged placement keeps repeating so
+        // a lost datagram cannot strand the resumed client.
+        let repeat = sent_at(resync, base, base);
+        let again = plan_snapshot(Some(&repeat), &resync, base, QUIET_HEARTBEAT);
+        assert!(again.send);
+    }
+
+    #[test]
+    fn the_heartbeat_scales_with_the_measured_rtt() {
+        assert_eq!(
+            heartbeat_interval(Duration::ZERO),
+            SNAPSHOT_HEARTBEAT_DEFAULT,
+            "no sample yet should keep the fixed default"
+        );
+        assert_eq!(
+            heartbeat_interval(Duration::from_millis(10)),
+            SNAPSHOT_HEARTBEAT_MIN
+        );
+        assert_eq!(
+            heartbeat_interval(Duration::from_millis(150)),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(5)),
+            SNAPSHOT_HEARTBEAT_MAX
+        );
     }
 
     #[test]
@@ -487,9 +731,10 @@ mod tests {
         let mut peers = Peers::default();
         peers.player_of.insert(link, 1);
         peers.entity_of.insert(1, link);
+        let now = Instant::now();
         peers
             .last_sent
-            .insert(1, (snapshot_with(&[]), Instant::now()));
+            .insert(1, sent_at(snapshot_with(&[]), now, now));
 
         peers.release(link, &mut game);
         assert!(

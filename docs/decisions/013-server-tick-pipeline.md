@@ -21,7 +21,7 @@ plus a per-system frequency budget:
 | Soft collision solve | 20–30 Hz | 60 Hz — every tick |
 | Hard collision solve | 60 Hz | 60 Hz — every tick |
 | Boss body update | 30–60 Hz | 60 Hz |
-| Snapshots | adaptive | on change, 4 Hz heartbeat (ADR 015) |
+| Snapshots | adaptive | on change, RTT-adaptive heartbeat (ADR 015) |
 
 The dialogue's table does not add up: a subsystem cannot run faster than the tick that drives it,
 and a 20–30 Hz soft solve under a 60 Hz KCC is visible as stepped pushes every 33–50 ms. The
@@ -79,8 +79,9 @@ Rules:
 - **Input cadence is half the tick.** `INPUT_SEND_HZ = 30` means one report every second server
   tick; the shadow is extrapolated between reports only as far as `REPORT_WINDOW`.
 - Snapshot *production* is still tied to the tick — a snapshot is built for every player every tick —
-  but transmission is change-gated with a 4 Hz heartbeat (ADR 015). A further adaptive peer-update
-  rate needs a client-side interpolation buffer to be worth anything.
+  but transmission is change-gated with an RTT-adaptive heartbeat (ADR 015). Peer colliders ride on a
+  separate 30 Hz cadence; the client-side interpolation that makes that invisible is part of the
+  still-unbuilt peer consumer.
 - Because there is no rewind, a high-ping player's shots land against current positions. That is a
   balance decision the combat design must own, not a movement bug.
 

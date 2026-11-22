@@ -55,6 +55,14 @@ pub const IDLE_SEND_TICKS: u32 = CLIENT_TICK_HZ / IDLE_SEND_HZ;
 /// Speed at or below which an input-free client counts as idle.
 pub const IDLE_SPEED_EPSILON: f32 = 0.05;
 
+/// How often the peer-collider set is refreshed on the wire.
+///
+/// Peers are interpolated on the client, so they do not need the server tick
+/// rate; a correction is a separate path and still goes out on the tick that
+/// produces it. Half the tick rate keeps peer traffic bounded without a visible
+/// cadence change once interpolation lands.
+pub const PEER_UPDATE_HZ: u32 = 30;
+
 /// Starting neighbour bore. Both a radius and a count limit are required;
 /// a bare "nearest 8" would create contacts across an empty field.
 pub const MAX_NEIGHBOURS: usize = 8;

@@ -48,7 +48,7 @@ Non-goals that were made explicit in the dialogue:
 
 - `crates/net` declares the protocol: `InputChannel` (client → server,
   `UnorderedUnreliable`, `send_frequency = INPUT_SEND_HZ`, priority 2) and `SnapshotChannel`
-  (server → client, `SequencedUnreliable`, on change with a 4 Hz heartbeat, priority 1), plus the two
+  (server → client, `SequencedUnreliable`, on change with an RTT-adaptive heartbeat, priority 1), plus the two
   messages (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel
   and message hashes agreed at handshake.
 - `crates/server/src/transport.rs`: a `ServerUdpIo` endpoint; lightyear spawns one link per remote
@@ -72,8 +72,10 @@ KCC, which is exactly what a stock state-copy prediction would get wrong.
 - Peer colliders are still hand-encoded into `MAX_SNAPSHOT_PEERS` (ADR 011). Replicating them as
   entities with a visibility filter is the next step; the K = 8 AOI cap stays.
 - No delta compression or prioritisation. Snapshots are change-gated (ADR 015), so a tick that
-  changes nothing the client can act on is not sent, but every sent snapshot still carries the full
-  peer set and is budgeted against `DATAGRAM_BUDGET = 1200` worst case.
+  changes nothing the client can act on is not sent. The hand-encoded peer set is still the
+  convergence target for step 1 above, and is switched off entirely until a client consumes it
+  (`SimConfig::replicate_peers`); when on, a snapshot is budgeted against `DATAGRAM_BUDGET = 1200`
+  worst case.
 - A running client that never sends is never admitted (no `Hello`): identity is the `player` field
   of the first movement packet, per ADR 007.
 
