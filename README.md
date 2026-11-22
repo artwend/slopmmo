@@ -23,7 +23,7 @@ running code instead of arguing about them.
 | `crates/kcc-avian` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`), used by the client |
 | `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, Lightyear endpoint |
 | `crates/client` | Bevy window (WASD + Q/E + Space) and a headless scripted CI mode |
-| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes Lightyear framing, both movement messages and ping/pong (packet rows, detail, rates) |
+| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes Lightyear framing, both movement messages and ping/pong (packet rows, detail, rates, TOML packet filter) |
 
 `proto` and `sim` are deliberately engine-free apart from `bevy_math` vectors, so the same code
 runs unchanged on the client (prediction) and on the server (shadow). The one crate that does pull
@@ -95,7 +95,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 84 tests: proto, net, sim, kcc-avian, server, client, packetdump
+cargo test --workspace          # 110 tests: proto, net, sim, kcc-avian, server, client, packetdump
                                  # plus one ignored repro for the correction-stacking defect (§7.7)
 cargo fmt --check
 cargo clippy --workspace --all-targets
@@ -275,8 +275,21 @@ distinguishable when several are connected.
 `--detail` pretty-prints the same RON with indentation. `--hex` appends a dump of the raw datagram,
 `--no-acks` hides ACK-only packets, and `--dir c2s|s2c` filters one side. `--count N --stats-every 0`
 makes the tool usable from a script. Short flags are `-l`, `-s`, `-n`, `-t`, `-v`, `-x`, `-a`, `-d`,
-`-nc`. The two movement messages and Lightyear's `Ping`/`Pong` control messages are decoded; any
-other internal message is shown as `INTERNAL` and counted.
+`-c`, `-nc`. The two movement messages and Lightyear's `Ping`/`Pong` control messages are decoded;
+any other internal message is shown as `INTERNAL` and counted.
+
+Which packets are printed is set in `tools/packetdump/packetdump.toml`. `packetdump` reads that file
+from the working directory, or the copy inside `tools/packetdump/` when it is started through cargo;
+`--config PATH` (`-c`) loads another file. Each `filter` entry is a packet name or a Lightyear
+message net id, and a leading `!` hides the packet instead of selecting it:
+
+```toml
+filter = ["input", "snapshot", "!internal", "!3"]
+```
+
+Names are `input` (`PlayerMovementPacket`), `snapshot` (`ServerSnapshot`), `ping`, `pong`,
+`internal` and `ack`; ids match the `net_id=` column. Exclusions win over inclusions, a datagram is
+printed when any of its messages matches, and the statistics keep counting every datagram.
 
 The rate summary also reports packet-id gaps and reordering per direction, so loss shows up
 without opening Wireshark:

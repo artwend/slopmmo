@@ -1,0 +1,22 @@
+# packetdump options.
+#
+# `packetdump` reads this file from the working directory, or from this
+# directory when it is started with `cargo run -p packetdump`. Use
+# `--config PATH` to load a different file.
+#
+# `filter` selects which datagrams are printed. Each entry is a packet name or
+# a Lightyear message net id (the `net_id=` column); prefix an entry with "!"
+# to hide that packet instead of selecting it.
+#
+# Names (case-insensitive, "_"/"-" ignored):
+#   input (PlayerMovementPacket), snapshot (ServerSnapshot), ping, pong,
+#   internal (also unknown, compressed) and ack (an ACK-only datagram).
+#
+# Exclusions win over inclusions, a datagram is printed when any of its
+# messages matches, and statistics still count every datagram.
+#
+# Examples:
+#   filter = ["input", "snapshot"]        # only movement traffic
+#   filter = ["!ping", "!pong", "!ack"]   # hide control traffic
+#   filter = ["!3"]                       # hide snapshot (net id 3)
+filter = []

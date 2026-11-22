@@ -19,3 +19,5 @@ postcard = { version = "1", features = ["alloc"] }
 # RON is the console representation of decoded packet content.
 ron = "0.12"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+# Reads the display filter from `packetdump.toml`.
+toml = "1"

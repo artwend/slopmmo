@@ -6381,6 +6381,7 @@ dependencies = [
  "proto",
  "ron",
  "serde",
+ "toml",
 ]
 
 [[package]]

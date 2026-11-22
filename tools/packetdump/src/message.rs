@@ -64,6 +64,70 @@ pub enum Decoded {
     },
 }
 
+/// The packet kinds a display filter can name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Input,
+    Snapshot,
+    Ping,
+    Pong,
+    /// A lightyear-internal message, a compressed body or a malformed datagram.
+    Internal,
+    /// A datagram that carries only acknowledgements.
+    Ack,
+}
+
+impl Kind {
+    /// Name shown in the packet log and used in the config file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "INPUT",
+            Self::Snapshot => "SNAPSHOT",
+            Self::Ping => "PING",
+            Self::Pong => "PONG",
+            Self::Internal => "INTERNAL",
+            Self::Ack => "ACK",
+        }
+    }
+}
+
+/// What a display filter rule matches: a packet kind and its lightyear net id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageKey {
+    pub kind: Kind,
+    pub net_id: Option<u16>,
+}
+
+impl MessageKey {
+    pub const fn ack() -> Self {
+        Self {
+            kind: Kind::Ack,
+            net_id: None,
+        }
+    }
+
+    /// A datagram whose message type is not visible: compressed or malformed.
+    pub const fn internal() -> Self {
+        Self {
+            kind: Kind::Internal,
+            net_id: None,
+        }
+    }
+}
+
+impl Decoded {
+    pub fn key(&self) -> MessageKey {
+        let (kind, net_id) = match self {
+            Self::Input { net_id, .. } => (Kind::Input, Some(*net_id)),
+            Self::Snapshot { net_id, .. } => (Kind::Snapshot, Some(*net_id)),
+            Self::Ping { net_id, .. } => (Kind::Ping, Some(*net_id)),
+            Self::Pong { net_id, .. } => (Kind::Pong, Some(*net_id)),
+            Self::Unknown { net_id, .. } => (Kind::Internal, *net_id),
+        };
+        MessageKey { kind, net_id }
+    }
+}
+
 pub fn decode(channel: u16, direction: Direction, payload: &[u8]) -> Decoded {
     let Some((net_id, body)) = read_net_id(payload) else {
         return Decoded::Unknown {
@@ -237,6 +301,36 @@ mod tests {
         };
         assert_eq!(net_id, Some(4));
         assert_eq!(bytes, 5);
+    }
+
+    #[test]
+    fn decoded_messages_expose_the_key_a_display_filter_matches() {
+        let ping = message_bytes(0, &0x1234u16.to_be_bytes());
+        assert_eq!(
+            decode(0, Direction::ClientToServer, &ping).key(),
+            MessageKey {
+                kind: Kind::Ping,
+                net_id: Some(0)
+            }
+        );
+
+        let input = message_bytes(2, &postcard::to_allocvec(&sample_input()).unwrap());
+        assert_eq!(
+            decode(1, Direction::ClientToServer, &input).key(),
+            MessageKey {
+                kind: Kind::Input,
+                net_id: Some(2)
+            }
+        );
+
+        let unknown = message_bytes(4, &[0xff, 0x00, 0x12, 0x34, 0x56]);
+        assert_eq!(
+            decode(0, Direction::ServerToClient, &unknown).key(),
+            MessageKey {
+                kind: Kind::Internal,
+                net_id: Some(4)
+            }
+        );
     }
 
     #[test]

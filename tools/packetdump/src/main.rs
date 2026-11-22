@@ -7,6 +7,7 @@
 //! server needs no configuration change.
 
 mod cli;
+mod config;
 mod message;
 mod relay;
 mod report;
@@ -27,6 +28,14 @@ fn main() -> ExitCode {
     let args = cli::Args::parse();
     let listen = args.listen;
     let server = args.server;
+
+    let config = match config::load(args.config.as_deref()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("packetdump: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     let mut relay = match relay::Relay::bind(listen, server) {
         Ok(relay) => relay,
@@ -49,6 +58,12 @@ fn main() -> ExitCode {
     println!("packetdump  parsed Lightyear packets (dev tool)");
     println!("  relay   {bound} -> {server}");
     println!("  client  --connect {connect}");
+    if !config.filter.is_empty() {
+        match &config.path {
+            Some(path) => println!("  filter  {}  ({})", config.filter, path.display()),
+            None => println!("  filter  {}", config.filter),
+        }
+    }
     println!();
 
     let mut reporter = Reporter::new(Options {
@@ -59,6 +74,7 @@ fn main() -> ExitCode {
         color,
         stats_every: (args.stats_every > 0.0).then(|| Duration::from_secs_f32(args.stats_every)),
         limit: args.count,
+        filter: config.filter,
     });
 
     loop {

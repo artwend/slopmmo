@@ -1,6 +1,7 @@
 //! Command line for the packet analyzer.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -66,6 +67,9 @@ pub struct Args {
     /// disable ANSI colors
     #[arg(long)]
     pub no_color: bool,
+    /// TOML config with the packet filter (default: ./packetdump.toml)
+    #[arg(short = 'c', long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 }
 
 fn parse_stats_every(raw: &str) -> Result<f32, String> {
@@ -136,5 +140,18 @@ mod tests {
         assert!(Args::try_parse_from(["packetdump", "-t", "90000"]).is_err());
         assert!(Args::try_parse_from(["packetdump", "-t", "slow"]).is_err());
         assert_eq!(parse(&["-t", "0"]).stats_every, 0.0);
+    }
+
+    #[test]
+    fn the_config_path_is_optional_and_parses_both_spellings() {
+        assert_eq!(parse(&[]).config, None);
+        assert_eq!(
+            parse(&["-c", "capture.toml"]).config,
+            Some(PathBuf::from("capture.toml"))
+        );
+        assert_eq!(
+            parse(&["--config", "other.toml"]).config,
+            Some(PathBuf::from("other.toml"))
+        );
     }
 }
