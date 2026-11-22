@@ -40,8 +40,10 @@ PlayerMovementPacket {
 - Each packet carries the newest input frame **plus its predecessors** (`INPUT_REDUNDANCY`), so
   losing one packet still delivers every tick's input.
 - Exactly **one** movement report per packet — the current one. No report history is retransmitted.
-- The simulation runs at `TICK_HZ = 60`, regardless of the send rate; input frames are addressed
-  by tick, never by arrival time.
+- The client KCC and the authoritative server both run at 60 Hz (`CLIENT_TICK_HZ` /
+  `SERVER_TICK_HZ`, ADR 013); input frames are addressed by the client's tick, never by arrival
+  time. The server still maps that domain onto its own by ratio, so the wire format does not assume
+  the two rates are equal.
 - Server→client uses `ServerSnapshot { server_tick, acked_seq, shadow_position, correction, peers,
   resync }` where `correction` is `Option<CollisionCorrection { seq, tick, epoch, velocity_delta,
   hard_normal }>` and `resync` is the resume-placement flag added later
@@ -60,7 +62,7 @@ giving anyone a time machine.
 - At 4 input frames per packet the client sends ~81 bytes at 30 Hz ≈ 2.4 KB/s: 45 bytes of
   header + report, plus 9 bytes per input frame. The report, not the inputs, dominates.
 - The server must tolerate gaps in the input stream and never extrapolate more than
-  `REPORT_WINDOW = 30` ticks.
+  `REPORT_WINDOW = 30` server ticks (0.5 s).
 - Duplicate packet suppression is a transport concern (`seq`), duplicate correction application is
   a protocol concern (`seq`, `tick`, `epoch`). Both exist and both are tested.
 
@@ -70,7 +72,8 @@ Implemented in `crates/proto/src/packet.rs`:
 
 - `PlayerMovementPacket` with `seq`, `player`, `report`, `inputs`, encoded in ~81 bytes at full
   redundancy.
-- `INPUT_SEND_HZ = 30`, `TICK_HZ = 60`; the client sends a report every 2nd tick.
+- `INPUT_SEND_HZ = 30`, `CLIENT_TICK_HZ = 60`; the client sends a report every 2nd prediction tick,
+  which is every second 60 Hz server tick.
 - `INPUT_REDUNDANCY = 3` → **4** frames per packet (newest + 3), not 2 as in the dialogue. Chosen
   so that three consecutive losses still leave one fresh frame; still well inside the 60-byte
   budget. Recorded here because it changes the loss tolerance from 1 to 3 packets.

@@ -20,12 +20,22 @@ pub use wire::{Reader, WireError, Writer};
 use core::f32::consts::TAU;
 use serde::{Deserialize, Serialize};
 
-/// Authoritative simulation rate.
-pub const TICK_HZ: u32 = 60;
-/// Seconds per simulation tick.
-pub const TICK_DT: f32 = 1.0 / TICK_HZ as f32;
-/// How often the client transmits. Lower than the tick rate on purpose: input
-/// frames are addressed by tick, so the send rate is not the simulation rate.
+/// Client prediction rate: the KCC and the local solve run this fast.
+pub const CLIENT_TICK_HZ: u32 = 60;
+/// Seconds per client prediction tick.
+pub const CLIENT_TICK_DT: f32 = 1.0 / CLIENT_TICK_HZ as f32;
+
+/// Authoritative server simulation rate.
+///
+/// Movement, the spatial rebuild, the broadphase and the collision solve all
+/// run once per server tick. Nothing is sub-sampled below it: a solve that runs
+/// slower than the tick that drives it is visible as stepped pushes.
+pub const SERVER_TICK_HZ: u32 = 60;
+/// Seconds per authoritative server tick.
+pub const SERVER_TICK_DT: f32 = 1.0 / SERVER_TICK_HZ as f32;
+
+/// How often the client transmits. Half the tick rate on purpose: input frames
+/// are addressed by tick, so the send rate is not the simulation rate.
 pub const INPUT_SEND_HZ: u32 = 30;
 /// Frames retransmitted in every packet: the newest plus this many predecessors.
 pub const INPUT_REDUNDANCY: usize = 3;
@@ -50,8 +60,14 @@ pub const CORRECTION_BUDGET: f32 = 2.0;
 
 /// Tolerance factor for the reported displacement check.
 pub const POSITION_SLACK: f32 = 1.35;
-/// Reports older than this many ticks are ignored.
-pub const REPORT_WINDOW: u32 = 30;
+/// How late a report may be before it is treated as stale.
+pub const REPORT_WINDOW_MS: u32 = 500;
+/// Reports older than this many server ticks are ignored.
+///
+/// Derived from [`REPORT_WINDOW_MS`] rather than written as a tick count: the
+/// staleness check runs on the server clock, so a fixed count would silently
+/// change the wall-clock window whenever the server tick rate changes.
+pub const REPORT_WINDOW: u32 = SERVER_TICK_HZ * REPORT_WINDOW_MS / 1000;
 
 pub const MAX_SPEED: f32 = 6.0;
 pub const MAX_ACCEL: f32 = 24.0;

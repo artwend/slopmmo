@@ -55,6 +55,11 @@ Resolution: **solve collisions every tick.** Buy CPU back elsewhere — incremen
 hash updates (dirty cells), not a lower solve rate. A 20–30 Hz soft solve applied to a 60 Hz
 KCC is visible as stepped pushes every 33–50 ms.
 
+Adopted: the server tick is **60 Hz** (a 30 Hz tick was evaluated and set back) and every collision
+mode is solved on every server tick. The client's KCC runs at the same rate; the wire format still
+maps client ticks onto server ticks by ratio rather than assuming equality. See
+[ADR 013](decisions/013-server-tick-pipeline.md).
+
 ### 2.2 `position_delta` was excluded, then reintroduced
 
 The short branch correctly removed `position_delta` from `EntityCollisionCorrection` because
@@ -130,7 +135,10 @@ dead zone around the contact distance.
 4. **No arithmetic**, despite "performance first". 10k players × 8 pairs × 30 Hz ≈ 2.4M pair
    evaluations/s plus 300k grid inserts/s. Feasible in a few ms/core — but it must be measured.
 5. **Tick mapping** between a 60 Hz client and a 30 Hz server: two client ticks fall into one
-   server tick. Which server tick does a correction attach to?
+   server tick. Which server tick does a correction attach to? *Resolved for the mapping itself:
+   corrections are stamped with the server tick, and `SimConfig::map_client_tick` scales the
+   client's tick domain onto the server's. Combat still has to decide which tick a hit resolves
+   on.*
 6. **Combat lag compensation** reuses server entity history — the dialogue says combat is a
    separate system but never says where that history lives.
 7. **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
@@ -166,7 +174,9 @@ do not make cheating trivial, do not pay for a physics engine — and it was mis
 
 ## 5. Open questions to resolve before feature work
 
-- Server tick: 60 Hz everywhere, or 30 Hz with entity collision sub-sampled? Measure first.
+- ~~Server tick: 60 Hz everywhere, or 30 Hz with entity collision sub-sampled? Measure first.~~
+  Decided: 60 Hz server tick with every collision mode solved on it; a 30 Hz tick was evaluated
+  and set back ([ADR 013](decisions/013-server-tick-pipeline.md)).
 - Is the client's peer-collider set history-tracked from day one, or after the first prototype?
 - Walkability grid resolution and how it is authored.
 - Correction budget: max total impulse per player per tick, and the give-up/teleport threshold.
@@ -204,7 +214,7 @@ small. Every one of the following was on the per-tick path.
 
 | # | Finding | Where | Cost |
 | --- | --- | --- | --- |
-| 1 | Four `Vec`s allocated per tick in the broadphase | `collision::build_pairs` | 4 allocations × 60 Hz |
+| 1 | Four `Vec`s allocated per tick in the broadphase | `collision::build_pairs` | 4 allocations per tick |
 | 2 | One `Vec<Impulse>` sized to the whole body list, per tick | `collision::solve` | 1 allocation + full write pass |
 | 3 | A `Vec<(f32, usize)>` collected **per player per tick** for AOI peers, then sorted | `Simulation::build_snapshots` | 1 allocation + a sort per player per tick |
 | 4 | A fresh `Vec<ServerSnapshot>` returned from `step`, and a second `Vec<u64>` of ids collected to zip it back up | `Simulation::step`, `Game::tick_once` | 2 allocations per tick |
@@ -295,7 +305,7 @@ Claims that are true:
 
 Claim that would be false, and is therefore not made: **the authoritative tick itself is
 single-threaded, deliberately.** Determinism is a stated requirement (ADR 013: fixed `dt`, tie-broken
-iteration order), and the tick now costs 0.99 ms of a 16.67 ms budget at 256 players. Note also that
+iteration order), and the tick now costs 1.11 ms of a 16.67 ms budget at 256 players. Note also that
 `ingest`, `drive` and `dispatch` all take `ResMut<GameRes>`, so the executor serialises them by
 construction — that conflict *is* the design, not an oversight.
 

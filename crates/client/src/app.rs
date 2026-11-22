@@ -157,9 +157,9 @@ fn simulate(
 ) {
     res.accumulator += time.delta_secs();
     let mut steps = 0;
-    while res.accumulator >= proto::TICK_DT && steps < 8 {
+    while res.accumulator >= proto::CLIENT_TICK_DT && steps < 8 {
         local.step(&world.0, res.input);
-        res.accumulator -= proto::TICK_DT;
+        res.accumulator -= proto::CLIENT_TICK_DT;
         steps += 1;
     }
     if steps == 8 {

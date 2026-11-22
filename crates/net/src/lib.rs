@@ -8,10 +8,16 @@
 use bevy_app::{App, Plugin};
 use core::time::Duration;
 use lightyear::prelude::*;
-use proto::{INPUT_SEND_HZ, PlayerMovementPacket, ServerSnapshot, TICK_HZ};
+use proto::{CLIENT_TICK_HZ, INPUT_SEND_HZ, PlayerMovementPacket, SERVER_TICK_HZ, ServerSnapshot};
 
-/// Duration of one simulation tick. Every Lightyear timeline uses it.
-pub const TICK_DURATION: Duration = Duration::from_nanos(1_000_000_000 / TICK_HZ as u64);
+/// Duration of one client prediction tick. The client's Lightyear timeline uses it.
+pub const CLIENT_TICK_DURATION: Duration =
+    Duration::from_nanos(1_000_000_000 / CLIENT_TICK_HZ as u64);
+
+/// Duration of one authoritative server tick. The server's Lightyear timeline
+/// uses it.
+pub const SERVER_TICK_DURATION: Duration =
+    Duration::from_nanos(1_000_000_000 / SERVER_TICK_HZ as u64);
 
 /// Largest packet we are willing to put in one UDP datagram.
 ///

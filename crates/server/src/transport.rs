@@ -74,7 +74,7 @@ impl Plugin for NetPlugin {
         // Order matters: plugin group, then the protocol, then the transport
         // entity. Lightyear hashes the protocol, so both ends must agree.
         app.add_plugins(ServerPlugins {
-            tick_duration: net::TICK_DURATION,
+            tick_duration: net::SERVER_TICK_DURATION,
         })
         .add_plugins(net::MovementProtocol)
         .init_resource::<Peers>()
@@ -94,7 +94,11 @@ fn spawn_endpoint(mut commands: Commands, addr: Res<ListenAddr>) {
     let server = commands
         .spawn((ServerUdpIo, RawServer, LocalAddr(addr.0)))
         .id();
-    info!("listening on {}, tick rate {} Hz", addr.0, proto::TICK_HZ);
+    info!(
+        "listening on {}, tick rate {} Hz",
+        addr.0,
+        proto::SERVER_TICK_HZ
+    );
     commands.trigger(Start { entity: server });
 }
 

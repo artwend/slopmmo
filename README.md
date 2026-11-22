@@ -11,7 +11,7 @@ running code instead of arguing about them.
 - **Rust** 1.100.0 (pinned in `rust-toolchain.toml`)
 - **Bevy** 0.20 (`MinimalPlugins` on the server, `DefaultPlugins` in the client window)
 - **Lightyear** 0.31 for the wire (UDP, channels, message framing)
-- 60 Hz fixed server tick, 30 Hz client input send with redundancy
+- 60 Hz fixed server tick with a collision solve every tick, 30 Hz client input send with redundancy
 
 ## Layout
 
@@ -50,11 +50,15 @@ The split is asymmetric, and that asymmetry is the whole architecture:
 Client                                        Server
 ------                                        ------
 owns terrain                                  owns no terrain at all
-KCC + peer colliders, 60 Hz                   shadow kinematics from reports
-predicts locally, never waits                 spatial hash -> pairs (K = 8)
+KCC + peer colliders, 60 Hz                   shadow kinematics from reports, 60 Hz
+predicts locally, never waits                 spatial hash -> pairs (K = 8), every tick
 applies corrections (velocity / normal)       soft or hard impulse per pair
 sends pose reports 30 Hz                      sends snapshot + correction
 ```
+
+Server and client both run at 60 Hz, and the server solves every collision mode on every tick.
+Nothing is sub-sampled below the tick that drives it, because a 20–30 Hz soft solve under a 60 Hz
+KCC is visible as stepped pushes.
 
 Consequences that are enforced in code, not just documented:
 
@@ -79,7 +83,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 73 tests: proto, net, sim, server, client, packetdump
+cargo test --workspace          # 74 tests: proto, net, sim, server, client, packetdump
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -115,15 +119,16 @@ Deterministic seed, no sockets. One machine's numbers, for scale only:
 ```
                    32 bots     256 bots
 ticks              300         300
-ms_per_tick        0.042       1.004
-solve_us_per_tick  30.7        915.9
+ms_per_tick        0.043       1.110
+solve_us_per_tick  31.6        1022.2
 pairs_last_tick    110         890
 corrections        9010        76456
-headroom_x         400.3       16.6
+headroom_x         389.8       15.0
 ```
 
 `headroom_x` is how many times over the tick budget is met at this bot count. Treat it as "the
-solver is not the bottleneck yet", not as a benchmark.
+solver is not the bottleneck yet", not as a benchmark. The bots predict at 60 Hz and report in the
+client tick domain, so `rejected_stale` stays at zero.
 
 The 32-bot column barely moves between builds because fixed per-tick bookkeeping dominates it; the
 256-bot column is the one that responds to the data layout. The review pass in
@@ -148,7 +153,7 @@ and fails if no snapshot arrives:
 
 ```
 net_sent        600
-net_snaps       1185
+net_snaps       1173
 net_corrections 0        # same KCC on both sides, so the wall slide needs no correction
 net_resyncs     0        # a continuous session is never placed by the server
 result          ok
@@ -164,8 +169,10 @@ continues from where the server put it instead of being rejected as a teleport f
 life. After the window, the id is a first admission again.
 
 The client's tick counter starts at zero while the server's has been running since launch, so
-every player carries an offset, anchored on its first report and re-anchored when a long hitch
-pushes its clock into the future. Without it a join would be rejected as `StaleTick` forever.
+every player carries a `(client tick, server tick)` anchor, re-anchored when a long hitch pushes its
+clock out of the window. The mapping scales elapsed client ticks by the server/client rate ratio;
+both run at 60 Hz today, but the protocol does not assume it, and a mismatched pair stays aligned
+instead of re-anchoring. Without the mapping, a join would be rejected as `StaleTick` forever.
 
 One trap worth knowing: the headless runner drives `App::update` by hand, and Lightyear installs
 its message send/receive systems in `Plugin::finish`. Without an explicit `app.finish()` /
@@ -281,6 +288,7 @@ implementation here diverges where the review concluded the design was wrong:
 | `position_delta` in corrections | none | breaks replay determinism on the client |
 | client predicts hard collisions | hard contacts are reported | the server has no terrain to verify them |
 | declared velocity validated | position delta between reports validated | declared velocity proves nothing |
+| Soft solve at 20–30 Hz, hard at 60 Hz | one solve per 60 Hz server tick | a subsystem cannot outrun the tick that drives it |
 | exponential ground friction | linear | exponential settles below `max_speed` |
 | build up penetration from zero | capped bias, inelastic impulse | fixed push double-counts |
 | "authoritative movement state" | shadow state | the client owns its position |

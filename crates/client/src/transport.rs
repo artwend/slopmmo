@@ -41,7 +41,7 @@ struct PlayerId(u64);
 impl Plugin for ClientNetPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ClientPlugins {
-            tick_duration: net::TICK_DURATION,
+            tick_duration: net::CLIENT_TICK_DURATION,
         })
         .add_plugins(net::MovementProtocol)
         .configure_sets(Update, (NetSet::Receive, NetSet::Send).chain())

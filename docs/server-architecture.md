@@ -116,11 +116,14 @@ The unit of deployment. One process, N cores, one tick loop.
 
 Invariants:
 
+- **One rate.** The server ticks at 60 Hz and every phase above runs on every tick, including both
+  collision modes. Nothing is sub-sampled. The client's KCC predicts at the same 60 Hz; the server
+  still scales the client's tick domain onto its own rather than assuming the rates are equal.
 - Event time is **tick time**. A packet's arrival decides whether it can still apply, never *when*
   it applies.
 - No rewind. There is no historical collision state; lag compensation is unbuilt and belongs to the
   combat design (ADR 013).
-- Extrapolation is bounded by `REPORT_WINDOW` (30 ticks), then the actor is frozen.
+- Extrapolation is bounded by `REPORT_WINDOW` (30 server ticks, 0.5 s), then the actor is frozen.
 - A departed player's shadow is parked for `RESUME_WINDOW`; a resume is placed from that shadow and
   its claim is clamped to the travel possible since the last accepted report. Reconnecting is never
   a way to move.
@@ -158,7 +161,7 @@ once.
 | Channel | Reliability | Rate | Content |
 | --- | --- | --- | --- |
 | client → server movement | unreliable, sequenced | 30 Hz, newest + 3 inputs | `PlayerMovementPacket` |
-| server → client snapshot | unreliable, sequenced | tick rate (adaptive not built) | tick, ack, shadow pos, correction, peers, `resync` |
+| server → client snapshot | unreliable, sequenced | tick rate, 60 Hz (adaptive not built) | tick, ack, shadow pos, correction, peers, `resync` |
 | corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
 | discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
 
@@ -186,7 +189,7 @@ the tick fails that test.
 Concurrency, stated precisely: the UDP endpoint is non-blocking and lightyear pools its receive
 buffers, the I/O layer runs as an async task on Bevy's task pool, and Bevy's executor is
 multi-threaded — but the tick itself is single-threaded on purpose. Determinism is an invariant
-(ADR 013), and the tick costs ~1 ms of a 16.67 ms budget at 256 players. `ingest`, `drive` and
+(ADR 013), and the tick costs ~1.1 ms of a 16.67 ms budget at 256 players. `ingest`, `drive` and
 `dispatch` all take `ResMut<GameRes>`, so the executor serialises them by construction; that conflict
 is the design, not a missed optimisation.
 
@@ -253,7 +256,8 @@ create → auth → character select → place in zone instance → play → han
 
 | Quantity | Value | Source |
 | --- | --- | --- |
-| Server tick | 60 Hz (16.67 ms) | `proto::TICK_HZ` |
+| Server tick | 60 Hz (16.67 ms) | `proto::SERVER_TICK_HZ` |
+| Client prediction | 60 Hz (16.7 ms) | `proto::CLIENT_TICK_HZ` |
 | Client send rate | 30 Hz | `proto::INPUT_SEND_HZ` |
 | Input redundancy | newest + 3 frames | `proto::INPUT_REDUNDANCY` |
 | Client packet | ~81 B | `proto::PlayerMovementPacket` |
@@ -261,12 +265,12 @@ create → auth → character select → place in zone instance → play → han
 | Peer cap in snapshot | 16 | `proto::MAX_SNAPSHOT_PEERS` |
 | Neighbour cap | 8 | `proto::MAX_NEIGHBOURS` |
 | Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
-| Report window | 30 ticks (0.5 s) | `proto::REPORT_WINDOW` |
+| Report window | 30 server ticks (0.5 s) | `proto::REPORT_WINDOW` |
 | Resume window | 120 s (7200 ticks) | `sim::authority::RESUME_WINDOW` |
 | Resume travel allowance | 5.4 m | `SimConfig::resume_travel()` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.039 ms at 32 bots, 0.993 ms at 256 bots | `server --bots N --duration 3` |
+| Measured tick cost | 0.043 ms at 32 bots, 1.11 ms at 256 bots | `server --bots N --duration 5` |
 | Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
@@ -283,7 +287,7 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 
 | Area | Status |
 | --- | --- |
-| Fixed 60 Hz tick, eight phases | Implemented (phases collapsed) |
+| Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
 | Client KCC + peer collision | Implemented |
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |

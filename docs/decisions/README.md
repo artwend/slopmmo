@@ -27,7 +27,7 @@ Status legend:
 | [010](010-collision-modes.md) | Collision modes `None` / `Soft` / `Hard`, soft by default in PvP | Implemented |
 | [011](011-neighbour-budget.md) | Spatial hash, nearest candidates, at most K = 8 pairs per player | Implemented |
 | [012](012-performance-before-anticheat.md) | Performance first, anti-cheat cheap and best-effort | Implemented |
-| [013](013-server-tick-pipeline.md) | Fixed server tick pipeline, no rewind, bounded extrapolation | Partial |
+| [013](013-server-tick-pipeline.md) | Fixed 60 Hz tick pipeline, solve every tick, no rewind, bounded extrapolation | Implemented |
 | [014](014-character-feel.md) | Camera-relative rotation, moderate air control, soft character collision | Implemented |
 
 Supporting documents:

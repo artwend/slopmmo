@@ -205,7 +205,7 @@ impl Local {
             tick: self.tick,
             ..input
         };
-        self.player.tick(world, &input, proto::TICK_DT);
+        self.player.tick(world, &input, proto::CLIENT_TICK_DT);
         self.recent.push_front(input);
         self.recent.truncate(proto::MAX_INPUT_FRAMES);
     }
@@ -215,7 +215,7 @@ impl Local {
         if self.sent_at == Some(self.tick) {
             return None;
         }
-        let every = (proto::TICK_HZ / proto::INPUT_SEND_HZ).max(1);
+        let every = (proto::CLIENT_TICK_HZ / proto::INPUT_SEND_HZ).max(1);
         if !self.tick.0.is_multiple_of(every) {
             return None;
         }

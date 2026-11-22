@@ -37,7 +37,7 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            tick_hz: proto::TICK_HZ,
+            tick_hz: proto::SERVER_TICK_HZ,
             neighbour_limit: proto::MAX_NEIGHBOURS,
             pairs_per_body: proto::MAX_PAIRS_PER_PLAYER,
             correction_budget: proto::CORRECTION_BUDGET,
@@ -53,11 +53,32 @@ impl Default for SimConfig {
 ///
 /// Long enough for a crash-restart or a network outage; short enough that the
 /// parked poses of players who are gone for good cannot accumulate.
-pub const RESUME_WINDOW: u32 = 120 * proto::TICK_HZ;
+pub const RESUME_WINDOW: u32 = 120 * proto::SERVER_TICK_HZ;
 
 impl SimConfig {
     pub fn dt(&self) -> f32 {
         1.0 / self.tick_hz.max(1) as f32
+    }
+
+    /// Maps a client tick onto the server tick domain anchored by `origin`,
+    /// a `(client tick, server tick)` pair.
+    ///
+    /// The two clocks do not share a rate: the client predicts at
+    /// [`proto::CLIENT_TICK_HZ`], the server ticks at [`Self::tick_hz`]. Elapsed
+    /// client ticks are therefore scaled, not added one-for-one — adding them
+    /// directly made the mapped tick run ahead of the server by one tick every
+    /// two client ticks, which tripped the future-staleness check and re-anchored
+    /// the clock continuously.
+    pub fn map_client_tick(
+        &self,
+        origin: (proto::Tick, proto::Tick),
+        client: proto::Tick,
+    ) -> proto::Tick {
+        let elapsed = i64::from(client.0.wrapping_sub(origin.0.0) as i32);
+        let scaled = elapsed * i64::from(self.tick_hz) / i64::from(proto::CLIENT_TICK_HZ);
+        // `scaled` is an i32-range delta; the cast keeps negative deltas as
+        // two's-complement wrapping sub, which is what `Tick::add` expects.
+        origin.1.add(scaled as u32)
     }
 
     /// Largest displacement a resume may claim from the shadow it left behind.
@@ -134,7 +155,9 @@ pub struct ServerPlayer {
     /// Maps the client's tick domain onto the server's. Established on the first
     /// accepted report and re-anchored when the domains drift apart, because the
     /// client's tick counter has nothing to do with the server's absolute tick.
-    pub tick_offset: Option<u32>,
+    /// Stored as `(client tick, server tick)` at the anchor: the two clocks run
+    /// at different rates, so the mapping needs a rate ratio, not a fixed offset.
+    pub tick_origin: Option<(proto::Tick, proto::Tick)>,
     /// Server tick of the last accepted report. The displacement check is
     /// measured on this clock, never on the client-declared report tick.
     pub last_server_tick: proto::Tick,
@@ -157,7 +180,7 @@ impl ServerPlayer {
             correction_seq: 0,
             last_correction_tick: None,
             budget_used: 0.0,
-            tick_offset: None,
+            tick_origin: None,
             last_server_tick: proto::Tick::ZERO,
             needs_resync: false,
         }
@@ -178,7 +201,7 @@ impl ServerPlayer {
 
 /// Per-tick buffers.
 ///
-/// The tick runs sixty times a second and is the only thing in the process that
+/// The tick runs thirty times a second and is the only thing in the process that
 /// touches every player, so it owns its working memory instead of allocating it.
 /// After the first tick with a given player count, [`Simulation::step`] does not
 /// call the allocator at all.
@@ -355,7 +378,7 @@ impl Simulation {
             reported
         };
 
-        let now = self.tick.0;
+        let now = self.tick;
         let player = self.add_player(packet.player, pos);
         // The shadow's own state is restored; the claim's velocity is not part
         // of the placement and is not re-validated here.
@@ -364,7 +387,7 @@ impl Simulation {
         player.grounded = shadow.grounded;
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
-        player.tick_offset = Some(now.wrapping_sub(report.tick.0));
+        player.tick_origin = Some((report.tick, now));
         player.needs_resync = clamped;
 
         self.stats.resumed += 1;
@@ -433,15 +456,24 @@ impl Simulation {
         // the first report; a mapped tick that lands outside the window means the
         // client's clock was paused or hitched, so re-anchor instead of stalling
         // it forever. Replays are the sequence number's job, not the tick's.
-        let offset = player
-            .tick_offset
-            .get_or_insert(tick.0.wrapping_sub(report.tick.0));
-        let mapped = proto::Tick::new(report.tick.0.wrapping_add(*offset));
+        //
+        // The client predicts at `CLIENT_TICK_HZ` and the server ticks at
+        // `tick_hz`, so the mapping scales elapsed client ticks instead of
+        // adding them one-for-one.
+        let origin = match player.tick_origin {
+            Some(origin) => origin,
+            None => {
+                let origin = (report.tick, *tick);
+                player.tick_origin = Some(origin);
+                origin
+            }
+        };
+        let mapped = config.map_client_tick(origin, report.tick);
         if tick.is_stale(mapped, config.report_window) {
             // Mapped into the future: the client's clock was paused, hitched or
             // restarted. Re-anchor rather than stalling it forever — the sequence
             // number and the displacement check still bound what it can claim.
-            *offset = tick.0.wrapping_sub(report.tick.0);
+            player.tick_origin = Some((report.tick, *tick));
         } else if mapped.is_stale(*tick, config.report_window) {
             stats.stale += 1;
             return Err(Reject::StaleTick);
@@ -494,6 +526,9 @@ impl Simulation {
     /// rather than returned, so the tick does not allocate. The whole pass is
     /// linear over a dense array: build bodies, rebuild the grid, build pairs,
     /// solve, write snapshots.
+    ///
+    /// Every collision mode is solved here, on every tick. There is no
+    /// sub-sampled solve: the only rate that matters is [`SimConfig::tick_hz`].
     pub fn step(&mut self, world: &StaticWorld) {
         self.tick = self.tick.add(1);
         let dt = self.config.dt();

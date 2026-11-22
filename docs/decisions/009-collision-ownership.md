@@ -57,7 +57,7 @@ offset and collision modes (ADR 012).
 
 - `crates/sim/src/world.rs` — static AABBs exist **client-side and in tests only**;
   `crates/server/src/main.rs` never constructs a `StaticWorld`.
-- `crates/sim/src/authority.rs` — the server keeps `ServerPlayer { position, velocity, tick_offset,
+- `crates/sim/src/authority.rs` — the server keeps `ServerPlayer { position, velocity, tick_origin,
   last_seq, last_tick }` and validates the reported displacement, rejecting with
   `Reject::{StaleTick, Teleport, TooFast, DuplicateSeq, UnknownPlayer, MalformedTick}`.
 - `crates/sim/src/collision.rs` — capsule-vs-capsule only, with `inv_mass = 0.0` for immovable

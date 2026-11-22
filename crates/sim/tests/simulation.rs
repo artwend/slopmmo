@@ -15,8 +15,10 @@ use sim::spatial::SpatialGrid;
 use sim::world::StaticWorld;
 use sim::{Aabb, move_and_slide};
 
+/// The KCC and movement model are client-side, so these tests step them at the
+/// client prediction rate. Server-side tests use `SimConfig::dt()`.
 fn dt() -> f32 {
-    proto::TICK_DT
+    proto::CLIENT_TICK_DT
 }
 
 const GRAVITY: f32 = -24.0;
@@ -316,14 +318,13 @@ fn duplicate_and_stale_packets_are_rejected_without_moving_the_shadow() {
     assert_eq!(sim.ingest(&first), Err(Reject::DuplicateSeq));
     assert_eq!(sim.player(1).unwrap().pos, shadow);
 
-    // Older than the report window.
-    let old = packet(
-        6,
-        200u32.wrapping_sub(proto::REPORT_WINDOW + 5),
-        1,
-        Vec3::new(0.02, 0.9, 0.0),
-        Vec3::ZERO,
-    );
+    // Older than the report window, measured on the server clock. The client and
+    // server rates need not match, so the client-tick offset is the server window
+    // scaled by their ratio.
+    let client_ticks_per_server_tick = (proto::CLIENT_TICK_HZ / proto::SERVER_TICK_HZ).max(1);
+    let old_client_tick =
+        200u32.wrapping_sub(client_ticks_per_server_tick * (proto::REPORT_WINDOW + 5));
+    let old = packet(6, old_client_tick, 1, Vec3::new(0.02, 0.9, 0.0), Vec3::ZERO);
     assert!(matches!(
         sim.ingest(&old),
         Err(Reject::StaleTick) | Err(Reject::Teleport)
@@ -339,7 +340,10 @@ fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
     // The client counts ticks from its own start; that is not a protocol error.
     let first = packet(1, 0, 1, Vec3::new(0.0, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&first), Ok(()));
-    assert_eq!(sim.player(1).unwrap().tick_offset, Some(5000));
+    assert_eq!(
+        sim.player(1).unwrap().tick_origin,
+        Some((Tick::new(0), Tick::new(5000)))
+    );
 
     let next = packet(2, 1, 1, Vec3::new(0.02, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&next), Ok(()));
@@ -349,8 +353,40 @@ fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
     let jumped = packet(3, 20_000, 1, Vec3::new(0.05, 0.9, 0.0), Vec3::ZERO);
     assert_eq!(sim.ingest(&jumped), Ok(()));
     assert_eq!(
-        sim.player(1).unwrap().tick_offset,
-        Some(sim.tick.0.wrapping_sub(20_000))
+        sim.player(1).unwrap().tick_origin,
+        Some((Tick::new(20_000), sim.tick))
+    );
+}
+
+#[test]
+fn a_60hz_client_clock_maps_onto_a_30hz_server_without_re_anchoring() {
+    // The default server tick is 60 Hz too, so the mapping is the identity in the
+    // shipped configuration. It still has to survive a rate split: half rate is
+    // the case that used to re-anchor every half second.
+    let config = SimConfig {
+        tick_hz: 30,
+        ..Default::default()
+    };
+    let mut sim = Simulation::new(config);
+    sim.add_player(1, Vec3::ZERO);
+    sim.tick = Tick::new(1000);
+    let anchor = (Tick::new(0), sim.tick);
+
+    // The client predicts at 60 Hz and reports every second tick, so exactly one
+    // report lands per 30 Hz server tick. Treating both counters as the same rate
+    // would map the client a tick ahead of the server for every two client ticks
+    // and trip the future-staleness re-anchor.
+    for i in 0..30u32 {
+        sim.tick = Tick::new(1000 + i);
+        let pos = Vec3::new(i as f32 * 0.02, 0.0, 0.0);
+        let report = packet(i as u16 + 1, i * 2, 1, pos, Vec3::ZERO);
+        assert_eq!(sim.ingest(&report), Ok(()), "report {i} was rejected");
+    }
+
+    assert_eq!(
+        sim.player(1).unwrap().tick_origin,
+        Some(anchor),
+        "the clock domain re-anchored mid-stream"
     );
 }
 

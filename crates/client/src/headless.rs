@@ -146,7 +146,7 @@ fn script_tick(world: Res<WorldRes>, mut local: ResMut<Local>, mut script: ResMu
     // A live run has to follow the wall clock, otherwise the script is over
     // before a single round-trip can complete.
     if let Some(start) = script.started {
-        let want = f64::from(script.ticks) * f64::from(proto::TICK_DT);
+        let want = f64::from(script.ticks) * f64::from(proto::CLIENT_TICK_DT);
         let elapsed = start.elapsed().as_secs_f64();
         if want > elapsed {
             std::thread::sleep(Duration::from_secs_f64(want - elapsed));
@@ -169,7 +169,7 @@ struct Report {
 }
 
 fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
-    let budget = ((seconds * proto::TICK_HZ as f32) as u32).max(1);
+    let budget = ((seconds * proto::CLIENT_TICK_HZ as f32) as u32).max(1);
 
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)

@@ -60,7 +60,7 @@ impl Game {
     /// Advances at most `max_ticks` fixed steps for `delta` seconds of wall time.
     pub fn advance(&mut self, delta: f32, max_ticks: u32) -> u32 {
         self.accumulator += delta;
-        let step = proto::TICK_DT;
+        let step = proto::SERVER_TICK_DT;
         let mut ran = 0;
         while self.accumulator >= step && ran < max_ticks {
             self.tick_once();
@@ -116,7 +116,7 @@ fn main() {
             }
             app.add_plugins(transport::NetPlugin { addr });
         }
-        None => info!("no socket, tick rate {} Hz", proto::TICK_HZ),
+        None => info!("no socket, tick rate {} Hz", proto::SERVER_TICK_HZ),
     }
 
     app.run();
@@ -141,29 +141,42 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
         })
         .collect();
 
-    let total_ticks = (duration_s * proto::TICK_HZ as f32).round() as u64;
+    let total_ticks = (duration_s * proto::SERVER_TICK_HZ as f32).round() as u64;
+    // Bots predict like a client and report once per server tick, tick-stamped in
+    // the client's own domain. The real client reports at `INPUT_SEND_HZ`; the
+    // benchmark sends every tick so the shadow is always fresh. Reporting server
+    // ticks as if they were client ticks would look like a clock running at the
+    // wrong rate and (correctly) be rejected as stale.
+    let client_steps = (proto::CLIENT_TICK_HZ / proto::SERVER_TICK_HZ).max(1);
+    let mut client_tick = proto::Tick::ZERO;
     let start = Instant::now();
     let mut solve_ns: u128 = 0;
 
     for _ in 0..total_ticks {
-        // `step` advances the tick; hand the bots the tick they are reporting
-        // for, exactly as the old driver did.
-        let tick = game.sim.tick.add(1);
+        for _ in 0..client_steps {
+            client_tick = client_tick.add(1);
+            for bot in roster.iter_mut() {
+                let input = bot.input(client_tick, &mut rng);
+                let (pos, vel) = bot.predict(
+                    &game.world,
+                    &game.move_params,
+                    &input,
+                    proto::CLIENT_TICK_DT,
+                );
+                bot.pos = pos;
+                bot.vel = vel;
+                bot.grounded = vel.y <= 0.0;
+            }
+        }
 
         for bot in roster.iter_mut() {
-            let input = bot.input(tick, &mut rng);
-            let (pos, vel) = bot.predict(&game.world, &game.move_params, &input, proto::TICK_DT);
-            bot.pos = pos;
-            bot.vel = vel;
-            bot.grounded = vel.y <= 0.0;
-
             let packet = proto::PlayerMovementPacket {
-                seq: (tick.0 & 0xFFFF) as u16,
+                seq: (client_tick.0 & 0xFFFF) as u16,
                 player: bot.id,
                 report: proto::MovementReport {
-                    tick,
-                    position: pos.to_array(),
-                    velocity: vel.to_array(),
+                    tick: client_tick,
+                    position: bot.pos.to_array(),
+                    velocity: bot.vel.to_array(),
                     body_yaw: 0.0,
                     grounded: bot.grounded,
                     applied_correction_seq: 0,
@@ -200,7 +213,7 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
     println!("rejected_fast   {}", stats.too_fast);
     println!("rejected_tp     {}", stats.teleport);
 
-    let budget_ms = total_ticks as f64 * 1000.0 / proto::TICK_HZ as f64;
+    let budget_ms = total_ticks as f64 * 1000.0 / proto::SERVER_TICK_HZ as f64;
     println!(
         "headroom_x      {:.1}",
         budget_ms / (elapsed.as_secs_f64() * 1000.0).max(0.001)
@@ -274,7 +287,12 @@ mod tests {
         for _ in 0..6 {
             b.advance(1.0 / 6.0, 16);
         }
-        assert!(a.sim.tick.0 >= 59, "too few ticks: {}", a.sim.tick.0);
+        // The server tick is 60 Hz, so one second is sixty steps.
+        assert!(
+            (59..=61).contains(&a.sim.tick.0),
+            "wrong number of server ticks: {}",
+            a.sim.tick.0
+        );
         // f32 accumulation can land one tick either side of the exact second.
         assert!(
             a.sim.tick.0.abs_diff(b.sim.tick.0) <= 1,
