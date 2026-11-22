@@ -12,6 +12,50 @@ decisions themselves — as the project owner made them, with verbatim quotes �
 
 ---
 
+## Where every issue stands
+
+Every point this review raised, sorted into what the repository has closed and what it has not. The
+sections below keep the full argument; this is the working set. Unnumbered on purpose: ADRs and code
+comments cite "§2.1", "§7 of the review", so the numbering must not move.
+
+### Closed
+
+| Item | Settled by |
+| --- | --- |
+| §2.1 Frequencies do not add up | 60 Hz tick with every collision mode solved on every tick; the pose the solver reads is dead-reckoned from the last report, so the 30 Hz report cadence no longer leaves it stale (ADR 013, `Simulation::step`). |
+| §2.2 `position_delta` on corrections | Corrections carry `velocity_delta` and `hard_normal` only; the server no longer moves the shadow from an impulse. |
+| §2.3 Predicting hard collision | Peers do not block local prediction at all: the client solves static terrain only. |
+| §2.4 "Authoritative movement state" | The struct is a shadow, the wire field is `shadow_position`, and the docs use the same word. |
+| §2.5 Prediction on non-rewound state | Prediction depends on static terrain alone, so there is nothing that would have to be rewound. |
+| §2.6 Soft collision numbers | Inelastic relative-normal impulse, vector-sum budget (`CORRECTION_BUDGET = 2.0`), 5 cm contact dead zone (`SOFT_MARGIN`). |
+| §2.7 Capsule distance on X/Z only | `vertical_overlap` gates every pair. |
+| §2.7 "Nearest 8" without a radius | `NEIGHBOUR_RADIUS = 2.0` and the K limit both apply. |
+| §2.7 Validation from the self-declared velocity | The displacement check (`\|Δpos\| ≤ v_max · Δt · k`) is the primary rule; the velocity field is only sanity-checked for finiteness and magnitude. |
+| §3.3 Idempotency of corrections | Monotonic `seq` + `epoch`, client `CorrectionLog`, `acked_seq` echoed in the snapshot. Sequence-keyed rather than tick-keyed replay, because there is no rewind to replay. |
+| §3.4 No arithmetic | Measured in §7.3: 0.039 ms/tick at 32 bots, 0.993 ms at 256. |
+| §3.5 Tick mapping 60/30 | `SimConfig::map_client_tick` scales elapsed client ticks; corrections are stamped with the server tick. Only the combat hit-tick is left, and that is §3.6. |
+| §3.7 Bevy/Avian API risk | Neither risk materialised: Avian is not a dependency (custom KCC), and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
+| §5 Correction budget and teleport threshold | `CORRECTION_BUDGET` and the displacement validator set both. The numbers exist; playtest tuning does not. |
+| §5 Server tick: 60 Hz or 30 Hz | 60 Hz, every collision mode solved (ADR 013). |
+| §7 Findings 1–11 (hot path) | All replaced; the zero-allocation guard (§7.4) now fails the build if a tick allocates. |
+| §8 Reconnect/resume | The shadow is parked on departure, a resume is clamped to it, and `resync` repeats until a report lands. |
+
+### Open
+
+| Item | What is missing |
+| --- | --- |
+| §2.7 Input channel | Still `ChannelMode::SequencedUnreliable`: a late datagram is dropped whole, redundancy frames included. Plain unreliable plus the per-tick dedupe the ingest path already has is the fix. |
+| §3.1 Boss/player vs terrain | No boss controller (`push_out_of_blockers` is a no-op) and no walkability oracle, so neither the push/re-resolve loop nor a guard against it exists. |
+| §3.2 and §5 Zone handover | No zone or handover code; `epoch` is threaded through corrections and snapshots, but nothing bumps it at a boundary crossing. |
+| §3.6 Combat lag compensation | No server-side position history and no rewind (ADR 013 open question): hitscan would resolve against current positions. |
+| §4.1 Client-side collider solve | Snapshots carry peer colliders; the client does not feed them into its solver. Doing so is what would re-open §2.3 and §2.5, so it needs the history-tracked collider set first. |
+| §5 Peer-collider history | Whether that set is history-tracked from day one or after the first prototype. |
+| §4.2 and §5 Walkability oracle | No coarse grid and no authoring story; the server cannot reject "inside a wall". |
+| ADR 013 Adaptive snapshot rate | Snapshots are tied to the tick; an adaptive rate needs a client interpolation buffer to be worth anything. |
+| §7.5 Parallel solve, incremental grid | Deferred by decision, not defects: the tick keeps 15× headroom and the solver owns ~90 % of it, so a parallel solve changes results and needs its own determinism test first. |
+
+---
+
 ## 1. What the design settled on
 
 | Area | Decision |
@@ -42,11 +86,15 @@ report final position        ──────────────▶    sh
 The client's position is authoritative for terrain. The server's position is a *shadow* — it
 must never be described as authoritative.
 
+Not every line of the left column is built: the client does not separate from peers locally today,
+because it does not feed peer colliders into its solve at all. That is the §4.1 split on the open
+list, and it is why §2.3 and §2.5 are currently answered by omission.
+
 ---
 
 ## 2. Errors and contradictions found in the dialogue
 
-### 2.1 Frequencies do not add up
+### 2.1 Frequencies do not add up — **closed**
 
 The tick table lists `Server movement state 30–60 Hz`, `Hard Collision 60 Hz`,
 `Soft Collision 20–30 Hz`. A subsystem cannot run faster than the tick that drives it.
@@ -60,7 +108,11 @@ mode is solved on every server tick. The client's KCC runs at the same rate; the
 maps client ticks onto server ticks by ratio rather than assuming equality. See
 [ADR 013](decisions/013-server-tick-pipeline.md).
 
-### 2.2 `position_delta` was excluded, then reintroduced
+The one figure below the tick that remains is the input report cadence (`INPUT_SEND_HZ = 30`), and it
+is a packet rate, not a simulation rate: the shadow is dead-reckoned from the last accepted report on
+every tick, capped at `REPORT_WINDOW`, so the solver *and* the state it reads run at the tick rate.
+
+### 2.2 `position_delta` was excluded, then reintroduced — **closed**
 
 The short branch correctly removed `position_delta` from `EntityCollisionCorrection` because
 the server cannot guarantee the offset does not land inside a wall. The long branch then put
@@ -70,7 +122,7 @@ A positional delta computed from a shadow state **accumulates drift**: the clien
 somewhere else, so every delta injects fresh error. Position corrections must be forbidden;
 only velocity/impulse corrections are admissible.
 
-### 2.3 "The client predicts hard collision" guarantees mispredictions
+### 2.3 "The client predicts hard collision" guarantees mispredictions — **closed**
 
 Hard collision is *asymmetric* (Shield Wall: blocker vs blocked) and depends on other players'
 positions, which the client only interpolates. Predicting it means predicting wrong exactly
@@ -79,14 +131,14 @@ when it matters — a dash through a shield.
 Resolution: remote players either do not block local prediction at all, or block it without
 being part of the rollback set.
 
-### 2.4 "Authoritative movement state" is a fiction
+### 2.4 "Authoritative movement state" is a fiction — **closed**
 
 The server has no authoritative position — it receives one. `ConfirmedHistory`-style
 reconciliation therefore does not apply in its standard form, and the whole machine degrades
 to "local simulation + injected impulses". This has to be an explicit written decision, and
 the server struct should be named *shadow*, never *authoritative*.
 
-### 2.5 The serious one: predicted motion depends on non-rewound state
+### 2.5 The serious one: predicted motion depends on non-rewound state — **closed**
 
 The client collides locally with NPCs and dynamic objects, but those entities are **not** in
 the rollback history, and Avian does not rewind its spatial structure. Every replay after a
@@ -96,7 +148,7 @@ Resolution: predicted motion may depend **only** on static geometry plus server-
 colliders that are themselves history-tracked. NPCs and decoration are non-blocking for
 prediction.
 
-### 2.6 Soft collision numbers are wrong
+### 2.6 Soft collision numbers are wrong — **closed**
 
 `penetration * w`, clamped to an absolute **1.0 m/s**, versus a 3.5 m/s walk speed: separation
 always lags approach, so players permanently interpenetrate. And the 1 m/s cap is *per pair*,
@@ -111,39 +163,42 @@ j = -(1 + e) * (v_rel · n) / (1/m_a + 1/m_b)
 This fixes penetration and jitter in one step. Add a per-player *vector* impulse budget and a
 dead zone around the contact distance.
 
-### 2.7 Other concrete defects
+### 2.7 Other concrete defects — **closed except the input channel**
 
 - Capsule distance computed on X/Z only → players stacked on different floors push each other.
   Needs a Y overlap test.
 - "Nearest 8" without a radius bound: in an empty field that means contacts at 50 m.
   Both constraints are required.
-- `Unreliable Sequenced` for input is the wrong channel: a late packet is dropped whole,
+- **Open.** `Unreliable Sequenced` for input is the wrong channel: a late packet is dropped whole,
   including its redundancy frames. Use plain `Unreliable` + per-tick dedupe in a buffer.
 - Speed validation reads the self-declared velocity field, which is trivially forged.
   Validate the **position delta** (`|Δpos| ≤ v_max · Δt · k`, and `Δpos ≈ v · Δt`).
 
 ---
 
-## 3. What was never considered
+## 3. What the dialogue never considered
 
-1. **Boss/player vs terrain.** Server pushes → client re-resolves against terrain → client
+1. **Open.** **Boss/player vs terrain.** Server pushes → client re-resolves against terrain → client
    ends up inside the boss → server pushes again. Stable oscillation in wall corners.
-2. **Zone/shard handover** was designed (Voronoi, cellular handover) but never connected to
+2. **Open.** **Zone/shard handover** was designed (Voronoi, cellular handover) but never connected to
    the physics model. Crossing a boundary resets the collision set discontinuously.
-3. **Idempotency of corrections.** An impulse must live in history keyed by tick and be
-   reproduced exactly once during replay, not sit in a "current impulse" field.
-4. **No arithmetic**, despite "performance first". 10k players × 8 pairs × 30 Hz ≈ 2.4M pair
-   evaluations/s plus 300k grid inserts/s. Feasible in a few ms/core — but it must be measured.
-5. **Tick mapping** between a 60 Hz client and a 30 Hz server: two client ticks fall into one
-   server tick. Which server tick does a correction attach to? *Resolved for the mapping itself:
-   corrections are stamped with the server tick, and `SimConfig::map_client_tick` scales the
-   client's tick domain onto the server's. Combat still has to decide which tick a hit resolves
-   on.*
-6. **Combat lag compensation** reuses server entity history — the dialogue says combat is a
+3. **Closed.** **Idempotency of corrections.** An impulse must live in history keyed by tick and be
+   reproduced exactly once during replay, not sit in a "current impulse" field. Settled with a
+   monotonic `seq` plus `epoch` and a client-side log: there is no replay to key by tick, because
+   there is no rewind.
+4. **Closed.** **No arithmetic**, despite "performance first". 10k players × 8 pairs × 60 Hz ≈ 4.8M
+   pair evaluations/s plus 600k grid inserts/s. Feasible in a few ms/core — but it must be measured.
+5. **Closed** for the mapping itself; the combat tick is §3.6. **Tick mapping** between a 60 Hz
+   client and a 30 Hz server: two client ticks fall into one server tick. Which server tick does a
+   correction attach to? *Resolved for the mapping itself: corrections are stamped with the server
+   tick, and `SimConfig::map_client_tick` scales the client's tick domain onto the server's. Combat
+   still has to decide which tick a hit resolves on.*
+6. **Open.** **Combat lag compensation** reuses server entity history — the dialogue says combat is a
    separate system but never says where that history lives.
-7. **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
+7. **Closed.** **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
    Lightyear 0.30 `PredictionHistory` / `ConfirmedHistory` / `VisualCorrection` were asserted
-   without verification against the docs.
+   without verification against the docs. Neither risk was taken: the KCC is custom and the
+   transport is Lightyear 0.31 over a raw UDP endpoint.
 
 ---
 
@@ -164,22 +219,25 @@ Consequences: no `EntityCollisionCorrection` carrying impulses, no idempotency p
 is history-tracked too. The server's correction channel becomes an *exception* path, not the
 normal path.
 
+Status: the server half — validation and collider state, corrections as an exception path — is
+implemented. The client half, feeding those colliders into the local solve, is not; it is on the
+open list, and it is what would re-open §2.3 and §2.5 if done without a history-tracked set.
+
 ### 4.2 A cheap terrain oracle instead of no terrain
 
 A coarse walkability grid (1–2 m cells per zone, a few KB) is not collision. It is enough to
 reject "inside a wall" and teleports almost for free. This is exactly the stated compromise —
 do not make cheating trivial, do not pay for a physics engine — and it was missing.
 
+Status: not implemented. It is still the cheapest defence against walking into geometry, and §3.1
+needs it before a boss can push anyone.
+
 ---
 
 ## 5. Open questions to resolve before feature work
 
-- ~~Server tick: 60 Hz everywhere, or 30 Hz with entity collision sub-sampled? Measure first.~~
-  Decided: 60 Hz server tick with every collision mode solved on it; a 30 Hz tick was evaluated
-  and set back ([ADR 013](decisions/013-server-tick-pipeline.md)).
 - Is the client's peer-collider set history-tracked from day one, or after the first prototype?
 - Walkability grid resolution and how it is authored.
-- Correction budget: max total impulse per player per tick, and the give-up/teleport threshold.
 - Handover protocol for collision state across zone boundaries.
 
 ---
@@ -340,7 +398,7 @@ Honest list, so the next review does not have to rediscover them:
 
 ## 8. Reconnect/resume: the shadow now outlives the link
 
-Moved out of §3 (*what was never considered*), because it is now considered and fixed. The dialogue
+Moved out of §3 (*what the dialogue never considered*), because it is now considered and fixed. The dialogue
 never connected reconnection to the movement model, and the transport resolved it the worst possible
 way: a silent peer's shadow body was deleted, and the first report on the next link was admitted at
 whatever position it claimed. Dropping the connection and reconnecting was therefore an instant,

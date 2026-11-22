@@ -141,9 +141,14 @@ struct ParkedShadow {
 #[derive(Clone, Debug)]
 pub struct ServerPlayer {
     pub id: u64,
-    /// Shadow pose. Sent as an informational reference, except for the
-    /// `resync` placement that follows a clamped resume.
+    /// Shadow pose for the current tick: the anchor advanced by dead reckoning
+    /// when the report stream is older than the tick. Sent as an informational
+    /// reference, except for the `resync` placement that follows a clamped resume.
     pub pos: Vec3,
+    /// Pose of the last accepted report. Extrapolation is measured from here and
+    /// the displacement check must use it: a pose that already moved forward
+    /// would shrink the travel the client is accused of.
+    pub anchor_pos: Vec3,
     pub vel: Vec3,
     pub body_yaw: f32,
     pub grounded: bool,
@@ -172,6 +177,7 @@ impl ServerPlayer {
         Self {
             id,
             pos,
+            anchor_pos: pos,
             vel: Vec3::ZERO,
             body_yaw: 0.0,
             grounded: false,
@@ -201,7 +207,7 @@ impl ServerPlayer {
 
 /// Per-tick buffers.
 ///
-/// The tick runs thirty times a second and is the only thing in the process that
+/// The tick runs sixty times a second and is the only thing in the process that
 /// touches every player, so it owns its working memory instead of allocating it.
 /// After the first tick with a given player count, [`Simulation::step`] does not
 /// call the allocator at all.
@@ -497,15 +503,23 @@ impl Simulation {
         if !pos.is_finite() {
             return Err(Reject::Teleport);
         }
-        let elapsed = tick.since(player.last_server_tick).max(1) as f32;
+        // `Tick::since` is `now - self`, so this is "server ticks since the last
+        // accepted report". The arguments were the other way round, which made
+        // the subtraction negative and clamped the allowance to a single tick:
+        // a legitimate catch-up report after a stalled stream was rejected as a
+        // teleport and the shadow could never be re-synced.
+        let elapsed = player.last_server_tick.since(*tick).max(1) as f32;
         let allowed =
             proto::MAX_SPEED * config.speed_slack * elapsed * config.dt() + proto::POSITION_SLACK;
-        let travelled = (pos - player.pos).length();
+        let travelled = (pos - player.anchor_pos).length();
         if travelled > allowed {
             stats.teleport += 1;
             return Err(Reject::Teleport);
         }
 
+        // The anchor is the only pose extrapolation and the displacement check
+        // may start from; `pos` will be advanced by the tick.
+        player.anchor_pos = pos;
         player.pos = pos;
         player.vel = vel;
         player.body_yaw = report.body_yaw;
@@ -529,6 +543,9 @@ impl Simulation {
     ///
     /// Every collision mode is solved here, on every tick. There is no
     /// sub-sampled solve: the only rate that matters is [`SimConfig::tick_hz`].
+    /// Reports arrive at `INPUT_SEND_HZ`, so bodies are dead-reckoned from their
+    /// last report before the solve; the solver never reads a pose older than the
+    /// tick it is running on.
     pub fn step(&mut self, world: &StaticWorld) {
         self.tick = self.tick.add(1);
         let dt = self.config.dt();
@@ -555,6 +572,23 @@ impl Simulation {
 
         bodies.clear();
         bodies.reserve(players.len() + blockers.len());
+
+        // Phase 2: dead-reckon the shadow between reports. Reports arrive at
+        // `INPUT_SEND_HZ` (30 Hz) while the tick solves at 60 Hz, so without this
+        // every second tick would solve against a frozen pose — the same
+        // "subsystem behind the tick" the tick rate was raised to remove.
+        // Deriving the pose from the anchor instead of integrating it keeps the
+        // shadow drift-free and identical on replay.
+        for p in players.iter_mut() {
+            if p.tick_origin.is_none() || p.needs_resync {
+                continue;
+            }
+            let age = p
+                .last_server_tick
+                .since(*tick)
+                .clamp(0, config.report_window as i32);
+            p.pos = p.anchor_pos + p.vel * (age as f32 * dt);
+        }
         bodies.extend(players.iter().map(|p| p.body(Mode::Soft)));
         bodies.extend(blockers.iter().copied());
 
@@ -579,9 +613,6 @@ impl Simulation {
             p.budget_used = imp.delta_v.length();
             if imp.delta_v != Vec3::ZERO {
                 p.vel += imp.delta_v;
-                // Keep the shadow roughly in step so the displacement validator
-                // does not drift away from the client over a long run.
-                p.pos += imp.delta_v * dt;
             }
             if imp.hard {
                 hard += 1;

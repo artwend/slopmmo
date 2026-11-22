@@ -56,6 +56,10 @@ applies corrections (velocity / normal)       soft or hard impulse per pair
 sends pose reports 30 Hz                      sends snapshot + correction
 ```
 
+Peer colliders are on the wire (`ServerSnapshot::peers`) but are not yet fed into the client's
+solve, so that second line is half-built: prediction currently depends on terrain alone. The
+remaining half is on the open list in [`architecture-review.md`](architecture-review.md).
+
 Server and client both run at 60 Hz, and the server solves every collision mode on every tick.
 Nothing is sub-sampled below the tick that drives it, because a 20–30 Hz soft solve under a 60 Hz
 KCC is visible as stepped pushes.

@@ -93,6 +93,11 @@ Rules:
   per-player client→server tick mapping (`tick_origin`) scales elapsed client ticks by
   `SERVER_TICK_HZ / CLIENT_TICK_HZ`, so a client starting its counter at 0 can join and the two
   clocks stay aligned; a mapped tick outside the window re-anchors instead of rejecting.
+- `crates/sim/src/authority.rs` — the shadow pose is derived, not integrated: every tick sets
+  `pos = anchor_pos + vel * min(age, REPORT_WINDOW) * dt`, where `anchor_pos` is the pose of the last
+  accepted report and `age` is server ticks since it. `INPUT_SEND_HZ` is half the tick, so without
+  this every second 60 Hz solve would read a 30 Hz pose. A `needs_resync` session is never
+  extrapolated: it waits for the client to report from the placement the server gave it.
 - The tick is **single-threaded by decision**, not by omission: determinism (above) comes first, and
   one core is not the constraint yet. It also **does not allocate** in the steady state, which
   `crates/sim/tests/allocations.rs` enforces with a counting allocator.

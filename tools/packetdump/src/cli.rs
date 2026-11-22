@@ -18,10 +18,20 @@ use crate::report::DirectionFilter;
 #[command(name = "packetdump", verbatim_doc_comment)]
 pub struct Args {
     /// relay bind address
-    #[arg(short = 'l', long, value_name = "ADDR", default_value = "127.0.0.1:4001")]
+    #[arg(
+        short = 'l',
+        long,
+        value_name = "ADDR",
+        default_value = "127.0.0.1:4001"
+    )]
     pub listen: SocketAddr,
     /// server address to forward to
-    #[arg(short = 's', long, value_name = "ADDR", default_value = "127.0.0.1:4000")]
+    #[arg(
+        short = 's',
+        long,
+        value_name = "ADDR",
+        default_value = "127.0.0.1:4000"
+    )]
     pub server: SocketAddr,
     /// stop after N observed datagrams (0: until Ctrl+C)
     #[arg(short = 'n', long, value_name = "N", default_value_t = 0)]

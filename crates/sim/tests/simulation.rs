@@ -600,6 +600,100 @@ fn server_corrects_overlapping_players_and_stays_deterministic() {
 }
 
 #[test]
+fn shadow_extrapolates_between_reports_then_freezes() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+
+    let speed = 1.2;
+    let report = packet(
+        1,
+        100,
+        1,
+        Vec3::new(0.0, 0.9, 0.0),
+        Vec3::new(speed, 0.0, 0.0),
+    );
+    assert_eq!(sim.ingest(&report), Ok(()));
+
+    // The report was accepted at server tick 100, so the first tick after it is
+    // already one tick of predicted travel, not zero.
+    sim.step(&world);
+    assert!((sim.player(1).unwrap().pos.x - speed * dt()).abs() < 1e-6);
+    sim.step(&world);
+    assert!((sim.player(1).unwrap().pos.x - speed * 2.0 * dt()).abs() < 1e-6);
+
+    for _ in 0..proto::REPORT_WINDOW {
+        sim.step(&world);
+    }
+    let frozen = sim.player(1).unwrap().pos.x;
+    let limit = speed * proto::REPORT_WINDOW as f32 * dt();
+    assert!(
+        (frozen - limit).abs() < 1e-4,
+        "extrapolation ran to {frozen}, window limit is {limit}"
+    );
+
+    // Frozen means frozen: the shadow does not keep walking on its own.
+    sim.step(&world);
+    assert_eq!(sim.player(1).unwrap().pos.x, frozen);
+}
+
+#[test]
+fn a_stalled_report_stream_catches_up_within_the_window() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+
+    let speed = proto::MAX_SPEED;
+    let start = packet(
+        1,
+        100,
+        1,
+        Vec3::new(0.0, 0.9, 0.0),
+        Vec3::new(speed, 0.0, 0.0),
+    );
+    assert_eq!(sim.ingest(&start), Ok(()));
+    for _ in 0..20 {
+        sim.step(&world);
+    }
+
+    // The client really did move during the gap, so the catch-up report is
+    // legitimate even though it is far from the extrapolated pose's neighbour:
+    // travel is measured from the anchor over server time.
+    let caught_up = Vec3::new(speed * 20.0 * dt(), 0.9, 0.0);
+    let catch_up = packet(2, 120, 1, caught_up, Vec3::new(speed, 0.0, 0.0));
+    assert_eq!(
+        sim.ingest(&catch_up),
+        Ok(()),
+        "a legitimate catch-up after a stalled stream was rejected"
+    );
+    assert_eq!(sim.player(1).unwrap().anchor_pos, caught_up);
+}
+
+#[test]
+fn a_clamped_resume_does_not_drift_before_the_next_report() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.player_mut(1).unwrap().vel = Vec3::new(3.0, 0.0, 0.0);
+    assert!(sim.detach_player(1));
+
+    let resume = sim
+        .resume_player(&packet(1, 0, 1, Vec3::new(40.0, 0.0, 0.0), Vec3::ZERO))
+        .expect("resume lost");
+    assert!(resume.clamped);
+
+    // The parked velocity is not a prediction baseline: a clamped session waits
+    // for the client to report from the placement it was given.
+    for _ in 0..2 {
+        sim.step(&world);
+        assert_eq!(sim.player(1).unwrap().pos, resume.pos);
+    }
+}
+
+#[test]
 fn snapshot_lists_nearby_peers_within_aoi_only() {
     let world = StaticWorld::test_room();
     let mut sim = Simulation::new(SimConfig::default());
