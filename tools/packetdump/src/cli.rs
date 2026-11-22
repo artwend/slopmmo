@@ -122,7 +122,7 @@ fn print_help() {
         "usage: packetdump [--listen ADDR] [--server ADDR] [options]\n\
          \n\
          Relays UDP traffic through this process and prints every Lightyear packet with\n\
-         its decoded messages. Point the client at the relay instead of the server:\n\
+         its decoded messages as RON. Point the client at the relay instead of the server:\n\
          \n\
          \x20 cargo run -p server -- --listen 127.0.0.1:4000\n\
          \x20 cargo run -p packetdump -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000\n\
@@ -133,7 +133,7 @@ fn print_help() {
          \x20 -s, --server ADDR        server address to forward to (default 127.0.0.1:4000)\n\
          \x20 -n, --count N            stop after N observed datagrams (default 0: until Ctrl+C)\n\
          \x20 -t, --stats-every SECS   print rate stats every SECS, 0 disables (default 1.0)\n\
-         \x20 -v, --detail             print decoded fields on separate lines\n\
+         \x20 -v, --detail             pretty-print the decoded RON payload\n\
          \x20 -x, --hex                append a hex dump of each datagram\n\
          \x20 -a, --no-acks            hide header-only ACK packets\n\
          \x20 -d, --dir MODE           c2s, s2c or both (default both)\n\

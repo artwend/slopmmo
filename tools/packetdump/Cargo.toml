@@ -14,4 +14,6 @@ proto.workspace = true
 # Decodes the message payloads. Lightyear serializes registered messages with
 # postcard; the framing itself is parsed in `src/wire.rs`.
 postcard = { version = "1", features = ["alloc"] }
-serde = { version = "1", default-features = false, features = ["alloc"] }
+# RON is the console representation of decoded packet content.
+ron = "0.12"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

@@ -79,7 +79,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 70 tests: proto, net, sim, server, client, packetdump
+cargo test --workspace          # 73 tests: proto, net, sim, server, client, packetdump
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -204,9 +204,9 @@ If both of those check out and the capture is still empty, run the server with
 ### Parsed packet view (dev tool)
 
 `tools/packetdump` is a developer-only UDP relay that forwards traffic between a client and the
-server and prints every Lightyear packet with its decoded messages. It needs no Npcap, capture
-driver, or administrator rights, and it forwards the bytes unchanged. Point the client at the relay
-instead of the server:
+server and prints every Lightyear packet with its decoded messages as RON. It needs no Npcap,
+capture driver, or administrator rights, and it forwards the bytes unchanged. Point the client at
+the relay instead of the server:
 
 ```sh
 cargo run -p server -- --listen 127.0.0.1:4000
@@ -234,23 +234,23 @@ set, launches the clients, and stops every child when the clients exit or you pr
 default each client opens a game window and runs until you close it. `-Headless` runs the fixed
 ~20 s script instead, so keep `-Duration` above that, and prints those client logs at the end.
 
-It prints one row per datagram; a `Data` packet may carry several messages:
+It prints one row per datagram; a `Data` packet may carry several messages. The decoded payload is
+compact RON:
 
 ```
-#000007  1.233s  C->S :52144   20 B  pkt=6     t=13        PING     id=1 net_id=0
-#000012  1.376s  S->C :52144   38 B  pkt=2     t=130       SNAPSHOT t=126 ack=14 shadow=(0.000, 0.900, -1.237) corr=none peers=0 resync=false
-#000013  1.409s  C->S :52144   86 B  pkt=9     t=18        INPUT    seq=16 player=1 t=32 pos=(0.000, 0.900, -1.591) vel=(0.000, 0.000, -5.567) yaw=0.0deg grounded=true applied=0 inputs=4
+#000007  1.233s  C->S :52144   20 B  pkt=6     t=13        PING     net_id=0  Ping(id: 1)
+#000012  1.376s  S->C :52144   38 B  pkt=2     t=130       SNAPSHOT net_id=3  ServerSnapshot(server_tick: Tick(126), acked_seq: 14, shadow_position: (0.0, 0.9, -1.237), correction: None, peers: [], resync: false)
+#000013  1.409s  C->S :52144   86 B  pkt=9     t=18        INPUT    net_id=2  PlayerMovementPacket(seq: 77, player: 1, report: MovementReport(tick: Tick(90), position: (0.0, 0.9, -1.5), velocity: (0.0, 0.0, -5.5), body_yaw: 0.0, grounded: true, applied_correction_seq: 3), inputs: [InputFrame(tick: Tick(90), move_x: 0, move_z: -127, buttons: 0, camera_yaw: 0)])
 ```
 
 The `:<port>` column is the client's UDP endpoint, which keeps packets from different clients
 distinguishable when several are connected.
 
-`--detail` expands each message (`seq`, report, input frames, correction, peer colliders), `--hex`
-appends a dump of the raw datagram, `--no-acks` hides ACK-only packets, and `--dir c2s|s2c` filters
-one side. `--count N --stats-every 0` makes the tool usable from a script. Short flags are `-l`,
-`-s`, `-n`, `-t`, `-v`, `-x`, `-a`, `-d`, `-nc`. The two movement messages and Lightyear's
-`Ping`/`Pong` control messages are decoded; any other internal message is shown as `INTERNAL` and
-counted.
+`--detail` pretty-prints the same RON with indentation. `--hex` appends a dump of the raw datagram,
+`--no-acks` hides ACK-only packets, and `--dir c2s|s2c` filters one side. `--count N --stats-every 0`
+makes the tool usable from a script. Short flags are `-l`, `-s`, `-n`, `-t`, `-v`, `-x`, `-a`, `-d`,
+`-nc`. The two movement messages and Lightyear's `Ping`/`Pong` control messages are decoded; any
+other internal message is shown as `INTERNAL` and counted.
 
 The rate summary also reports packet-id gaps and reordering per direction, so loss shows up
 without opening Wireshark:

@@ -4,11 +4,30 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use proto::{CollisionCorrection, PlayerMovementPacket, ServerSnapshot, peer_mode};
+use proto::{PlayerMovementPacket, ServerSnapshot};
+use serde::{Deserialize, Serialize};
 
 use crate::message::{self, Decoded, Direction};
 use crate::relay::Datagram;
 use crate::wire::{Batch, Body, Fragment, Packet, WireError};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Ping {
+    id: u16,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Pong {
+    id: u16,
+    tick_diff: u32,
+    overstep: u8,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct UnknownMessage {
+    net_id: Option<u16>,
+    bytes: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectionFilter {
@@ -303,23 +322,28 @@ impl Reporter {
                 );
                 if fragment.index == 0 && tail.is_empty() {
                     match message::decode(*channel, direction, fragment.payload) {
-                        Decoded::Input { packet, .. } => {
+                        Decoded::Input { net_id, packet } => {
                             out.push_str("  ");
-                            out.push_str(&self.input_summary(&packet));
+                            out.push_str(&self.input_summary(net_id, &packet));
                         }
-                        Decoded::Snapshot { packet, .. } => {
+                        Decoded::Snapshot { net_id, packet } => {
                             out.push_str("  ");
-                            out.push_str(&self.snapshot_summary(&packet));
+                            out.push_str(&self.snapshot_summary(net_id, &packet));
                         }
-                        Decoded::Ping { id, .. } => out.push_str(&format!("  ping id={id}")),
+                        Decoded::Ping { net_id, id } => {
+                            out.push_str("  ");
+                            out.push_str(&self.ping_summary(net_id, id));
+                        }
                         Decoded::Pong {
+                            net_id,
                             id,
                             tick_diff,
                             overstep,
                             ..
-                        } => out.push_str(&format!(
-                            "  pong id={id} frame_ticks={tick_diff} overstep={overstep}"
-                        )),
+                        } => {
+                            out.push_str("  ");
+                            out.push_str(&self.pong_summary(net_id, id, tick_diff, overstep));
+                        }
                         Decoded::Unknown { .. } => {}
                     }
                 }
@@ -343,55 +367,59 @@ impl Reporter {
 
     fn message_summary(&self, channel: u16, direction: Direction, payload: &[u8]) -> String {
         match message::decode(channel, direction, payload) {
-            Decoded::Input { packet, .. } => self.input_summary(&packet),
-            Decoded::Snapshot { packet, .. } => self.snapshot_summary(&packet),
-            Decoded::Ping { net_id, id } => {
-                format!("{}id={id} net_id={net_id}", self.kind("33", "PING"))
-            }
+            Decoded::Input { net_id, packet } => self.input_summary(net_id, &packet),
+            Decoded::Snapshot { net_id, packet } => self.snapshot_summary(net_id, &packet),
+            Decoded::Ping { net_id, id } => self.ping_summary(net_id, id),
             Decoded::Pong {
                 net_id,
                 id,
                 tick_diff,
                 overstep,
-            } => format!(
-                "{}id={id} frame_ticks={tick_diff} overstep={overstep} net_id={net_id}",
-                self.kind("33", "PONG")
-            ),
+            } => self.pong_summary(net_id, id, tick_diff, overstep),
             Decoded::Unknown { net_id, bytes } => format!(
-                "{}net_id={} {} B (not decoded)",
+                "{}{}",
                 self.kind("90", "INTERNAL"),
-                net_id.map_or_else(|| "?".to_string(), |id| id.to_string()),
-                bytes
+                ron_compact(&UnknownMessage {
+                    net_id,
+                    bytes: bytes as u64,
+                })
             ),
         }
     }
 
-    fn input_summary(&self, packet: &PlayerMovementPacket) -> String {
+    fn input_summary(&self, net_id: u16, packet: &PlayerMovementPacket) -> String {
         format!(
-            "{}seq={} player={} t={} pos={} vel={} yaw={} grounded={} applied={} inputs={}",
+            "{}net_id={net_id}  {}",
             self.kind("36", "INPUT"),
-            packet.seq,
-            packet.player,
-            packet.report.tick.0,
-            fmt_vec(packet.report.position),
-            fmt_vec(packet.report.velocity),
-            fmt_yaw(packet.report.body_yaw),
-            packet.report.grounded,
-            packet.report.applied_correction_seq,
-            packet.inputs.len()
+            ron_compact(packet)
         )
     }
 
-    fn snapshot_summary(&self, packet: &ServerSnapshot) -> String {
+    fn snapshot_summary(&self, net_id: u16, packet: &ServerSnapshot) -> String {
         format!(
-            "{}t={} ack={} shadow={} {} peers={} resync={}",
+            "{}net_id={net_id}  {}",
             self.kind("32", "SNAPSHOT"),
-            packet.server_tick.0,
-            packet.acked_seq,
-            fmt_vec(packet.shadow_position),
-            correction_summary(&packet.correction),
-            packet.peers.len(),
-            packet.resync
+            ron_compact(packet)
+        )
+    }
+
+    fn ping_summary(&self, net_id: u16, id: u16) -> String {
+        format!(
+            "{}net_id={net_id}  {}",
+            self.kind("33", "PING"),
+            ron_compact(&Ping { id })
+        )
+    }
+
+    fn pong_summary(&self, net_id: u16, id: u16, tick_diff: u32, overstep: u8) -> String {
+        format!(
+            "{}net_id={net_id}  {}",
+            self.kind("33", "PONG"),
+            ron_compact(&Pong {
+                id,
+                tick_diff,
+                overstep,
+            })
         )
     }
 
@@ -408,21 +436,21 @@ impl Reporter {
                         "    msg {index}  PlayerMovementPacket  net_id={net_id}  {} B{message_id}",
                         message.payload.len()
                     );
-                    self.print_input(&packet);
+                    self.print_ron(&packet);
                 }
                 Decoded::Snapshot { net_id, packet } => {
                     println!(
                         "    msg {index}  ServerSnapshot  net_id={net_id}  {} B{message_id}",
                         message.payload.len()
                     );
-                    self.print_snapshot(&packet);
+                    self.print_ron(&packet);
                 }
                 Decoded::Ping { net_id, id } => {
                     println!(
                         "    msg {index}  Ping  net_id={net_id}  {} B{message_id}",
                         message.payload.len()
                     );
-                    println!("      id={id}");
+                    self.print_ron(&Ping { id });
                 }
                 Decoded::Pong {
                     net_id,
@@ -434,84 +462,26 @@ impl Reporter {
                         "    msg {index}  Pong  net_id={net_id}  {} B{message_id}",
                         message.payload.len()
                     );
-                    println!(
-                        "      ping_id={id}  frame_time_ticks={tick_diff}  overstep={overstep}"
-                    );
+                    self.print_ron(&Pong {
+                        id,
+                        tick_diff,
+                        overstep,
+                    });
                 }
-                Decoded::Unknown { net_id, bytes } => println!(
-                    "    msg {index}  internal  net_id={net_id:?}  {bytes} B (not decoded)",
-                ),
+                Decoded::Unknown { net_id, bytes } => {
+                    println!("    msg {index}  internal  (not decoded)");
+                    self.print_ron(&UnknownMessage {
+                        net_id,
+                        bytes: bytes as u64,
+                    });
+                }
             }
         }
     }
 
-    fn print_input(&self, packet: &PlayerMovementPacket) {
-        println!("      seq={}  player={}", packet.seq, packet.player);
-        println!("      report");
-        println!(
-            "        tick={}  pos={}  vel={}",
-            packet.report.tick.0,
-            fmt_vec(packet.report.position),
-            fmt_vec(packet.report.velocity)
-        );
-        println!(
-            "        body_yaw={}  grounded={}  applied_correction={}",
-            fmt_yaw(packet.report.body_yaw),
-            packet.report.grounded,
-            packet.report.applied_correction_seq
-        );
-        if packet.inputs.is_empty() {
-            println!("      inputs: none");
-        } else {
-            println!("      inputs ({}, newest first)", packet.inputs.len());
-            for (index, input) in packet.inputs.iter().enumerate() {
-                println!(
-                    "        [{index}] tick={}  move=({}, {})  buttons={}  camera_yaw={}",
-                    input.tick.0,
-                    input.move_x,
-                    input.move_z,
-                    fmt_buttons(input.buttons),
-                    fmt_yaw(input.camera_yaw_rad()),
-                );
-            }
-        }
-    }
-
-    fn print_snapshot(&self, packet: &ServerSnapshot) {
-        println!(
-            "      server_tick={}  acked_seq={}  resync={}",
-            packet.server_tick.0, packet.acked_seq, packet.resync
-        );
-        println!("      shadow={}", fmt_vec(packet.shadow_position));
-        match &packet.correction {
-            None => println!("      correction: none"),
-            Some(correction) => {
-                println!(
-                    "      correction seq={}  tick={}  epoch={}  dv={}",
-                    correction.seq,
-                    correction.tick.0,
-                    correction.epoch,
-                    fmt_vec(correction.velocity_delta)
-                );
-                match correction.hard_normal {
-                    Some(normal) => println!("        hard_normal={}", fmt_vec(normal)),
-                    None => println!("        hard_normal: none"),
-                }
-            }
-        }
-        if packet.peers.is_empty() {
-            println!("      peers: none");
-        } else {
-            println!("      peers ({})", packet.peers.len());
-            for (index, peer) in packet.peers.iter().enumerate() {
-                println!(
-                    "        [{index}] player={}  pos={}  yaw={}  mode={}",
-                    peer.player,
-                    fmt_vec(peer.position),
-                    fmt_yaw(peer.body_yaw),
-                    mode_name(peer.mode)
-                );
-            }
+    fn print_ron<T: Serialize>(&self, value: &T) {
+        for line in ron_pretty(value).lines() {
+            println!("      {line}");
         }
     }
 
@@ -531,17 +501,19 @@ impl Reporter {
         );
         if fragment.index == 0 {
             match message::decode(channel, direction, fragment.payload) {
-                Decoded::Input { packet, .. } => self.print_input(&packet),
-                Decoded::Snapshot { packet, .. } => self.print_snapshot(&packet),
-                Decoded::Ping { id, .. } => println!("    ping id={id}"),
+                Decoded::Input { packet, .. } => self.print_ron(&packet),
+                Decoded::Snapshot { packet, .. } => self.print_ron(&packet),
+                Decoded::Ping { id, .. } => self.print_ron(&Ping { id }),
                 Decoded::Pong {
                     id,
                     tick_diff,
                     overstep,
                     ..
-                } => println!(
-                    "    pong ping_id={id} frame_time_ticks={tick_diff} overstep={overstep}"
-                ),
+                } => self.print_ron(&Pong {
+                    id,
+                    tick_diff,
+                    overstep,
+                }),
                 Decoded::Unknown { .. } => {
                     println!("    first fragment does not contain a whole known message")
                 }
@@ -744,23 +716,25 @@ fn channel_name(batch: &Batch<'_>, direction: Direction) -> String {
     "  (internal)".to_string()
 }
 
-fn correction_summary(correction: &Option<CollisionCorrection>) -> String {
-    match correction {
-        None => "corr=none".to_string(),
-        Some(correction) => {
-            let mut out = format!(
-                "corr=seq={} tick={} epoch={} dv={}",
-                correction.seq,
-                correction.tick.0,
-                correction.epoch,
-                fmt_vec(correction.velocity_delta)
-            );
-            if let Some(normal) = correction.hard_normal {
-                out.push_str(&format!(" n={}", fmt_vec(normal)));
-            }
-            out
-        }
-    }
+fn ron_compact<T: ?Sized + Serialize>(value: &T) -> String {
+    let config = ron::ser::PrettyConfig::new()
+        .struct_names(true)
+        .compact_structs(true)
+        .compact_arrays(true)
+        .compact_maps(true)
+        .new_line("")
+        .indentor("")
+        .separator(" ");
+    ron::ser::to_string_pretty(value, config)
+        .unwrap_or_else(|error| format!("<RON error: {error}>"))
+}
+
+fn ron_pretty<T: ?Sized + Serialize>(value: &T) -> String {
+    let config = ron::ser::PrettyConfig::new()
+        .struct_names(true)
+        .indentor("  ");
+    ron::ser::to_string_pretty(value, config)
+        .unwrap_or_else(|error| format!("<RON error: {error}>"))
 }
 
 fn messages_summary(stats: &DirStats) -> String {
@@ -773,46 +747,6 @@ fn messages_summary(stats: &DirStats) -> String {
         .map(|(name, stat)| format!("{name} {}/{}", stat.count, human_bytes(stat.bytes)))
         .collect::<Vec<_>>()
         .join("  ")
-}
-
-fn mode_name(mode: u8) -> &'static str {
-    match mode {
-        peer_mode::NONE => "none",
-        peer_mode::SOFT => "soft",
-        peer_mode::HARD => "hard",
-        _ => "unknown",
-    }
-}
-
-fn fmt_vec(v: [f32; 3]) -> String {
-    format!("({:.3}, {:.3}, {:.3})", v[0], v[1], v[2])
-}
-
-fn fmt_yaw(rad: f32) -> String {
-    format!("{:.1}deg", rad.to_degrees())
-}
-
-fn fmt_buttons(buttons: u8) -> String {
-    let mut names = Vec::new();
-    if buttons & proto::buttons::JUMP != 0 {
-        names.push("JUMP".to_string());
-    }
-    if buttons & proto::buttons::SPRINT != 0 {
-        names.push("SPRINT".to_string());
-    }
-    if buttons & proto::buttons::CROUCH != 0 {
-        names.push("CROUCH".to_string());
-    }
-    let unknown =
-        buttons & !(proto::buttons::JUMP | proto::buttons::SPRINT | proto::buttons::CROUCH);
-    if unknown != 0 {
-        names.push(format!("0x{unknown:02x}"));
-    }
-    if names.is_empty() {
-        "none".to_string()
-    } else {
-        names.join("|")
-    }
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -883,33 +817,152 @@ mod tests {
         assert!(!DirectionFilter::ServerToClient.shows(Direction::ClientToServer));
     }
 
-    #[test]
-    fn correction_summary_includes_velocity_and_hard_normal() {
-        let correction = Some(CollisionCorrection {
-            seq: 7,
-            tick: proto::Tick::new(90),
-            epoch: 2,
-            velocity_delta: [1.0, 0.0, -2.0],
-            hard_normal: Some([0.0, 1.0, 0.0]),
-        });
-        let text = correction_summary(&correction);
-        assert!(text.contains("seq=7"), "{text}");
-        assert!(text.contains("epoch=2"), "{text}");
-        assert!(text.contains("(1.000, 0.000, -2.000)"), "{text}");
-        assert!(text.contains("n=(0.000, 1.000, 0.000)"), "{text}");
-        assert_eq!(correction_summary(&None), "corr=none");
+    fn sample_input() -> PlayerMovementPacket {
+        PlayerMovementPacket {
+            seq: 77,
+            player: 1,
+            report: proto::MovementReport {
+                tick: proto::Tick::new(90),
+                position: [0.0, 0.9, -1.5],
+                velocity: [0.0, 0.0, -5.5],
+                body_yaw: 0.0,
+                grounded: true,
+                applied_correction_seq: 3,
+            },
+            inputs: vec![proto::InputFrame {
+                tick: proto::Tick::new(90),
+                move_x: 0,
+                move_z: -127,
+                buttons: proto::buttons::JUMP,
+                camera_yaw: proto::quantise_yaw(0.0),
+            }],
+        }
+    }
+
+    fn sample_snapshot() -> ServerSnapshot {
+        ServerSnapshot {
+            server_tick: proto::Tick::new(90),
+            acked_seq: 3,
+            shadow_position: [0.0, 0.9, -1.5],
+            correction: Some(proto::CollisionCorrection {
+                seq: 7,
+                tick: proto::Tick::new(89),
+                epoch: 1,
+                velocity_delta: [0.0, 0.0, -0.5],
+                hard_normal: Some([0.0, 1.0, 0.0]),
+            }),
+            peers: std::iter::once(proto::PeerCollider {
+                player: 2,
+                position: [0.1, 0.2, 0.3],
+                body_yaw: 0.5,
+                mode: proto::peer_mode::SOFT,
+            })
+            .collect(),
+            resync: false,
+        }
     }
 
     #[test]
-    fn input_buttons_are_named() {
-        assert_eq!(fmt_buttons(0), "none");
-        assert_eq!(fmt_buttons(proto::buttons::JUMP), "JUMP");
-        assert_eq!(
-            fmt_buttons(proto::buttons::JUMP | proto::buttons::SPRINT),
-            "JUMP|SPRINT"
-        );
-        assert_eq!(fmt_buttons(0x80), "0x80");
-        assert_eq!(fmt_buttons(proto::buttons::CROUCH | 0x80), "CROUCH|0x80");
+    fn movement_content_roundtrips_as_compact_named_ron() {
+        let input = sample_input();
+        let text = ron_compact(&input);
+        assert!(text.starts_with("PlayerMovementPacket("), "{text}");
+        assert!(text.contains("seq: 77"), "{text}");
+        assert!(text.contains("inputs: [InputFrame("), "{text}");
+        assert!(!text.contains('\n'), "{text}");
+
+        let decoded: PlayerMovementPacket = ron::from_str(&text).expect("RON roundtrip");
+        assert_eq!(decoded.seq, input.seq);
+        assert_eq!(decoded.player, input.player);
+        assert_eq!(decoded.inputs.len(), 1);
+    }
+
+    #[test]
+    fn pretty_ron_is_multiline_and_named() {
+        let text = ron_pretty(&sample_input());
+        assert!(text.contains("PlayerMovementPacket("), "{text}");
+        assert!(text.contains("\n  seq: 77"), "{text}");
+        assert!(text.lines().count() > 3, "{text}");
+    }
+
+    #[test]
+    fn snapshot_content_roundtrips_as_ron() {
+        let snapshot = sample_snapshot();
+        let text = ron_compact(&snapshot);
+        assert!(text.starts_with("ServerSnapshot("), "{text}");
+        let decoded: ServerSnapshot = ron::from_str(&text).expect("RON roundtrip");
+        assert_eq!(decoded.server_tick.0, 90);
+        assert_eq!(decoded.peers.len(), 1);
+        assert!(decoded.correction.is_some());
+    }
+
+    #[test]
+    fn control_content_roundtrips_as_ron() {
+        let ping = ron_compact(&Ping { id: 3 });
+        assert!(ping.starts_with("Ping("), "{ping}");
+        let decoded: Ping = ron::from_str(&ping).expect("ping RON");
+        assert_eq!(decoded.id, 3);
+
+        let pong = ron_compact(&Pong {
+            id: 3,
+            tick_diff: 7,
+            overstep: 1,
+        });
+        assert!(pong.starts_with("Pong("), "{pong}");
+        let decoded: Pong = ron::from_str(&pong).expect("pong RON");
+        assert_eq!((decoded.id, decoded.tick_diff, decoded.overstep), (3, 7, 1));
+    }
+
+    #[test]
+    fn one_line_output_embeds_the_ron_payload() {
+        fn put_varint(out: &mut Vec<u8>, value: u64) {
+            if value <= 63 {
+                out.push(value as u8);
+            } else if value <= 16_383 {
+                out.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
+            } else if value <= 1_073_741_823 {
+                out.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
+            } else {
+                out.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes());
+            }
+        }
+
+        let mut payload = vec![2u8]; // PlayerMovementPacket net id
+        payload.extend_from_slice(&postcard::to_allocvec(&sample_input()).unwrap());
+
+        let mut bytes = vec![0u8]; // Data packet
+        bytes.extend_from_slice(&9u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&5u32.to_be_bytes());
+        put_varint(&mut bytes, 1); // channel
+        bytes.push(1); // one message
+        bytes.push(0); // no message id
+        put_varint(&mut bytes, payload.len() as u64);
+        bytes.extend_from_slice(&payload);
+
+        let datagram = Datagram {
+            direction: Direction::ClientToServer,
+            from: "127.0.0.1:54321".parse().unwrap(),
+            to: "127.0.0.1:4000".parse().unwrap(),
+            bytes: &bytes,
+        };
+        let parsed = Packet::parse(datagram.bytes);
+        let reporter = Reporter::new(Options {
+            detail: false,
+            hex: false,
+            show_acks: true,
+            directions: DirectionFilter::Both,
+            color: false,
+            stats_every: None,
+            limit: 0,
+        });
+
+        let line = reporter.format_line(8, Duration::from_millis(1500), &datagram, &parsed);
+        assert!(line.contains(":54321"), "{line}");
+        assert!(line.contains("net_id=2"), "{line}");
+        assert!(line.contains("PlayerMovementPacket("), "{line}");
+        assert!(line.contains("seq: 77"), "{line}");
     }
 
     #[test]
