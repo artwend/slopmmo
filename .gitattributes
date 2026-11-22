@@ -1,1 +1,12 @@
+# Normalise every text file to LF, including files already committed with CRLF.
+# The docs had mixed line endings around the performance sections; `text=auto`
+# alone does not rewrite an existing blob on checkout.
 * text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+# PowerShell's parser is happier with CRLF, and the launcher is Windows-only.
+*.ps1 text eol=crlf

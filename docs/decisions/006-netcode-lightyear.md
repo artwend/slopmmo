@@ -47,7 +47,7 @@ Non-goals that were made explicit in the dialogue:
 `crates/client/src/net.rs`) is deleted.
 
 - `crates/net` declares the protocol: `InputChannel` (client → server,
-  `SequencedUnreliable`, `send_frequency = INPUT_SEND_HZ`, priority 2) and `SnapshotChannel`
+  `UnorderedUnreliable`, `send_frequency = INPUT_SEND_HZ`, priority 2) and `SnapshotChannel`
   (server → client, `SequencedUnreliable`, every tick, priority 1), plus the two messages
   (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel
   and message hashes agreed at handshake.
@@ -94,7 +94,9 @@ The first clause is green today (`cargo test --workspace` = 39 tests, plus the l
 
 - ~~Which Lightyear release pairs with Bevy 0.20?~~ Answered: Lightyear 0.31.0 on Bevy 0.20.1.
 - ~~Does Lightyear's unreliable channel support sequenced (drop-older) semantics?~~ Answered:
-  `ChannelMode::SequencedUnreliable` does, and it is what both channels use.
+  `ChannelMode::SequencedUnreliable` does, and snapshots use it. Input uses
+  `UnorderedUnreliable`: dropping a late datagram at the channel also drops its redundancy
+  frames, so ordering is left to the ingest path's per-packet dedupe.
 - Simplification worth considering: because the server cannot verify terrain, the predicted
   component may only need `position/velocity/applied_correction_seq`, with the KCC replayed from
   server-provided collision events — that is a smaller prediction surface than a stock setup.

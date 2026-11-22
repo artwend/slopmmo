@@ -36,7 +36,11 @@ pub struct MovementProtocol;
 impl Plugin for MovementProtocol {
     fn build(&self, app: &mut App) {
         app.add_channel::<InputChannel>(ChannelSettings {
-            mode: ChannelMode::SequencedUnreliable,
+            // Plain unordered unreliable, not sequenced: a late datagram still
+            // carries the redundancy frames that let the ingest path recover the
+            // missed ticks. Ordering is handled by the per-packet dedupe
+            // (packet.seq), not by dropping the whole datagram at the channel.
+            mode: ChannelMode::UnorderedUnreliable,
             // Inputs are pointless once superseded, so the sender only flushes
             // them at the rate the client produces them.
             send_frequency: Duration::from_nanos(1_000_000_000 / INPUT_SEND_HZ as u64),

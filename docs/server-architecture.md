@@ -267,10 +267,10 @@ create → auth → character select → place in zone instance → play → han
 | Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
 | Report window | 30 server ticks (0.5 s) | `proto::REPORT_WINDOW` |
 | Resume window | 120 s (7200 ticks) | `sim::authority::RESUME_WINDOW` |
-| Resume travel allowance | 5.4 m | `SimConfig::resume_travel()` |
+| Resume travel allowance | 5.4 m fixed cap; not yet scaled by time since detach | `SimConfig::resume_travel()` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.043 ms at 32 bots, 1.11 ms at 256 bots | `server --bots N --duration 5` |
+| Measured tick cost | 0.042 ms at 32 bots, 1.128 ms at 256 bots | `server --bots N --duration 5` |
 | Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
@@ -288,11 +288,14 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | Area | Status |
 | --- | --- |
 | Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
-| Client KCC + peer collision | Implemented |
+| Client KCC vs terrain | Implemented |
+| Client-side peer-collider solve | Absent — colliders are on the wire but not fed into the local solve |
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
 | Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |
 | Correction protocol with `(seq, tick, epoch)` | Implemented |
+| Correction integration (one tick per delta, in-flight discount) | Absent — the shadow applies a delta across the whole report window (`architecture-review.md` §7.7) |
+| Server-sanctioned displacement (respawn, teleport, knockback, mounts) | Absent — only a clamped resume can move a shadow |
 | Lightyear UDP transport with admission, timeout, orphan release | Implemented |
 | Reconnect/resume clamp: parked shadow, clamped claim, `resync` adoption | Implemented |
 | Per-player clock offset mapping | Implemented |

@@ -764,6 +764,44 @@ fn grid_aoi_matches_a_full_scan_across_cell_boundaries() {
     }
 }
 
+/// Known open defect, kept as a repro (architecture-review.md §7.7).
+///
+/// The shadow pose is derived from `anchor + vel × age`, and `vel` already
+/// includes every correction applied since the anchor. A new delta is therefore
+/// multiplied by the ticks elapsed since the report instead of being integrated
+/// once. The intended invariant is
+/// `pos(n) = anchor + Σ vel_after(k) · dt`.
+///
+/// Ignored until the fix lands; run explicitly with
+/// `cargo test -p sim --test simulation -- --ignored`.
+#[test]
+#[ignore = "correction stacking: see architecture-review.md §7.7"]
+fn corrections_are_integrated_once_per_tick() {
+    let world = StaticWorld::test_room();
+    let config = SimConfig::default();
+    let dt = config.dt();
+    let mut sim = Simulation::new(config);
+    sim.tick = Tick::new(100);
+
+    let start = Vec3::new(0.0, 0.9, 0.0);
+    let peer = Vec3::new(0.5, 0.9, 0.0);
+    sim.add_player(1, start);
+    sim.add_player(2, peer);
+    assert_eq!(sim.ingest(&packet(1, 100, 1, start, Vec3::ZERO)), Ok(()));
+    assert_eq!(sim.ingest(&packet(1, 100, 2, peer, Vec3::ZERO)), Ok(()));
+
+    let mut expected = start;
+    for _ in 0..10 {
+        sim.step(&world);
+        expected += sim.player(1).unwrap().vel * dt;
+    }
+    let actual = sim.player(1).unwrap().pos;
+    assert!(
+        (actual - expected).length() < 1e-4,
+        "shadow integrated to {actual:?}; one-tick integration predicts {expected:?}"
+    );
+}
+
 #[test]
 fn kcc_does_not_climb_a_ledge_taller_than_the_capsule_radius() {
     let mut world = StaticWorld::new();

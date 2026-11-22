@@ -73,8 +73,8 @@ Rules:
   collision modes are all 60 Hz. The client's local KCC and peer separation run at the same rate;
   server corrections arrive once per server tick.
 - **One rate to reason about.** Running both at 60 Hz costs twice the CPU per simulated second of a
-  30 Hz pipeline, but leaves no subsystem behind the tick. Measured cost is ~0.043 ms/tick at 32
-  bots and ~1.11 ms/tick at 256 bots (release, 300-tick runs), i.e. 390× and 15× realtime headroom;
+  30 Hz pipeline, but leaves no subsystem behind the tick. Measured cost is ~0.042 ms/tick at 32
+  bots and ~1.13 ms/tick at 256 bots (release, 300-tick runs), i.e. ~394× and ~15× realtime headroom;
   there is no measured reason to trade the rate away.
 - **Input cadence is half the tick.** `INPUT_SEND_HZ = 30` means one report every second server
   tick; the shadow is extrapolated between reports only as far as `REPORT_WINDOW`.
@@ -101,7 +101,8 @@ Rules:
 - The tick is **single-threaded by decision**, not by omission: determinism (above) comes first, and
   one core is not the constraint yet. It also **does not allocate** in the steady state, which
   `crates/sim/tests/allocations.rs` enforces with a counting allocator.
-- Measured: 32 bots at 0.043 ms per tick (390× headroom), 256 bots at 1.11 ms per tick (15×).
+- Measured: 32 bots at 0.042 ms per tick (~394× headroom), 256 bots at 1.13 ms per tick (~15×).
+  The 10k projection is ~40–47 ms/tick without zone sharding; see `architecture-review.md` §3.4.
 - Not implemented: adaptive snapshot rate, lag compensation.
 
 ## Open questions
