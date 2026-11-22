@@ -21,7 +21,7 @@ plus a per-system frequency budget:
 | Soft collision solve | 20–30 Hz | 60 Hz — every tick |
 | Hard collision solve | 60 Hz | 60 Hz — every tick |
 | Boss body update | 30–60 Hz | 60 Hz |
-| Snapshots | adaptive | tied to the tick (60 Hz) |
+| Snapshots | adaptive | on change, 4 Hz heartbeat (ADR 015) |
 
 The dialogue's table does not add up: a subsystem cannot run faster than the tick that drives it,
 and a 20–30 Hz soft solve under a 60 Hz KCC is visible as stepped pushes every 33–50 ms. The
@@ -78,8 +78,9 @@ Rules:
   there is no measured reason to trade the rate away.
 - **Input cadence is half the tick.** `INPUT_SEND_HZ = 30` means one report every second server
   tick; the shadow is extrapolated between reports only as far as `REPORT_WINDOW`.
-- Snapshot rate is currently tied to the tick (60 Hz); an adaptive snapshot rate needs a
-  client-side interpolation buffer to be worth anything.
+- Snapshot *production* is still tied to the tick — a snapshot is built for every player every tick —
+  but transmission is change-gated with a 4 Hz heartbeat (ADR 015). A further adaptive peer-update
+  rate needs a client-side interpolation buffer to be worth anything.
 - Because there is no rewind, a high-ping player's shots land against current positions. That is a
   balance decision the combat design must own, not a movement bug.
 
@@ -103,7 +104,7 @@ Rules:
   `crates/sim/tests/allocations.rs` enforces with a counting allocator.
 - Measured: 32 bots at 0.042 ms per tick (~394× headroom), 256 bots at 1.13 ms per tick (~15×).
   The 10k projection is ~40–47 ms/tick without zone sharding; see `architecture-review.md` §3.4.
-- Not implemented: adaptive snapshot rate, lag compensation.
+- Not implemented: adaptive peer-update rate, lag compensation.
 
 ## Open questions
 

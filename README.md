@@ -19,13 +19,15 @@ running code instead of arguing about them.
 | --- | --- |
 | `crates/proto` | Wire format, constants, packet types. No Bevy, no logic; serde types that Lightyear serialises with postcard |
 | `crates/net` | The Lightyear protocol: two channels and the two messages, added identically by both binaries |
-| `crates/sim` | Pure simulation: capsule KCC, spatial hash, pair solver, server authority model |
+| `crates/sim` | Pure simulation: capsule KCC reference solver, spatial hash, pair solver, server authority model |
+| `crates/kcc-avian` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`), used by the client |
 | `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, Lightyear endpoint |
 | `crates/client` | Bevy window (WASD + Q/E + Space) and a headless scripted CI mode |
 | `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes Lightyear framing, both movement messages and ping/pong (packet rows, detail, rates) |
 
 `proto` and `sim` are deliberately engine-free apart from `bevy_math` vectors, so the same code
-runs unchanged on the client (prediction) and on the server (shadow).
+runs unchanged on the client (prediction) and on the server (shadow). The one crate that does pull
+in a physics engine is `kcc-avian`, and only the client depends on it.
 
 ## Docs
 
@@ -50,7 +52,7 @@ The split is asymmetric, and that asymmetry is the whole architecture:
 Client                                        Server
 ------                                        ------
 owns terrain                                  owns no terrain at all
-KCC vs terrain, 60 Hz                         shadow kinematics from reports, 60 Hz
+Avian virtual character, 60 Hz                shadow kinematics from reports, 60 Hz
 receives peer colliders, does not solve them  spatial hash -> pairs (K = 8), every tick
 predicts locally, never waits                 soft or hard impulse per pair
 applies corrections (velocity / normal)       sends snapshot + correction
@@ -93,7 +95,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 77 tests: proto, net, sim, server, client, packetdump
+cargo test --workspace          # 84 tests: proto, net, sim, kcc-avian, server, client, packetdump
                                  # plus one ignored repro for the correction-stacking defect (§7.7)
 cargo fmt --check
 cargo clippy --workspace --all-targets
@@ -110,7 +112,7 @@ two runs are bit-identical, and exits non-zero if any invariant breaks:
 
 ```
 script_ticks    1201
-peak_y          1.8633     # jump apex: 1.02 m above the 0.9 m resting height
+peak_y          1.8733     # jump apex: ~0.97 m above the 0.9 m resting height
 deterministic   true
 result          ok
 ```
@@ -168,9 +170,9 @@ round trips can complete. It reports `net_sent`, `net_snaps`, `net_corrections` 
 and fails if no snapshot arrives:
 
 ```
-net_sent        600
-net_snaps       1173
-net_corrections 0        # same KCC on both sides, so the wall slide needs no correction
+net_sent        601
+net_snaps       1205
+net_corrections 0        # the shadow never solves terrain, so a wall slide needs no correction
 net_resyncs     0        # a continuous session is never placed by the server
 result          ok
 ```

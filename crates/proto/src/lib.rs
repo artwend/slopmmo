@@ -40,6 +40,21 @@ pub const INPUT_REDUNDANCY: usize = 3;
 /// Maximum number of input frames in a single packet.
 pub const MAX_INPUT_FRAMES: usize = INPUT_REDUNDANCY + 1;
 
+/// Rate at which a completely idle client still reports.
+///
+/// A client with no input, no motion and no fresh correction sends nothing:
+/// state reports are superseded by definition, and the server dead-reckons a
+/// stationary shadow without them. This keepalive exists for three reasons: it
+/// refreshes the displacement baseline that report validation is measured from
+/// (an unbounded idle gap would otherwise inflate how far a report may claim to
+/// have travelled), it stays well inside the server's peer timeout, and it keeps
+/// NAT mappings warm.
+pub const IDLE_SEND_HZ: u32 = 4;
+/// Client ticks between idle keepalive reports.
+pub const IDLE_SEND_TICKS: u32 = CLIENT_TICK_HZ / IDLE_SEND_HZ;
+/// Speed at or below which an input-free client counts as idle.
+pub const IDLE_SPEED_EPSILON: f32 = 0.05;
+
 /// Starting neighbour bore. Both a radius and a count limit are required;
 /// a bare "nearest 8" would create contacts across an empty field.
 pub const MAX_NEIGHBOURS: usize = 8;

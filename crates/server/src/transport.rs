@@ -23,6 +23,14 @@ use sim::authority::Reject;
 /// UDP has no disconnect, so silence is the only signal that a client is gone.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A snapshot that carries nothing new is still re-sent this often.
+///
+/// The snapshot channel is unreliable and sequenced: the datagram carrying the
+/// last change can be lost, so the heartbeat bounds how long a client can stay
+/// stale. It also refreshes `acked_seq` and `shadow_position`, which are
+/// informational and deliberately do not force a send on their own.
+pub const SNAPSHOT_HEARTBEAT: Duration = Duration::from_millis(250);
+
 /// Bookkeeping for the links lightyear opens on our behalf, keyed by link entity.
 #[derive(Resource, Default)]
 pub struct Peers {
@@ -31,12 +39,18 @@ pub struct Peers {
     last_seen: HashMap<Entity, Instant>,
     /// Reused every frame by `evict_silent`.
     expired: Vec<Entity>,
+    /// Last snapshot put on the wire for a player, and when. The next tick's
+    /// snapshot is compared against it so an unchanged one is not sent.
+    last_sent: HashMap<u64, (proto::ServerSnapshot, Instant)>,
     pub admitted: u64,
     pub dropped: u64,
     pub resumed: u64,
     pub resume_clamped: u64,
     pub packets_in: u64,
     pub snapshots_out: u64,
+    /// Ticks whose snapshot was identical to the last one sent, so no datagram
+    /// was produced.
+    pub snapshots_skipped: u64,
 }
 
 impl Peers {
@@ -50,6 +64,9 @@ impl Peers {
         // charge of the body; the old link must not take the body with it.
         if self.entity_of.get(&player) == Some(&entity) {
             self.entity_of.remove(&player);
+            // A resume is a new stream: its first snapshot must not be compared
+            // against what the old link happened to have been sent.
+            self.last_sent.remove(&player);
             // The pose is kept, not deleted: admission cannot validate a
             // reconnect against anything if the shadow is gone, which made
             // "drop the link, reconnect anywhere" a free teleport.
@@ -205,7 +222,13 @@ fn evict_orphans(
     }
 }
 
-/// Sends the most recent completed tick's snapshots, exactly once.
+/// Sends the most recent completed tick's snapshots, at most once each.
+///
+/// A snapshot is put on the wire only when it carries something the client can
+/// act on — a correction, a resync, or a changed peer set — or when the
+/// heartbeat is due. The server still builds a snapshot for every player every
+/// tick ([`sim::authority::Simulation::step`]); this filter is about the network
+/// bill, not about skipping work that other readers may want.
 fn dispatch(
     mut game: ResMut<GameRes>,
     mut peers: ResMut<Peers>,
@@ -214,6 +237,7 @@ fn dispatch(
     if !game.0.snapshots_pending {
         return;
     }
+    let now = Instant::now();
     for &(id, snapshot) in game.0.sim.snapshots() {
         let Some(entity) = peers.entity_of.get(&id).copied() else {
             continue;
@@ -224,12 +248,58 @@ fn dispatch(
         let Some(mut sender) = sender else {
             continue;
         };
+        let resend = peers.last_sent.get(&id).is_none_or(|(prev, at)| {
+            // `resync` stays set until a report is accepted, so it must keep
+            // repeating: the one datagram that would place a resumed client can
+            // be the one that is lost.
+            snapshot.resync
+                || snapshot_changed(prev, &snapshot)
+                || now.duration_since(*at) >= SNAPSHOT_HEARTBEAT
+        });
+        if !resend {
+            peers.snapshots_skipped += 1;
+            continue;
+        }
         // `ServerSnapshot` is `Copy` and its peer list is inline, so this is a
         // flat copy instead of a per-player heap clone.
         sender.send::<net::SnapshotChannel>(snapshot);
         peers.snapshots_out += 1;
+        peers.last_sent.insert(id, (snapshot, now));
     }
     game.0.snapshots_pending = false;
+}
+
+/// Whether `next` tells the client something `prev` did not.
+///
+/// `server_tick`, `acked_seq` and `shadow_position` are deliberately excluded:
+/// the client predicts its own pose and only adopts the shadow while `resync`
+/// is set, so those fields changing on their own do not justify a datagram (the
+/// heartbeat refreshes them). Peer state is compared at millimetre precision,
+/// the resolution the wire already cares about, so solver noise cannot defeat
+/// suppression.
+fn snapshot_changed(prev: &proto::ServerSnapshot, next: &proto::ServerSnapshot) -> bool {
+    if prev.resync != next.resync {
+        return true;
+    }
+    match (&prev.correction, &next.correction) {
+        (None, None) => {}
+        (Some(a), Some(b)) if a.seq == b.seq && a.epoch == b.epoch => {}
+        _ => return true,
+    }
+    prev.peers.len() != next.peers.len()
+        || prev.peers.iter().zip(next.peers.iter()).any(|(a, b)| {
+            a.player != b.player
+                || a.mode != b.mode
+                || a.body_yaw.to_bits() != b.body_yaw.to_bits()
+                || a.position
+                    .iter()
+                    .zip(b.position.iter())
+                    .any(|(x, y)| millimetres(*x) != millimetres(*y))
+        })
+}
+
+fn millimetres(v: f32) -> i32 {
+    (v * proto::QUANT_MM).round() as i32
 }
 
 #[cfg(test)]
@@ -339,6 +409,92 @@ mod tests {
                 .resume_player(&reconnect_packet(1, Vec3::ZERO))
                 .is_some(),
             "the departing link's shadow was not parked"
+        );
+    }
+
+    fn snapshot_with(peers: &[(u64, [f32; 3])]) -> proto::ServerSnapshot {
+        proto::ServerSnapshot {
+            server_tick: proto::Tick::new(9),
+            acked_seq: 3,
+            shadow_position: [1.0, 0.0, 2.0],
+            correction: None,
+            resync: false,
+            peers: peers
+                .iter()
+                .map(|&(player, position)| proto::PeerCollider {
+                    player,
+                    position,
+                    body_yaw: 0.0,
+                    mode: proto::peer_mode::SOFT,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn informational_fields_alone_do_not_justify_a_datagram() {
+        let prev = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+        let next = proto::ServerSnapshot {
+            server_tick: proto::Tick::new(10),
+            acked_seq: 4,
+            shadow_position: [5.0, 0.9, -5.0],
+            ..prev
+        };
+        assert!(!snapshot_changed(&prev, &next));
+    }
+
+    #[test]
+    fn actionable_changes_justify_a_datagram() {
+        let prev = snapshot_with(&[(2, [0.0, 0.9, 1.0])]);
+
+        let moved = snapshot_with(&[(2, [0.0, 0.9, 1.001])]);
+        assert!(snapshot_changed(&prev, &moved));
+
+        // Solver noise below the millimetre the wire cares about is not a change.
+        let noise = snapshot_with(&[(2, [0.0, 0.9, 1.0004])]);
+        assert!(!snapshot_changed(&prev, &noise));
+
+        let joined = snapshot_with(&[(2, [0.0, 0.9, 1.0]), (3, [0.0, 0.9, 2.0])]);
+        assert!(snapshot_changed(&prev, &joined));
+
+        let corrected = proto::ServerSnapshot {
+            correction: Some(proto::CollisionCorrection {
+                seq: 1,
+                tick: proto::Tick::new(9),
+                epoch: 0,
+                velocity_delta: [0.5, 0.0, 0.0],
+                hard_normal: None,
+            }),
+            ..prev
+        };
+        assert!(snapshot_changed(&prev, &corrected));
+        assert!(!snapshot_changed(&corrected, &corrected));
+
+        let resync = proto::ServerSnapshot {
+            resync: true,
+            ..prev
+        };
+        assert!(snapshot_changed(&prev, &resync));
+    }
+
+    #[test]
+    fn releasing_a_link_forgets_its_last_snapshot() {
+        let mut game = Game::new();
+        game.sim.add_player(1, Vec3::ZERO);
+        let mut world = World::new();
+        let link = world.spawn_empty().id();
+
+        let mut peers = Peers::default();
+        peers.player_of.insert(link, 1);
+        peers.entity_of.insert(1, link);
+        peers
+            .last_sent
+            .insert(1, (snapshot_with(&[]), Instant::now()));
+
+        peers.release(link, &mut game);
+        assert!(
+            peers.last_sent.is_empty(),
+            "a resume compared against the old stream"
         );
     }
 }

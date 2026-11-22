@@ -22,13 +22,14 @@ Status legend:
 | [005](005-transport-split.md) | QUIC + TLS 1.3 for backend traffic, Lightyear UDP for the game channel | Open |
 | [006](006-netcode-lightyear.md) | Netcode library: Lightyear plus its built-in transport | Partial |
 | [007](007-movement-packet.md) | One merged `PlayerMovementPacket`, unreliable, 30 Hz send / 60 Hz sim | Implemented |
-| [008](008-hybrid-physics-model.md) | Hybrid physics: kinematic character on Avian `MoveAndSlide` | Partial |
+| [008](008-hybrid-physics-model.md) | Hybrid physics: kinematic character on Avian `MoveAndSlide` | Implemented |
 | [009](009-collision-ownership.md) | Client owns terrain collision, server owns player and boss collision | Implemented |
 | [010](010-collision-modes.md) | Collision modes `None` / `Soft` / `Hard`, soft by default in PvP | Implemented |
 | [011](011-neighbour-budget.md) | Spatial hash, nearest candidates, at most K = 8 pairs per player | Implemented |
 | [012](012-performance-before-anticheat.md) | Performance first, anti-cheat cheap and best-effort | Implemented |
 | [013](013-server-tick-pipeline.md) | Fixed 60 Hz tick pipeline, solve every tick, no rewind, bounded extrapolation | Implemented |
 | [014](014-character-feel.md) | Camera-relative rotation, moderate air control, soft character collision | Implemented |
+| [015](015-traffic-suppression.md) | Superseded state stays off the wire: idle reports and change-gated snapshots | Implemented |
 
 Supporting documents:
 

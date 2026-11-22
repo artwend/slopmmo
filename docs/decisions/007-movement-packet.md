@@ -59,8 +59,9 @@ giving anyone a time machine.
 
 ## Consequences
 
-- At 4 input frames per packet the client sends ~81 bytes at 30 Hz ≈ 2.4 KB/s: 45 bytes of
-  header + report, plus 9 bytes per input frame. The report, not the inputs, dominates.
+- At 4 input frames per packet the client sends ~81 bytes at 30 Hz ≈ 2.4 KB/s while active: 45 bytes
+  of header + report, plus 9 bytes per input frame. The report, not the inputs, dominates. While
+  idle it drops to a 4 Hz keepalive of ~50 bytes ≈ 0.2 KB/s (ADR 015).
 - The server must tolerate gaps in the input stream and never extrapolate more than
   `REPORT_WINDOW = 30` server ticks (0.5 s).
 - Duplicate packet suppression is a transport concern (`seq`), duplicate correction application is
@@ -73,7 +74,8 @@ Implemented in `crates/proto/src/packet.rs`:
 - `PlayerMovementPacket` with `seq`, `player`, `report`, `inputs`, encoded in ~81 bytes at full
   redundancy.
 - `INPUT_SEND_HZ = 30`, `CLIENT_TICK_HZ = 60`; the client sends a report every 2nd prediction tick,
-  which is every second 60 Hz server tick.
+  which is every second 60 Hz server tick. Reports that would repeat the previous one are suppressed
+  and replaced by a 4 Hz keepalive (ADR 015); the packet layout is unchanged.
 - `INPUT_REDUNDANCY = 3` → **4** frames per packet (newest + 3), not 2 as in the dialogue. Chosen
   so that three consecutive losses still leave one fresh frame; still well inside the 60-byte
   budget. Recorded here because it changes the loss tolerance from 1 to 3 packets.

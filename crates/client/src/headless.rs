@@ -6,12 +6,14 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::prelude::*;
+use kcc_avian::prelude::{MoveAndSlidePlugin, PhysicsPlugins};
 
-use crate::transport::{ClientNetPlugin, NetSet, NetStats};
-use crate::{Args, Local, WorldRes};
+use crate::character;
+use crate::transport::{ClientNetPlugin, NetStats};
+use crate::{Args, Local};
 
 const FORWARD: i8 = -127;
 const RIGHT: i8 = 127;
@@ -87,19 +89,16 @@ struct Script {
     peak_y: f32,
     max_abs_x: f32,
     max_abs_z: f32,
-    /// Wall-clock origin for a live run; `None` means run as fast as possible.
-    started: Option<Instant>,
     finished: bool,
 }
 
 impl Script {
-    fn new(budget: u32, live: bool) -> Self {
+    fn new(budget: u32) -> Self {
         let phases = phases();
         Self {
             left: phases[0].ticks,
             peak_y: 0.9,
             budget,
-            started: live.then(Instant::now),
             phases,
             index: 0,
             ticks: 0,
@@ -110,8 +109,8 @@ impl Script {
     }
 }
 
-/// One script tick per App update, so the wire systems keep their normal place.
-fn script_tick(world: Res<WorldRes>, mut local: ResMut<Local>, mut script: ResMut<Script>) {
+/// One script tick per fixed step, so the wire systems keep their normal place.
+fn script_tick(mut local: ResMut<Local>, mut script: ResMut<Script>) {
     if script.finished {
         return;
     }
@@ -121,19 +120,13 @@ fn script_tick(world: Res<WorldRes>, mut local: ResMut<Local>, mut script: ResMu
     }
 
     let phase = script.phases[script.index];
-    local.step(
-        &world.0,
-        proto::InputFrame {
-            move_x: phase.move_x,
-            move_z: phase.move_z,
-            buttons: phase.buttons,
-            ..default()
-        },
-    );
+    local.step(proto::InputFrame {
+        move_x: phase.move_x,
+        move_z: phase.move_z,
+        buttons: phase.buttons,
+        ..default()
+    });
     script.ticks += 1;
-    script.peak_y = script.peak_y.max(local.player.pos.y);
-    script.max_abs_x = script.max_abs_x.max(local.player.pos.x.abs());
-    script.max_abs_z = script.max_abs_z.max(local.player.pos.z.abs());
 
     script.left -= 1;
     if script.left == 0 {
@@ -142,16 +135,16 @@ fn script_tick(world: Res<WorldRes>, mut local: ResMut<Local>, mut script: ResMu
             script.left = next.ticks;
         }
     }
+}
 
-    // A live run has to follow the wall clock, otherwise the script is over
-    // before a single round-trip can complete.
-    if let Some(start) = script.started {
-        let want = f64::from(script.ticks) * f64::from(proto::CLIENT_TICK_DT);
-        let elapsed = start.elapsed().as_secs_f64();
-        if want > elapsed {
-            std::thread::sleep(Duration::from_secs_f64(want - elapsed));
-        }
+/// Records the extremes the invariants need, after the step's pose is final.
+fn track_extremes(local: Res<Local>, mut script: ResMut<Script>) {
+    if script.ticks == 0 {
+        return;
     }
+    script.peak_y = script.peak_y.max(local.player.pos.y);
+    script.max_abs_x = script.max_abs_x.max(local.player.pos.x.abs());
+    script.max_abs_z = script.max_abs_z.max(local.player.pos.z.abs());
 }
 
 struct Report {
@@ -171,16 +164,22 @@ struct Report {
 fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
     let budget = ((seconds * proto::CLIENT_TICK_HZ as f32) as u32).max(1);
 
+    let terrain = sim::StaticWorld::test_room();
     let mut app = App::new();
-    app.add_plugins(MinimalPlugins)
-        .insert_resource(WorldRes(sim::StaticWorld::test_room()))
-        .init_resource::<Local>()
-        .init_resource::<NetStats>()
-        .insert_resource(Script::new(budget, connect.is_some()))
-        .add_systems(
-            Update,
-            script_tick.after(NetSet::Receive).before(NetSet::Send),
-        );
+    app.add_plugins((
+        MinimalPlugins,
+        PhysicsPlugins::new(FixedPostUpdate),
+        MoveAndSlidePlugin::default(),
+    ))
+    .insert_resource(Time::<Fixed>::from_hz(proto::CLIENT_TICK_HZ as f64))
+    .init_resource::<Local>()
+    .init_resource::<NetStats>()
+    .insert_resource(Script::new(budget))
+    .add_systems(FixedUpdate, (script_tick, character::apply_local).chain())
+    .add_systems(FixedLast, (character::read_back, track_extremes).chain());
+
+    character::spawn_terrain(app.world_mut(), &terrain);
+    character::spawn_player(app.world_mut());
 
     if let Some(addr) = connect {
         // A live run has to be debuggable; the offline run stays quiet so its
@@ -198,8 +197,26 @@ fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Repo
     app.finish();
     app.cleanup();
 
+    let live = connect.is_some();
+    if !live {
+        // Offline is driven one fixed step per update: the wall clock must not
+        // decide how many steps a run takes, or two runs cannot be compared.
+        app.world_mut().resource_mut::<Time<Virtual>>().pause();
+    }
+
     while !app.world().resource::<Script>().finished {
-        app.update();
+        if live {
+            // The fixed clock follows real time, so the script advances at 60 Hz
+            // and a round trip has time to complete.
+            app.update();
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            let step = app.world().resource::<Time<Fixed>>().timestep();
+            app.world_mut()
+                .resource_mut::<Time<Fixed>>()
+                .accumulate_overstep(step);
+            app.update();
+        }
     }
 
     let local = app.world().resource::<Local>();

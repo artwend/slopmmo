@@ -160,14 +160,22 @@ once.
 
 | Channel | Reliability | Rate | Content |
 | --- | --- | --- | --- |
-| client → server movement | unreliable, sequenced | 30 Hz, newest + 3 inputs | `PlayerMovementPacket` |
-| server → client snapshot | unreliable, sequenced | tick rate, 60 Hz (adaptive not built) | tick, ack, shadow pos, correction, peers, `resync` |
+| client → server movement | unreliable, sequenced | 30 Hz while active; 4 Hz idle keepalive | `PlayerMovementPacket` |
+| server → client snapshot | unreliable, sequenced | on change; 4 Hz heartbeat | tick, ack, shadow pos, correction, peers, `resync` |
 | corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
 | discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
 
-Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s; server ≈ 28 B + 23 B per peer per
-snapshot → 1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope
-and are the reason AOI exists.
+Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while moving, dropping to ≈ 200 B/s
+when idle (4 Hz keepalive with no redundancy frames); server ≈ 28 B + 23 B per peer per snapshot →
+1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope and are the
+reason AOI exists.
+
+Neither side streams on a fixed cadence any more (ADR 015). The client stays silent while its input,
+pose, grounding and correction acknowledgement are unchanged. The server compares each tick's
+snapshot with the last one it sent for that player — at millimetre precision — and only transmits a
+change in a correction, `resync` or the peer set. `server_tick`, `acked_seq` and `shadow_position`
+do not force a datagram because the client predicts its own pose and only adopts the shadow during
+`resync`. A lost final update is repaired by the heartbeat, so a quiet tick costs nothing.
 
 ### 3.5 Data layout and allocation discipline
 
@@ -259,7 +267,8 @@ create → auth → character select → place in zone instance → play → han
 | Server tick | 60 Hz (16.67 ms) | `proto::SERVER_TICK_HZ` |
 | Client prediction | 60 Hz (16.7 ms) | `proto::CLIENT_TICK_HZ` |
 | Client send rate | 30 Hz | `proto::INPUT_SEND_HZ` |
-| Input redundancy | newest + 3 frames | `proto::INPUT_REDUNDANCY` |
+| Idle client send rate | 4 Hz keepalive, no redundancy frames | `proto::IDLE_SEND_HZ` |
+| Snapshot heartbeat | 4 Hz when nothing changed | `server::transport::SNAPSHOT_HEARTBEAT` |
 | Client packet | ~81 B | `proto::PlayerMovementPacket` |
 | Snapshot | 28 B + 23 B per peer | `proto::ServerSnapshot` |
 | Peer cap in snapshot | 16 | `proto::MAX_SNAPSHOT_PEERS` |
@@ -288,7 +297,7 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | Area | Status |
 | --- | --- |
 | Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
-| Client KCC vs terrain | Implemented |
+| Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc-avian`) |
 | Client-side peer-collider solve | Absent — colliders are on the wire but not fed into the local solve |
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
