@@ -26,7 +26,7 @@ pub struct SimConfig {
     pub neighbour_limit: usize,
     pub pairs_per_body: usize,
     pub correction_budget: f32,
-    /// Multiplier on `MAX_SPEED` for the velocity sanity check.
+    /// Multiplier on `MAX_SPEED` and `MAX_ANGULAR_SPEED` for the sanity checks.
     pub speed_slack: f32,
     pub report_window: u32,
     /// Ticks a departed player's shadow stays available for a resume.
@@ -142,6 +142,7 @@ pub struct Resume {
 struct ParkedShadow {
     pos: Vec3,
     vel: Vec3,
+    angular_velocity: Vec3,
     body_yaw: f32,
     grounded: bool,
     at: proto::Tick,
@@ -159,7 +160,14 @@ pub struct ServerPlayer {
     /// would shrink the travel the client is accused of.
     pub anchor_pos: Vec3,
     pub vel: Vec3,
+    /// Angular velocity from the last accepted report; only the Y (yaw)
+    /// component is integrated. The character is kinematic and never falls over.
+    pub angular_velocity: Vec3,
     pub body_yaw: f32,
+    /// `body_yaw` of the last accepted report. Rotation is extrapolated from
+    /// here for the same reason `anchor_pos` exists: re-integrating from an
+    /// already-advanced pose would compound it.
+    pub anchor_yaw: f32,
     pub grounded: bool,
     pub last_seq: u16,
     pub last_tick: proto::Tick,
@@ -188,7 +196,9 @@ impl ServerPlayer {
             pos,
             anchor_pos: pos,
             vel: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
             body_yaw: 0.0,
+            anchor_yaw: 0.0,
             grounded: false,
             last_seq: 0,
             last_tick: proto::Tick::ZERO,
@@ -352,6 +362,7 @@ impl Simulation {
             ParkedShadow {
                 pos: removed.pos,
                 vel: removed.vel,
+                angular_velocity: removed.angular_velocity,
                 body_yaw: removed.body_yaw,
                 grounded: removed.grounded,
                 at: self.tick,
@@ -398,7 +409,9 @@ impl Simulation {
         // The shadow's own state is restored; the claim's velocity is not part
         // of the placement and is not re-validated here.
         player.vel = shadow.vel;
+        player.angular_velocity = shadow.angular_velocity;
         player.body_yaw = shadow.body_yaw;
+        player.anchor_yaw = shadow.body_yaw;
         player.grounded = shadow.grounded;
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
@@ -494,9 +507,19 @@ impl Simulation {
             return Err(Reject::StaleTick);
         }
 
-        let vel = Vec3::from_array(report.velocity);
+        let vel = Vec3::from_array(report.linear_velocity);
         let max_v = proto::MAX_SPEED * config.speed_slack * 1.6;
         if !vel.is_finite() || vel.length() > max_v {
+            stats.too_fast += 1;
+            return Err(Reject::TooFast);
+        }
+
+        // The same bound on rotation: a yaw rate beyond what a camera can
+        // produce is as implausible as an over-speed linear velocity, and it
+        // would otherwise buy unbounded dead-reckoned rotation.
+        let angular = Vec3::from_array(report.angular_velocity);
+        let max_w = proto::MAX_ANGULAR_SPEED * config.speed_slack * 1.6;
+        if !angular.is_finite() || angular.length() > max_w {
             stats.too_fast += 1;
             return Err(Reject::TooFast);
         }
@@ -531,7 +554,9 @@ impl Simulation {
         player.anchor_pos = pos;
         player.pos = pos;
         player.vel = vel;
+        player.angular_velocity = angular;
         player.body_yaw = report.body_yaw;
+        player.anchor_yaw = report.body_yaw;
         player.grounded = report.grounded;
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
@@ -597,6 +622,9 @@ impl Simulation {
                 .since(*tick)
                 .clamp(0, config.report_window as i32);
             p.pos = p.anchor_pos + p.vel * (age as f32 * dt);
+            // Rotation is dead-reckoned the same way and from its own anchor,
+            // so a turning player is not frozen between reports.
+            p.body_yaw = p.anchor_yaw + p.angular_velocity.y * (age as f32 * dt);
         }
         bodies.extend(players.iter().map(|p| p.body(Mode::Soft)));
         bodies.extend(blockers.iter().copied());

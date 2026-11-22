@@ -31,7 +31,8 @@ The owner's follow-on requirements (accepted in the same exchange) fix the trans
 ```
 PlayerMovementPacket {
     seq, player,
-    report { tick, position, velocity, body_yaw, grounded, applied_correction_seq },
+    report { tick, position, linear_velocity, angular_velocity, body_yaw, grounded,
+             applied_correction_seq },
     inputs: [ { tick, move_x, move_z, buttons, camera_yaw } ],   // newest first
 }
 ```
@@ -59,9 +60,9 @@ giving anyone a time machine.
 
 ## Consequences
 
-- At 4 input frames per packet the client sends ~81 bytes at 30 Hz ≈ 2.4 KB/s while active: 45 bytes
+- At 4 input frames per packet the client sends ~93 bytes at 30 Hz ≈ 2.8 KB/s while active: 57 bytes
   of header + report, plus 9 bytes per input frame. The report, not the inputs, dominates. While
-  idle it drops to a 4 Hz keepalive of ~50 bytes ≈ 0.2 KB/s (ADR 015).
+  idle it drops to a 4 Hz keepalive of ~62 bytes ≈ 0.3 KB/s (ADR 015).
 - The server must tolerate gaps in the input stream and never extrapolate more than
   `REPORT_WINDOW = 30` server ticks (0.5 s).
 - Duplicate packet suppression is a transport concern (`seq`), duplicate correction application is
@@ -71,8 +72,9 @@ giving anyone a time machine.
 
 Implemented in `crates/proto/src/packet.rs`:
 
-- `PlayerMovementPacket` with `seq`, `player`, `report`, `inputs`, encoded in ~81 bytes at full
-  redundancy.
+- `PlayerMovementPacket` with `seq`, `player`, `report`, `inputs`, encoded in ~93 bytes at full
+  redundancy. The report's velocity is split into `linear_velocity` and `angular_velocity` so the
+  shadow can dead-reckon rotation without inventing a yaw rate; `body_yaw` remains the pose.
 - `INPUT_SEND_HZ = 30`, `CLIENT_TICK_HZ = 60`; the client sends a report every 2nd prediction tick,
   which is every second 60 Hz server tick. Reports that would repeat the previous one are suppressed
   and replaced by a 4 Hz keepalive (ADR 015); the packet layout is unchanged.

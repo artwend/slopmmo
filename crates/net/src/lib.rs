@@ -83,7 +83,8 @@ mod tests {
             report: MovementReport {
                 tick: Tick(u32::MAX),
                 position: [120.0, -40.0, 120.0],
-                velocity: [-120.0, -120.0, 120.0],
+                linear_velocity: [-120.0, -120.0, 120.0],
+                angular_velocity: [-120.0, -120.0, 120.0],
                 body_yaw: core::f32::consts::PI,
                 grounded: false,
                 applied_correction_seq: u16::MAX,

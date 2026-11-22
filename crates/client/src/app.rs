@@ -7,6 +7,10 @@ use crate::character::{self, Character};
 use crate::transport::{ClientNetPlugin, NetSet};
 use crate::{Args, Local, WorldRes};
 
+/// Camera turn speed, rad/s. Reported as angular velocity so the shadow can
+/// extrapolate the body yaw between reports.
+const TURN_RATE: f32 = 2.5;
+
 #[derive(Resource, Default)]
 struct PlayerRes {
     input: proto::InputFrame,
@@ -147,7 +151,8 @@ fn sample_input(
     }
 
     let turn = (keys.pressed(KeyCode::KeyE) as i32 - keys.pressed(KeyCode::KeyQ) as i32) as f32;
-    local.player.yaw -= turn * 2.5 * time.delta_secs();
+    local.player.angular_velocity = Vec3::new(0.0, -turn * TURN_RATE, 0.0);
+    local.player.yaw += local.player.angular_velocity.y * time.delta_secs();
 
     res.input = proto::InputFrame {
         move_x: (x * 127.0).clamp(-127.0, 127.0) as i8,

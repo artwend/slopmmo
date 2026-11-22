@@ -93,6 +93,12 @@ pub const REPORT_WINDOW: u32 = SERVER_TICK_HZ * REPORT_WINDOW_MS / 1000;
 pub const MAX_SPEED: f32 = 6.0;
 pub const MAX_ACCEL: f32 = 24.0;
 
+/// Fastest yaw rate the shadow accepts, rad/s.
+///
+/// The windowed client turns at 2.5 rad/s; the headroom covers a mouse-driven
+/// camera while keeping the bound meaningful as a sanity check.
+pub const MAX_ANGULAR_SPEED: f32 = 6.0;
+
 /// Fixed-point scale for positions and velocities: millimetres, millimetres/s.
 pub const QUANT_MM: f32 = 1000.0;
 /// Fixed-point scale for unit normals.

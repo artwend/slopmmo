@@ -95,7 +95,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 110 tests: proto, net, sim, kcc-avian, server, client, packetdump
+cargo test --workspace          # 112 tests: proto, net, sim, kcc-avian, server, client, packetdump
                                  # plus one ignored repro for the correction-stacking defect (§7.7)
 cargo fmt --check
 cargo clippy --workspace --all-targets
@@ -266,7 +266,7 @@ compact RON:
 ```
 #000007  1.233s  C->S :52144   20 B  pkt=6     t=13        PING     net_id=0  Ping(id: 1)
 #000012  1.376s  S->C :52144   38 B  pkt=2     t=130       SNAPSHOT net_id=3  ServerSnapshot(server_tick: Tick(126), acked_seq: 14, shadow_position: (0.0, 0.9, -1.237), correction: None, peers: [], resync: false)
-#000013  1.409s  C->S :52144   86 B  pkt=9     t=18        INPUT    net_id=2  PlayerMovementPacket(seq: 77, player: 1, report: MovementReport(tick: Tick(90), position: (0.0, 0.9, -1.5), velocity: (0.0, 0.0, -5.5), body_yaw: 0.0, grounded: true, applied_correction_seq: 3), inputs: [InputFrame(tick: Tick(90), move_x: 0, move_z: -127, buttons: 0, camera_yaw: 0)])
+#000013  1.409s  C->S :52144   98 B  pkt=9     t=18        INPUT    net_id=2  PlayerMovementPacket(seq: 77, player: 1, report: MovementReport(tick: Tick(90), position: (0.0, 0.9, -1.5), linear_velocity: (0.0, 0.0, -5.5), angular_velocity: (0.0, 0.0, 0.0), body_yaw: 0.0, grounded: true, applied_correction_seq: 3), inputs: [InputFrame(tick: Tick(90), move_x: 0, move_z: -127, buttons: 0, camera_yaw: 0)])
 ```
 
 The `:<port>` column is the client's UDP endpoint, which keeps packets from different clients

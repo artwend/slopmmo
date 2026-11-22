@@ -19,4 +19,4 @@
 #   filter = ["input", "snapshot"]        # only movement traffic
 #   filter = ["!ping", "!pong", "!ack"]   # hide control traffic
 #   filter = ["!3"]                       # hide snapshot (net id 3)
-filter = []
+filter = ["!ping", "!pong"]

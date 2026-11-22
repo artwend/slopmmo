@@ -30,7 +30,12 @@ pub mod peer_mode {
 pub struct MovementReport {
     pub tick: Tick,
     pub position: [f32; 3],
-    pub velocity: [f32; 3],
+    /// World-space linear velocity, m/s.
+    pub linear_velocity: [f32; 3],
+    /// World-space angular velocity, rad/s. Only the Y (yaw) component is
+    /// simulated; the character has no pitch or roll authority. Carried as a
+    /// vector so the shadow can integrate it like `linear_velocity`.
+    pub angular_velocity: [f32; 3],
     pub body_yaw: f32,
     pub grounded: bool,
     /// Last correction the client has applied, for idempotent re-delivery.
@@ -244,7 +249,8 @@ mod tests {
             report: MovementReport {
                 tick: Tick::new(1234),
                 position: [12.345, 1.5, -7.25],
-                velocity: [3.5, -0.5, 0.0],
+                linear_velocity: [3.5, -0.5, 0.0],
+                angular_velocity: [0.0, 2.5, 0.0],
                 body_yaw: 2.0,
                 grounded: true,
                 applied_correction_seq: 9,
@@ -258,6 +264,8 @@ mod tests {
         assert_eq!(back.report.applied_correction_seq, 9);
         assert!(back.report.grounded);
         assert!((back.report.position[0] - 12.345).abs() < 1e-3);
+        assert!((back.report.linear_velocity[0] - 3.5).abs() < 1e-3);
+        assert!((back.report.angular_velocity[1] - 2.5).abs() < 1e-3);
         assert!((back.report.body_yaw - 2.0).abs() < 1e-3);
         assert_eq!(back.inputs[0].buttons, pkt.inputs[0].buttons);
         assert!(pkt.inputs[0].jump());

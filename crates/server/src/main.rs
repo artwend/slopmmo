@@ -174,7 +174,8 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
                 report: proto::MovementReport {
                     tick: client_tick,
                     position: bot.pos.to_array(),
-                    velocity: bot.vel.to_array(),
+                    linear_velocity: bot.vel.to_array(),
+                    angular_velocity: [0.0; 3],
                     body_yaw: 0.0,
                     grounded: bot.grounded,
                     applied_correction_seq: 0,

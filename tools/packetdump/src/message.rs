@@ -216,7 +216,8 @@ mod tests {
             report: MovementReport {
                 tick: Tick::new(1234),
                 position: [12.345, 1.5, -7.25],
-                velocity: [3.5, -0.5, 0.0],
+                linear_velocity: [3.5, -0.5, 0.0],
+                angular_velocity: [0.0, 1.5, 0.0],
                 body_yaw: 2.0,
                 grounded: true,
                 applied_correction_seq: 9,

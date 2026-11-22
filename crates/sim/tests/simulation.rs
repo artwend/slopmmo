@@ -275,7 +275,8 @@ fn packet(seq: u16, tick: u32, player: u64, pos: Vec3, vel: Vec3) -> proto::Play
         report: proto::MovementReport {
             tick: Tick::new(tick),
             position: pos.to_array(),
-            velocity: vel.to_array(),
+            linear_velocity: vel.to_array(),
+            angular_velocity: [0.0; 3],
             grounded: true,
             ..Default::default()
         },
@@ -303,6 +304,11 @@ fn teleporting_reports_are_rejected() {
         Vec3::new(0.0, 0.0, 400.0),
     );
     assert_eq!(sim.ingest(&fast), Err(Reject::TooFast));
+
+    // Rotation is bounded by the same check, not just translation.
+    let mut spinning = packet(4, 103, 1, Vec3::new(0.1, 0.9, 0.0), Vec3::ZERO);
+    spinning.report.angular_velocity = [0.0, 400.0, 0.0];
+    assert_eq!(sim.ingest(&spinning), Err(Reject::TooFast));
 }
 
 #[test]
@@ -399,6 +405,7 @@ fn a_resume_is_clamped_to_the_shadow_it_left() {
     {
         let p = sim.player_mut(1).unwrap();
         p.vel = Vec3::new(1.0, 0.0, 2.0);
+        p.angular_velocity = Vec3::new(0.0, 0.75, 0.0);
         p.body_yaw = 1.25;
         p.grounded = true;
     }
@@ -435,6 +442,7 @@ fn a_resume_is_clamped_to_the_shadow_it_left() {
     let p = sim.player(1).unwrap();
     assert_eq!(p.pos, resume.pos);
     assert_eq!(p.vel, Vec3::new(1.0, 0.0, 2.0));
+    assert_eq!(p.angular_velocity, Vec3::new(0.0, 0.75, 0.0));
     assert!((p.body_yaw - 1.25).abs() < 1e-6);
     assert!(p.grounded);
 }
@@ -636,6 +644,41 @@ fn shadow_extrapolates_between_reports_then_freezes() {
     // Frozen means frozen: the shadow does not keep walking on its own.
     sim.step(&world);
     assert_eq!(sim.player(1).unwrap().pos.x, frozen);
+}
+
+#[test]
+fn shadow_dead_reckons_yaw_between_reports_then_freezes() {
+    let world = StaticWorld::test_room();
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+
+    let yaw = 0.25;
+    let spin = 1.5;
+    let mut report = packet(1, 100, 1, Vec3::new(0.0, 0.9, 0.0), Vec3::ZERO);
+    report.report.body_yaw = yaw;
+    report.report.angular_velocity = [0.0, spin, 0.0];
+    assert_eq!(sim.ingest(&report), Ok(()));
+
+    // The accepted report is the rotation anchor, so the first tick already
+    // advances the yaw by one tick of spin.
+    sim.step(&world);
+    assert!((sim.player(1).unwrap().body_yaw - (yaw + spin * dt())).abs() < 1e-6);
+    sim.step(&world);
+    assert!((sim.player(1).unwrap().body_yaw - (yaw + spin * 2.0 * dt())).abs() < 1e-6);
+
+    for _ in 0..proto::REPORT_WINDOW {
+        sim.step(&world);
+    }
+    let frozen = sim.player(1).unwrap().body_yaw;
+    let limit = yaw + spin * proto::REPORT_WINDOW as f32 * dt();
+    assert!(
+        (frozen - limit).abs() < 1e-4,
+        "yaw extrapolation ran to {frozen}, window limit is {limit}"
+    );
+
+    sim.step(&world);
+    assert_eq!(sim.player(1).unwrap().body_yaw, frozen);
 }
 
 #[test]

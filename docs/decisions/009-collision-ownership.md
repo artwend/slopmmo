@@ -33,12 +33,13 @@ The owner's reasoning, in order:
 | Other players in PvP | yes | **yes** | the only place where cheating wins fights |
 | Other players outside PvP | yes | no | cosmetic contact only |
 
-The server therefore holds a **shadow state**: position, velocity, radius, height and mode for
-each player, plus boss bodies. It never holds a mesh.
+The server therefore holds a **shadow state**: position, linear and angular velocity, yaw, radius,
+height and mode for each player, plus boss bodies. It never holds a mesh.
 
-The client reports its post-solve `position`/`velocity`/`grounded`; the server does **not** trust
-it blindly, it validates the *implied displacement* against `MAX_SPEED`, `REPORT_WINDOW`, clock
-offset and collision modes (ADR 012).
+The client reports its post-solve `position`/`linear_velocity`/`angular_velocity`/`grounded`; the
+server does **not** trust it blindly, it validates the *implied displacement* against `MAX_SPEED`,
+`REPORT_WINDOW`, clock offset and collision modes, and the yaw rate against `MAX_ANGULAR_SPEED`
+(ADR 012).
 
 ## Consequences
 
@@ -57,8 +58,9 @@ offset and collision modes (ADR 012).
 
 - `crates/sim/src/world.rs` — static AABBs exist **client-side and in tests only**;
   `crates/server/src/main.rs` never constructs a `StaticWorld`.
-- `crates/sim/src/authority.rs` — the server keeps `ServerPlayer { position, velocity, tick_origin,
-  last_seq, last_tick }` and validates the reported displacement, rejecting with
+- `crates/sim/src/authority.rs` — the server keeps `ServerPlayer { position, velocity, body_yaw,
+  angular_velocity, tick_origin, last_seq, last_tick }` and validates the reported displacement,
+  rejecting with
   `Reject::{StaleTick, Teleport, TooFast, DuplicateSeq, UnknownPlayer, MalformedTick}`.
 - `crates/sim/src/collision.rs` — capsule-vs-capsule only, with `inv_mass = 0.0` for immovable
   bodies (bosses).

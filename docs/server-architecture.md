@@ -80,8 +80,8 @@ player, that player is handed off.
 A dynamic cell moving is an **actor migration with seamless handoff**:
 
 1. The source node freezes the actor at a tick boundary and stops emitting its state.
-2. Authority state is transferred: shadow position/velocity, `body_yaw`, applied correction id,
-   collision modes, the player's tick offset, and the **epoch**.
+2. Authority state is transferred: shadow position and linear/angular velocity, `body_yaw`, applied
+   correction id, collision modes, the player's tick offset, and the **epoch**.
 3. The destination node publishes itself as the owner; snapshots for that player now come from it.
 4. The client sees a new epoch and discards corrections from the old one (ADR 007).
 5. Only then can the source node drop the actor.
@@ -163,19 +163,21 @@ once.
 
 | Channel | Reliability | Rate | Content |
 | --- | --- | --- | --- |
-| client → server movement | unreliable, sequenced | 30 Hz while active; 4 Hz idle keepalive | `PlayerMovementPacket` |
+| client → server movement | unreliable, sequenced | 30 Hz on change; 10 Hz anchor while moving; 4 Hz when stationary | `PlayerMovementPacket` |
 | server → client snapshot | unreliable, sequenced | on change; adaptive heartbeat (2×RTT, 100 ms–1 s); peers ≤ 30 Hz | tick, ack, shadow pos, correction, peers, `resync` |
 | corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
 | discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
 
-Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while moving, dropping to ≈ 200 B/s
-when idle (4 Hz keepalive with no redundancy frames). Server: ≈ 28 B per changed snapshot with the
+Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while the state changes, ≈ 0.8 KB/s
+at the 10 Hz walking anchor, and ≈ 200 B/s when stationary (4 Hz keepalive, no redundancy frames).
+Server: ≈ 28 B per changed snapshot with the
 peer list off (the shipped default), or ≈ 28 B + 23 B per peer when `SimConfig::replicate_peers` is
 enabled — 1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope;
 the peer list is the reason AOI exists, and it stays dark until a client consumes it.
 
 Neither side streams on a fixed cadence any more (ADR 015). The client stays silent while its input,
-pose, grounding and correction acknowledgement are unchanged. The server compares each tick's
+pose, grounding and correction acknowledgement are unchanged — including while walking at a steady
+velocity, which the server already dead-reckons from the last report. The server compares each tick's
 snapshot with the last one it sent for that player — at millimetre precision — and only transmits a
 change in a correction, `resync` or the peer set. `server_tick`, `acked_seq` and `shadow_position`
 do not force a datagram because the client predicts its own pose and only adopts the shadow during
@@ -273,8 +275,8 @@ create → auth → character select → place in zone instance → play → han
 | --- | --- | --- |
 | Server tick | 60 Hz (16.67 ms) | `proto::SERVER_TICK_HZ` |
 | Client prediction | 60 Hz (16.7 ms) | `proto::CLIENT_TICK_HZ` |
-| Client send rate | 30 Hz | `proto::INPUT_SEND_HZ` |
-| Idle client send rate | 4 Hz keepalive, no redundancy frames | `proto::IDLE_SEND_HZ` |
+| Client send rate | 30 Hz maximum, only on change | `proto::INPUT_SEND_HZ` |
+| Client anchor rate | 10 Hz while moving, 4 Hz stationary, no redundancy frames | `client::ANCHOR_SEND_HZ`, `proto::IDLE_SEND_HZ` |
 | Snapshot heartbeat | adaptive: 2×RTT, clamped 100 ms–1 s (250 ms until a sample) | `server::transport::heartbeat_interval` |
 | Peer refresh rate | 30 Hz, independent of the tick | `proto::PEER_UPDATE_HZ` |
 | Client packet | ~81 B | `proto::PlayerMovementPacket` |

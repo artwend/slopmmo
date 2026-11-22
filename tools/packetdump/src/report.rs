@@ -858,7 +858,8 @@ mod tests {
             report: proto::MovementReport {
                 tick: proto::Tick::new(90),
                 position: [0.0, 0.9, -1.5],
-                velocity: [0.0, 0.0, -5.5],
+                linear_velocity: [0.0, 0.0, -5.5],
+                angular_velocity: [0.0, 0.0, 0.0],
                 body_yaw: 0.0,
                 grounded: true,
                 applied_correction_seq: 3,

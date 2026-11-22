@@ -25,18 +25,29 @@ independent wastes follow:
 
 ## Decision
 
-**Client.** A report is skipped unless at least one of these changed since the last report: a stick
-axis or button, grounding, the pose (to 1 mm), effectively-zero velocity, or the applied-correction
-sequence. Skips are bounded: after `IDLE_SEND_TICKS` (4 Hz) a keepalive report goes out. The
-keepalive drops the redundancy frames, because there is no input history worth recovering.
+**Client.** A report is sent only when it carries something the server cannot already infer, or when
+an anchor is due. Something changed when any of these did:
 
-`4 Hz` is a compromise:
+- a stick axis or button, grounding, or the applied-correction acknowledgement;
+- the linear velocity by more than `REPORT_VELOCITY_EPSILON`, or the yaw rate by more than
+  `REPORT_ANGULAR_EPSILON` — including *stopping* a turn, because the shadow extrapolates the last
+  reported rate;
+- the pose no longer matches the shadow's dead reckoning (`pos + vel × age`) within
+  `REPORT_POSITION_EPSILON`.
 
-- it stays far inside the server's `PEER_TIMEOUT` (10 s), so the link is not evicted;
-- it bounds the displacement allowance that `Simulation::ingest` derives from the time since the last
-  accepted report. At 4 Hz that allowance is a few metres rather than unbounded, which keeps the
-  anti-cheat check meaningful without paying for 30 Hz while nothing moves;
-- it is frequent enough that the server's dead-reckoned shadow is refreshed regularly.
+Otherwise only an anchor goes out: `ANCHOR_SEND_HZ` (10 Hz) while the character moves and
+`IDLE_SEND_HZ` (4 Hz) while it is stationary. Anchors carry no redundancy frames, because there is
+no new input to recover. The 10 Hz anchor bounds how long a *lost* velocity change can leave the
+shadow on the old value; the 4 Hz idle keepalive stays far inside `PEER_TIMEOUT` (10 s) and keeps
+the displacement allowance that `Simulation::ingest` derives from the gap between reports from
+growing without bound. At 10 Hz that allowance is ~2 m, at 4 Hz ~3 m.
+
+A turn keeps the full 30 Hz cadence while it lasts. Yaw is dead-reckoned from the reported rate, but
+a rate change — especially a stop — has to be heard promptly, and a moving turn changes the
+camera-relative wish direction every tick anyway.
+
+Crucially, a *change* is still described on the same 30 Hz cadence grid as before, so the worst-case
+delay between a key press and its report is unchanged.
 
 **Server.** The transport keeps the last snapshot it sent per player and compares the next tick's
 snapshot against it. A datagram is produced only when:
@@ -77,7 +88,11 @@ transport, so diagnostics, tests and future readers of `Simulation::snapshots()`
 
 ## Consequences
 
-- **Idle client:** 30 reports/s (~2.4 KB/s) → 4 reports/s of ~50 B (~0.2 KB/s).
+- **Steady client:** a constant velocity is already described by `pos + vel × age`, so 30 reports/s
+  (~2.4 KB/s) drops to ~10 anchors/s (~0.8 KB/s) while walking and 4/s (~0.2 KB/s) while stationary.
+  Changes and turns still leave at 30 Hz with their input frames. Measured over a 20 s scripted run
+  through the packetdump relay: 564 → 147 reports; client→server 63 → 32 packets/s and server→client
+  66 → 40 packets/s, because the server also sends fewer ACK-only datagrams for fewer client packets.
 - **Idle server:** 60 snapshots/s → at most 10/s per client (the 100 ms floor on a fast path), and
   less on a high-RTT link as the heartbeat stretches to 1 s. For a stationary player in an empty
   area, the server→client stream is effectively heartbeat-only. Measured on loopback: 184 snapshots
@@ -98,9 +113,11 @@ transport, so diagnostics, tests and future readers of `Simulation::snapshots()`
 
 ## What the repository does
 
-- `crates/client/src/main.rs`: `Local::report` gates on the idle predicate; `SentReport` stores what
-  the last packet said. Tests cover idle keepalive, full cadence while moving, and a correction ack
-  forcing a report out of idle.
+- `crates/client/src/main.rs`: `Local::report` sends when the state changed or an anchor is due;
+  `SentReport` stores what the last packet said (tick, pose, linear and angular velocity, input) so
+  dead reckoning can be compared. `ANCHOR_SEND_HZ`, `REPORT_VELOCITY_EPSILON`,
+  `REPORT_ANGULAR_EPSILON`, `REPORT_POSITION_EPSILON`. Tests cover idle anchors, steady-walk anchors,
+  a velocity/input change, a correction ack, and the end of a turn.
 - `crates/server/src/transport.rs`: `Peers::last_sent` (`SentSnapshot { at, peers_at }`),
   `plan_snapshot`, `PEER_UPDATE_INTERVAL`, `heartbeat_interval`, `snapshots_skipped`. Tests cover
   informational-only changes, millimetre sensitivity, peer membership and cadence, a correction

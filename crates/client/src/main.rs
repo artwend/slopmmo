@@ -51,6 +51,9 @@ pub struct Args {
 pub struct LocalPlayer {
     pub pos: Vec3,
     pub vel: Vec3,
+    /// Yaw rate in rad/s produced by the camera, reported so the server can
+    /// extrapolate rotation between reports.
+    pub angular_velocity: Vec3,
     pub grounded: bool,
     pub yaw: f32,
     pub move_params: sim::movement::MoveParams,
@@ -61,6 +64,7 @@ impl LocalPlayer {
         Self {
             pos: character::spawn_position(),
             vel: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
             grounded: true,
             yaw: 0.0,
             move_params: sim::movement::MoveParams::default(),
@@ -124,14 +128,33 @@ impl CorrectionLog {
 pub const INPUT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / proto::INPUT_SEND_HZ as u64);
 
-/// What the last report put on the wire, so a tick that says the same thing can
-/// stay silent instead of being described again.
+/// Anchor rate while the reported state is unchanged but the character moves.
+///
+/// The server dead-reckons `pos + vel × age` from the last report, so a steady
+/// velocity needs no per-tick description. The anchor only bounds how long a
+/// *lost* velocity change can leave the shadow on the old value.
+const ANCHOR_SEND_HZ: u32 = 10;
+const ANCHOR_SEND_TICKS: u32 = proto::CLIENT_TICK_HZ / ANCHOR_SEND_HZ;
+
+/// Linear-velocity change the server cannot infer from the last report.
+const REPORT_VELOCITY_EPSILON: f32 = 0.1;
+/// Yaw-rate change that must be reported: the shadow extrapolates the last rate,
+/// so a stopped turn would otherwise keep rotating at the old speed.
+const REPORT_ANGULAR_EPSILON: f32 = 0.05;
+/// Dead-reckoning error that must be corrected even when the velocity matches.
+const REPORT_POSITION_EPSILON: f32 = 0.02;
+
+/// What the last report put on the wire, so a tick the server can already infer
+/// stays silent instead of describing the same state again.
 #[derive(Clone, Copy)]
 struct SentReport {
     tick: proto::Tick,
     position: [f32; 3],
+    linear_velocity: [f32; 3],
+    angular_velocity: [f32; 3],
     grounded: bool,
     applied_correction_seq: u16,
+    input: proto::InputFrame,
 }
 
 /// Shared world geometry for both the local solve and the rendered boxes.
@@ -187,13 +210,16 @@ impl Local {
         self.recent.truncate(proto::MAX_INPUT_FRAMES);
     }
 
-    /// The report due for the current tick, or `None` off-cadence or idle.
+    /// The report due for the current tick, or `None` when the server can already
+    /// infer the state and no anchor is due.
     ///
-    /// Off-cadence ticks stay silent because input is tick-addressed. An idle
-    /// tick is also silent: no input, no motion, an unchanged pose and no new
-    /// correction mean the next report would repeat the last one, so only the
-    /// [`proto::IDLE_SEND_HZ`] keepalive goes out. Keepalives carry no redundant
-    /// input frames — there is nothing to recover.
+    /// Off-cadence ticks stay silent because input is tick-addressed. On the
+    /// cadence, the report is sent when it carries something the shadow cannot
+    /// derive — changed input, grounding, velocity, yaw rate, a correction
+    /// acknowledgement, or a pose that no longer matches dead reckoning.
+    /// Otherwise only an anchor goes out: `ANCHOR_SEND_HZ` while the character
+    /// moves and [`proto::IDLE_SEND_HZ`] while it is stationary. Anchors carry
+    /// no redundant input frames — there is no new input to recover.
     pub fn report(&mut self, player_id: u64) -> Option<proto::PlayerMovementPacket> {
         if self.sent_at == Some(self.tick) {
             return None;
@@ -206,22 +232,32 @@ impl Local {
         let report = proto::MovementReport {
             tick: self.tick,
             position: self.player.pos.to_array(),
-            velocity: self.player.vel.to_array(),
+            linear_velocity: self.player.vel.to_array(),
+            angular_velocity: self.player.angular_velocity.to_array(),
             body_yaw: self.player.yaw,
             grounded: self.player.grounded,
             applied_correction_seq: self.corrections.last_seq(),
         };
-        let idle = self.idle(&report);
-        let keepalive_due = self
-            .last_sent
-            .is_none_or(|sent| sent.tick.since(self.tick) >= proto::IDLE_SEND_TICKS as i32);
-        if idle && !keepalive_due {
+        let newest = self.recent.front().copied().unwrap_or_default();
+        let unchanged = self.unchanged(&report, &newest);
+        let due = if unchanged {
+            let interval = if self.stationary(&report) {
+                proto::IDLE_SEND_TICKS
+            } else {
+                ANCHOR_SEND_TICKS
+            };
+            self.last_sent
+                .is_none_or(|sent| sent.tick.since(self.tick) >= interval as i32)
+        } else {
+            true
+        };
+        if !due {
             return None;
         }
 
         self.sent_at = Some(self.tick);
         self.seq = self.seq.wrapping_add(1);
-        let inputs = if idle {
+        let inputs = if unchanged {
             Vec::new()
         } else {
             self.recent.iter().copied().collect()
@@ -229,8 +265,11 @@ impl Local {
         self.last_sent = Some(SentReport {
             tick: self.tick,
             position: report.position,
+            linear_velocity: report.linear_velocity,
+            angular_velocity: report.angular_velocity,
             grounded: report.grounded,
             applied_correction_seq: report.applied_correction_seq,
+            input: newest,
         });
         Some(proto::PlayerMovementPacket {
             seq: self.seq,
@@ -240,27 +279,50 @@ impl Local {
         })
     }
 
-    /// True when a report says nothing the server has not already been told:
-    /// no input, effectively no velocity, an unchanged pose and no new
-    /// correction to acknowledge. Any of those changing is a fact the shadow
-    /// needs, so the report is not idle.
-    fn idle(&self, report: &proto::MovementReport) -> bool {
+    fn stationary(&self, report: &proto::MovementReport) -> bool {
+        report.linear_velocity.iter().map(|v| v * v).sum::<f32>()
+            <= proto::IDLE_SPEED_EPSILON * proto::IDLE_SPEED_EPSILON
+    }
+
+    /// True when the new report tells the server nothing it could not infer from
+    /// the last one: same input, grounding and correction ack, no yaw rate, a
+    /// matching linear velocity, and a pose its dead reckoning already predicts.
+    ///
+    /// A turn keeps the full cadence: the shadow extrapolates yaw from the last
+    /// reported rate but does not smooth it, so it is described while it lasts.
+    fn unchanged(&self, report: &proto::MovementReport, newest: &proto::InputFrame) -> bool {
         let Some(sent) = self.last_sent else {
             return false;
         };
-        let newest = self.recent.front().copied().unwrap_or_default();
-        newest.move_x == 0
-            && newest.move_z == 0
-            && newest.buttons == 0
-            && report.grounded == sent.grounded
-            && report.applied_correction_seq == sent.applied_correction_seq
-            && report.velocity.iter().map(|v| v * v).sum::<f32>()
-                <= proto::IDLE_SPEED_EPSILON * proto::IDLE_SPEED_EPSILON
-            && report
-                .position
-                .iter()
-                .zip(sent.position.iter())
-                .all(|(a, b)| (a - b).abs() <= 1.0 / proto::QUANT_MM)
+        if newest.move_x != sent.input.move_x
+            || newest.move_z != sent.input.move_z
+            || newest.buttons != sent.input.buttons
+            || report.grounded != sent.grounded
+            || report.applied_correction_seq != sent.applied_correction_seq
+        {
+            return false;
+        }
+        let angular = Vec3::from_array(report.angular_velocity);
+        if angular.distance_squared(Vec3::from_array(sent.angular_velocity))
+            > REPORT_ANGULAR_EPSILON * REPORT_ANGULAR_EPSILON
+            || angular.length_squared() > REPORT_ANGULAR_EPSILON * REPORT_ANGULAR_EPSILON
+        {
+            return false;
+        }
+
+        let velocity = Vec3::from_array(report.linear_velocity);
+        let sent_velocity = Vec3::from_array(sent.linear_velocity);
+        if velocity.distance_squared(sent_velocity)
+            > REPORT_VELOCITY_EPSILON * REPORT_VELOCITY_EPSILON
+        {
+            return false;
+        }
+
+        let age = sent.tick.since(report.tick).max(0) as f32;
+        let predicted =
+            Vec3::from_array(sent.position) + sent_velocity * (age * proto::CLIENT_TICK_DT);
+        Vec3::from_array(report.position).distance_squared(predicted)
+            <= REPORT_POSITION_EPSILON * REPORT_POSITION_EPSILON
     }
 
     /// Applies a snapshot's placement and correction; false when no correction
@@ -270,9 +332,10 @@ impl Local {
             // A resumed session is placed by the server. This is the one case
             // where the shadow position is adopted instead of predicted;
             // dropping the local velocity stops the snap from turning into a
-            // burst of movement.
+            // burst of movement or rotation.
             self.player.pos = Vec3::from_array(snapshot.shadow_position);
             self.player.vel = Vec3::ZERO;
+            self.player.angular_velocity = Vec3::ZERO;
         }
         let Some(c) = &snapshot.correction else {
             return false;
@@ -312,22 +375,113 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_client_keeps_the_full_cadence() {
+    fn a_turning_client_keeps_the_full_cadence() {
         let mut local = Local::default();
-        local.player.vel = Vec3::new(0.0, 0.0, -proto::MAX_SPEED);
+        local.report(7).expect("the first report is always sent");
+        local.player.angular_velocity = Vec3::new(0.0, 2.5, 0.0);
+
         let mut sent = 0;
         for _ in 0..(proto::CLIENT_TICK_HZ * 2) {
-            local.step(proto::InputFrame {
-                move_z: -127,
-                ..Default::default()
-            });
+            local.step(proto::InputFrame::default());
             if let Some(packet) = local.report(7) {
-                assert!(!packet.inputs.is_empty(), "movement report lost redundancy");
+                assert!(
+                    !packet.inputs.is_empty(),
+                    "a turning client sent a keepalive"
+                );
                 sent += 1;
             }
         }
-        // Two seconds at the 30 Hz cadence.
         assert_eq!(sent, 2 * proto::INPUT_SEND_HZ as usize);
+    }
+
+    /// Steps the local tick and advances the pose the way Avian does after it,
+    /// so dead reckoning can be compared against real movement.
+    fn step_and_move(local: &mut Local, input: proto::InputFrame) {
+        local.step(input);
+        local.player.pos += local.player.vel * proto::CLIENT_TICK_DT;
+    }
+
+    #[test]
+    fn a_steady_walk_sends_anchors_not_every_tick() {
+        let mut local = Local::default();
+        let input = proto::InputFrame {
+            move_z: -127,
+            ..Default::default()
+        };
+        // Converge to the steady velocity first; that phase legitimately reports
+        // every cadence tick.
+        for _ in 0..proto::CLIENT_TICK_HZ {
+            step_and_move(&mut local, input);
+            local.report(7);
+        }
+
+        let mut sent = 0;
+        for _ in 0..(proto::CLIENT_TICK_HZ * 2) {
+            step_and_move(&mut local, input);
+            if let Some(packet) = local.report(7) {
+                assert!(packet.inputs.is_empty(), "anchor carried redundancy frames");
+                sent += 1;
+            }
+        }
+        let expected = 2 * ANCHOR_SEND_HZ as i32;
+        assert!(
+            (sent - expected).abs() <= 2,
+            "steady walk sent {sent} reports, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn a_velocity_change_leaves_on_the_next_cadence_tick() {
+        let mut local = Local::default();
+        let walk = proto::InputFrame {
+            move_z: -127,
+            ..Default::default()
+        };
+        for _ in 0..proto::CLIENT_TICK_HZ {
+            step_and_move(&mut local, walk);
+            local.report(7);
+        }
+
+        let sprint = proto::InputFrame {
+            move_z: -127,
+            buttons: proto::buttons::SPRINT,
+            ..Default::default()
+        };
+        let mut reported = None;
+        for _ in 0..2 {
+            step_and_move(&mut local, sprint);
+            if let Some(packet) = local.report(7) {
+                reported = Some(packet);
+            }
+        }
+        let packet = reported.expect("a velocity change was suppressed");
+        assert!(
+            packet.inputs.iter().any(|f| f.sprint()),
+            "the changed input was not reported with it"
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_turn_is_reported_on_the_next_cadence_tick() {
+        let mut local = Local::default();
+        local.report(7).expect("first report");
+        local.player.angular_velocity = Vec3::new(0.0, 2.5, 0.0);
+        for _ in 0..4 {
+            local.step(proto::InputFrame::default());
+            local.report(7);
+        }
+
+        // The shadow extrapolates the reported yaw rate, so stopping a turn is a
+        // fact it must hear before the next anchor.
+        local.player.angular_velocity = Vec3::ZERO;
+        let mut stopped = None;
+        for _ in 0..2 {
+            local.step(proto::InputFrame::default());
+            if let Some(packet) = local.report(7) {
+                stopped = Some(packet.report.angular_velocity);
+            }
+        }
+        assert_eq!(stopped, Some([0.0; 3]), "the stopped turn was suppressed");
     }
 
     #[test]

@@ -49,6 +49,9 @@ reduced airborne authority, linear ground friction. `crates/proto` carries `came
 `body_yaw` as quantised values (16-bit yaw ≈ 0.0055° resolution). `crates/sim/src/kcc.rs`
 is fully deterministic and takes `CLIENT_TICK_DT`, never wall-clock time.
 
+The camera's turn rate travels as `angular_velocity` in the movement report, so the server can
+extrapolate `body_yaw` between reports instead of holding rotation until the next one arrives.
+
 Verified in the headless harness: a scripted sprint + jump produces `peak_y 1.8633` and identical
 output across runs (`deterministic: true`).
 

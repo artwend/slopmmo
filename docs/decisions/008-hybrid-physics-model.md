@@ -65,7 +65,9 @@ forking the branch:
 The client is an ordinary Avian app: `PhysicsPlugins` + `MoveAndSlidePlugin` run in
 `FixedPostUpdate`, the avatar entity *is* the virtual character, and the movement model writes
 `LinearVelocity` in `FixedUpdate`. `character::read_back` copies `Position`, `LinearVelocity` and
-`Grounded` into `Local` for the report.
+`Grounded` into `Local` for the report. The report carries that linear velocity alongside the
+camera's `angular_velocity`: the server bounds the yaw rate the same way it bounds linear speed and
+advances `body_yaw` from the report anchor while dead-reckoning, exactly as it advances position.
 
 `crates/sim/src/kcc.rs` stays as the engine-free reference solver: the deterministic
 capsule-vs-AABB collide-and-slide is what `sim`'s own tests and the server's bot benchmark use, so
