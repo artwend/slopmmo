@@ -29,10 +29,12 @@ struct UnknownMessage {
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum DirectionFilter {
     Both,
+    #[value(name = "c2s")]
     ClientToServer,
+    #[value(name = "s2c")]
     ServerToClient,
 }
 

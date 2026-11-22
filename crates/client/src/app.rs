@@ -39,7 +39,7 @@ pub fn run(args: &Args) {
             .before(NetSet::Send),
     );
 
-    if let Some(addr) = args.connect_addr() {
+    if let Some(addr) = args.connect {
         app.add_plugins(ClientNetPlugin {
             server: addr,
             player_id: args.player_id,

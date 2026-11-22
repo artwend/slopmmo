@@ -10,6 +10,7 @@ proto.workspace = true
 net.workspace = true
 sim.workspace = true
 bevy = "0.20"
+clap = { version = "4", features = ["derive"] }
 
 # No `udp` feature on a wasm target: lightyear's UDP backend is std-only.
 lightyear = { version = "0.31", default-features = false, features = ["std", "client", "udp", "raw_connection"] }

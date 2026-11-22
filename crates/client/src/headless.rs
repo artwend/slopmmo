@@ -246,7 +246,7 @@ pub fn run(args: &Args) -> ExitCode {
 
     // Optional live round-trip: the script is replayed against a real server so
     // the encode/decode path and correction idempotency are exercised.
-    if let Some(addr) = args.connect_addr() {
+    if let Some(addr) = args.connect {
         println!("net_server      {addr}");
         let r = run_script(args.seconds, Some(addr), args.player_id);
         println!("net_sent        {}", r.sent);

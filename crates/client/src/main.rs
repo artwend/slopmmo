@@ -13,75 +13,37 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bevy::prelude::{Resource, Vec3};
+use clap::Parser;
 
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
-    match args.mode {
-        Mode::Window => {
-            app::run(&args);
-            std::process::ExitCode::SUCCESS
-        }
-        Mode::Headless => headless::run(&args),
+    if args.headless {
+        headless::run(&args)
+    } else {
+        app::run(&args);
+        std::process::ExitCode::SUCCESS
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Mode {
-    Window,
-    Headless,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parser)]
+#[command(
+    name = "client",
+    about = "Bevy window with a local KCC solve, plus a headless CI mode",
+    after_help = "window controls: WASD move, Q/E turn camera, Space jump, Shift sprint"
+)]
 pub struct Args {
-    pub mode: Mode,
+    /// run a scripted session, print metrics, exit
+    #[arg(long)]
+    pub headless: bool,
+    /// safety cap on simulated seconds
+    #[arg(long, value_name = "S", default_value_t = 30.0)]
     pub seconds: f32,
-    pub connect: Option<String>,
+    /// send reports to a UDP server, e.g. 127.0.0.1:4000
+    #[arg(long, value_name = "ADDR")]
+    pub connect: Option<SocketAddr>,
+    /// numeric player id
+    #[arg(long = "player", value_name = "ID", default_value_t = 1)]
     pub player_id: u64,
-}
-
-impl Args {
-    /// Parses `--connect` into an address, exiting with code 2 if it is unusable.
-    pub fn connect_addr(&self) -> Option<SocketAddr> {
-        let raw = self.connect.as_ref()?;
-        match raw.parse() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                eprintln!("invalid --connect address {raw:?}: {e}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    fn parse() -> Self {
-        let mut out = Self {
-            mode: Mode::Window,
-            seconds: 30.0,
-            connect: None,
-            player_id: 1,
-        };
-        let mut it = std::env::args().skip(1);
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--headless" => out.mode = Mode::Headless,
-                "--seconds" => out.seconds = it.next().and_then(|v| v.parse().ok()).unwrap_or(30.0),
-                "--connect" => out.connect = it.next(),
-                "--player" => out.player_id = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
-                "--help" | "-h" => {
-                    println!(
-                        "usage: client [--headless] [--seconds S] [--connect ADDR] [--player ID]\n\
-                         \n  --headless      run a scripted session, print metrics, exit\n\
-                         \n  --seconds S     safety cap on simulated seconds (default 30)\n\
-                         \n  --connect ADDR  send reports to a UDP server, e.g. 127.0.0.1:4000\n\
-                         \n  --player ID     numeric player id (default 1)\n\
-                         \n  window controls: WASD move, Q/E turn camera, Space jump, Shift sprint\n"
-                    );
-                    std::process::exit(0);
-                }
-                other => eprintln!("unknown argument: {other}"),
-            }
-        }
-        out
-    }
 }
 
 /// Shared local pose, used by both the window and headless paths.

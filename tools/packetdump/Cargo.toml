@@ -11,6 +11,8 @@ description = "Developer-only CLI packet analyzer for the lightyear movement pro
 
 [dependencies]
 proto.workspace = true
+# Command line parsing and `--help`.
+clap = { version = "4", features = ["derive"] }
 # Decodes the message payloads. Lightyear serializes registered messages with
 # postcard; the framing itself is parsed in `src/wire.rs`.
 postcard = { version = "1", features = ["alloc"] }

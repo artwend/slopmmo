@@ -9,6 +9,7 @@ publish = false
 proto.workspace = true
 net.workspace = true
 bevy_math = "0.20"
+clap = { version = "4", features = ["derive"] }
 sim.workspace = true
 
 # Headless only: no render, no window, no asset pipeline.

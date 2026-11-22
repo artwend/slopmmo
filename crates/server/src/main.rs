@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
+use clap::Parser;
 
 use sim::authority::{SimConfig, Simulation};
 use sim::movement::MoveParams;
@@ -93,6 +94,8 @@ fn main() {
         return;
     }
 
+    let addr = args.listen;
+
     let mut app = App::new();
     app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))))
         .add_plugins(bevy::log::LogPlugin::default())
@@ -103,21 +106,16 @@ fn main() {
         .insert_resource(GameRes(Game::new()))
         .add_systems(Update, drive.in_set(SimSet::Drive));
 
-    match args.listen_addr() {
-        Some(addr) => {
-            // Probe the address ourselves so a bad `--listen` is still a clean
-            // exit instead of a logged error from inside a lightyear observer.
-            match std::net::UdpSocket::bind(addr) {
-                Ok(socket) => drop(socket),
-                Err(e) => {
-                    error!("cannot bind {addr}: {e}");
-                    std::process::exit(2);
-                }
-            }
-            app.add_plugins(transport::NetPlugin { addr });
+    // Probe the address ourselves so a bad `--listen` is still a clean
+    // exit instead of a logged error from inside a lightyear observer.
+    match std::net::UdpSocket::bind(addr) {
+        Ok(socket) => drop(socket),
+        Err(e) => {
+            error!("cannot bind {addr}: {e}");
+            std::process::exit(2);
         }
-        None => info!("no socket, tick rate {} Hz", proto::SERVER_TICK_HZ),
     }
+    app.add_plugins(transport::NetPlugin { addr });
 
     app.run();
 }
@@ -220,54 +218,21 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
     );
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parser)]
+#[command(
+    name = "server",
+    about = "Headless MMO server: deterministic bot benchmark or a UDP game loop"
+)]
 pub struct Args {
+    /// run N deterministic bots, no sockets, print metrics
+    #[arg(long, value_name = "N", default_value_t = 0)]
     pub bots: usize,
+    /// bot benchmark length in seconds
+    #[arg(long, value_name = "S", default_value_t = 10.0)]
     pub duration: f32,
-    pub listen: Option<String>,
-}
-
-impl Args {
-    /// Parses `--listen` into an address, exiting with code 2 if it is unusable.
-    fn listen_addr(&self) -> Option<SocketAddr> {
-        let raw = self.listen.as_ref()?;
-        match raw.parse() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                eprintln!("invalid --listen address {raw:?}: {e}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    fn parse() -> Self {
-        let mut out = Self {
-            bots: 0,
-            duration: 10.0,
-            listen: Some("0.0.0.0:4000".to_string()),
-        };
-        let mut it = std::env::args().skip(1);
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--bots" => out.bots = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-                "--duration" => {
-                    out.duration = it.next().and_then(|v| v.parse().ok()).unwrap_or(10.0)
-                }
-                "--listen" => out.listen = it.next(),
-                "--help" | "-h" => {
-                    println!(
-                        "usage: server [--bots N --duration S] [--listen ADDR]\n\
-                         \n  --bots N        run N deterministic bots, no sockets, print metrics\n\
-                         \n  --duration S    bot benchmark length in seconds (default 10)\n\
-                         \n  --listen ADDR   UDP bind address (default 0.0.0.0:4000)\n"
-                    );
-                    std::process::exit(0);
-                }
-                other => eprintln!("unknown argument: {other}"),
-            }
-        }
-        out
-    }
+    /// UDP bind address
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:4000")]
+    pub listen: SocketAddr,
 }
 
 #[cfg(test)]

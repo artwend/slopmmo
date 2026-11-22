@@ -17,14 +17,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
+
 use report::{Options, Reporter};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     let args = cli::Args::parse();
-    let listen = args.listen_addr();
-    let server = args.server_addr();
+    let listen = args.listen;
+    let server = args.server;
 
     let mut relay = match relay::Relay::bind(listen, server) {
         Ok(relay) => relay,
@@ -42,7 +44,7 @@ fn main() -> ExitCode {
         _ => bound,
     };
     let color =
-        args.color && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        !args.no_color && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     println!("packetdump  parsed Lightyear packets (dev tool)");
     println!("  relay   {bound} -> {server}");
