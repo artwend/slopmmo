@@ -38,7 +38,7 @@ and the section below says what would re-open it. Do not read it as "Closed".
 | §2.7 Validation from the self-declared velocity | The displacement check (`\|Δpos\| ≤ v_max · Δt · k`) is the primary rule; the velocity field is only sanity-checked for finiteness and magnitude. |
 | §3.3 Idempotency of corrections | Monotonic `seq` + `epoch`, client `CorrectionLog`, `acked_seq` echoed in the snapshot. Sequence-keyed rather than tick-keyed replay, because there is no rewind to replay. |
 | §3.5 Tick mapping 60/30 | `SimConfig::map_client_tick` scales elapsed client ticks; corrections are stamped with the server tick. Only the combat hit-tick is left, and that is §3.6. |
-| §3.7 Bevy/Avian API risk | Neither risk materialised: Avian is not a dependency (custom KCC), and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
+| §3.7 Bevy/Avian API risk | Closed by implementation: `crates/kcc-avian` uses released `avian3d` 0.8's `MoveAndSlide` through the `virtual-character` component/plugin API, and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
 | §5 Correction budget and teleport threshold | `CORRECTION_BUDGET` and the displacement validator set both. The numbers exist; playtest tuning does not. |
 | §5 Server tick: 60 Hz or 30 Hz | 60 Hz, every collision mode solved (ADR 013). |
 | §7 Findings 1–10 (hot path) | All replaced; the zero-allocation guard (§7.4) now exercises penetrating pairs and correction emission, and fails the build if a tick allocates. Finding 11 (the listen default) is a documentation mismatch, not a hot-path defect; it is still open. |
@@ -77,7 +77,7 @@ and the section below says what would re-open it. Do not read it as "Closed".
 | Replication | Snapshot state replication + message protocol hybrid |
 | Transport | UDP, unreliable + sequenced where applicable, Protobuf-like binary |
 | Engine | Bevy 0.20, fixed 60 Hz server tick |
-| KCC | Custom deterministic core; the client solves terrain against it. Avian is not a dependency. |
+| KCC | Avian's virtual character (`VirtualCharacter` + `MoveAndSlidePlugin`) in `crates/kcc-avian`; `sim::kcc` is the engine-free reference solver. |
 | Terrain collision | **Client only.** Server holds no landscape data at all |
 | Entity collision | **Server only** (players in PvP, bosses), custom capsule solver, no Avian |
 | Anti-cheat | Deliberately deprioritised. Cheap checks only; "don't make cheating trivial" |
@@ -90,7 +90,7 @@ The resulting model is asymmetric by construction:
 Client                                          Server
 ------                                          ------
 input (60 Hz)                ──────────────▶    input buffer
-KCC vs terrain (custom)                         shadow kinematics
+KCC vs terrain (Avian)                          shadow kinematics
                                                 spatial hash → pairs (K=8)
 local separation vs peers    ◀──────────────    soft/hard solve
 apply correction, re-resolve                    aggregate corrections
@@ -225,8 +225,9 @@ dead zone around the contact distance.
    separate system but never says where that history lives.
 7. **Closed.** **Bevy/Avian API risk.** `virtual-character` is a moving branch, not released Avian.
    Lightyear 0.30 `PredictionHistory` / `ConfirmedHistory` / `VisualCorrection` were asserted
-   without verification against the docs. Neither risk was taken: the KCC is custom and the
-   transport is Lightyear 0.31 over a raw UDP endpoint.
+   without verification against the docs. The transport is Lightyear 0.31 over a raw UDP endpoint,
+   and the controller uses the branch's `VirtualCharacter` / `AutoMoveAndSlide` /
+   `MoveAndSlidePlugin` API ported onto released `avian3d` 0.8 (`crates/kcc-avian`).
 
 ---
 

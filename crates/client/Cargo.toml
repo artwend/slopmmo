@@ -9,6 +9,7 @@ publish = false
 proto.workspace = true
 net.workspace = true
 sim.workspace = true
+kcc-avian.workspace = true
 bevy = "0.20"
 clap = { version = "4", features = ["derive"] }
 

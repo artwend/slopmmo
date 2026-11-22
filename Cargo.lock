@@ -2701,6 +2701,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "clap",
+ "kcc-avian",
  "lightyear",
  "net",
  "proto",
@@ -4497,6 +4498,15 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kcc-avian"
+version = "0.1.0"
+dependencies = [
+ "avian3d",
+ "bevy",
+ "sim",
 ]
 
 [[package]]

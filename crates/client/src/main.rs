@@ -1,10 +1,11 @@
-//! Client: Bevy window with a local KCC solve, plus a headless CI mode.
+//! Client: Bevy window with an Avian virtual character, plus a headless CI mode.
 //!
 //! The client owns terrain and its own position. The server only ever sends
 //! collision corrections and peer colliders, so nothing here waits on a
 //! round-trip to move.
 
 mod app;
+mod character;
 mod headless;
 mod transport;
 
@@ -28,7 +29,7 @@ fn main() -> std::process::ExitCode {
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "client",
-    about = "Bevy window with a local KCC solve, plus a headless CI mode",
+    about = "Bevy window with an Avian virtual character, plus a headless CI mode",
     after_help = "window controls: WASD move, Q/E turn camera, Space jump, Shift sprint"
 )]
 pub struct Args {
@@ -52,31 +53,28 @@ pub struct LocalPlayer {
     pub vel: Vec3,
     pub grounded: bool,
     pub yaw: f32,
-    pub kcc: sim::kcc::KccParams,
     pub move_params: sim::movement::MoveParams,
 }
 
 impl LocalPlayer {
     pub fn spawn() -> Self {
         Self {
-            // Capsule centre resting on the floor: half_height + radius = 0.9.
-            pos: Vec3::new(0.0, 0.9, 0.0),
+            pos: character::spawn_position(),
             vel: Vec3::ZERO,
             grounded: true,
             yaw: 0.0,
-            kcc: sim::kcc::KccParams::default(),
             move_params: sim::movement::MoveParams::default(),
         }
     }
 
-    /// One fixed tick: velocity model, then the terrain solve.
-    pub fn tick(&mut self, world: &sim::StaticWorld, input: &proto::InputFrame, dt: f32) {
+    /// One fixed tick of the velocity model.
+    ///
+    /// The geometry solve happens after this, in Avian's physics step; the
+    /// movement model reads `grounded` from the previous step's `Grounded`
+    /// marker.
+    pub fn tick(&mut self, input: &proto::InputFrame, dt: f32) {
         self.vel =
             sim::movement::step_velocity(&self.move_params, input, self.vel, self.grounded, dt);
-        let out = sim::move_and_slide(world, &self.kcc, self.pos, self.vel, dt);
-        self.pos = out.position;
-        self.vel = out.velocity;
-        self.grounded = out.grounded;
     }
 
     /// Applies a server correction as a velocity delta. Idempotency is the
@@ -126,6 +124,16 @@ impl CorrectionLog {
 pub const INPUT_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / proto::INPUT_SEND_HZ as u64);
 
+/// What the last report put on the wire, so a tick that says the same thing can
+/// stay silent instead of being described again.
+#[derive(Clone, Copy)]
+struct SentReport {
+    tick: proto::Tick,
+    position: [f32; 3],
+    grounded: bool,
+    applied_correction_seq: u16,
+}
+
 /// Shared world geometry for both the local solve and the rendered boxes.
 #[derive(Resource)]
 pub struct WorldRes(pub sim::StaticWorld);
@@ -144,6 +152,8 @@ pub struct Local {
     pub corrections: CorrectionLog,
     /// Tick of the last report, so a redelivered frame cannot double-send.
     sent_at: Option<proto::Tick>,
+    /// Last report put on the wire, or `None` before the first one.
+    last_sent: Option<SentReport>,
 }
 
 impl Default for Local {
@@ -155,24 +165,35 @@ impl Default for Local {
             recent: VecDeque::with_capacity(proto::MAX_INPUT_FRAMES),
             corrections: CorrectionLog::default(),
             sent_at: None,
+            last_sent: None,
         }
     }
 }
 
 impl Local {
     /// One fixed tick with `input`; the tick number is stamped on the frame.
-    pub fn step(&mut self, world: &sim::StaticWorld, input: proto::InputFrame) {
+    ///
+    /// The character entity is moved later in the same fixed step, by
+    /// `MoveAndSlidePlugin`; `character::read_back` copies the result into
+    /// `player` before the next tick.
+    pub fn step(&mut self, input: proto::InputFrame) {
         self.tick = self.tick.add(1);
         let input = proto::InputFrame {
             tick: self.tick,
             ..input
         };
-        self.player.tick(world, &input, proto::CLIENT_TICK_DT);
+        self.player.tick(&input, proto::CLIENT_TICK_DT);
         self.recent.push_front(input);
         self.recent.truncate(proto::MAX_INPUT_FRAMES);
     }
 
-    /// The report due for the current tick, or `None` off-cadence.
+    /// The report due for the current tick, or `None` off-cadence or idle.
+    ///
+    /// Off-cadence ticks stay silent because input is tick-addressed. An idle
+    /// tick is also silent: no input, no motion, an unchanged pose and no new
+    /// correction mean the next report would repeat the last one, so only the
+    /// [`proto::IDLE_SEND_HZ`] keepalive goes out. Keepalives carry no redundant
+    /// input frames — there is nothing to recover.
     pub fn report(&mut self, player_id: u64) -> Option<proto::PlayerMovementPacket> {
         if self.sent_at == Some(self.tick) {
             return None;
@@ -181,21 +202,65 @@ impl Local {
         if !self.tick.0.is_multiple_of(every) {
             return None;
         }
+
+        let report = proto::MovementReport {
+            tick: self.tick,
+            position: self.player.pos.to_array(),
+            velocity: self.player.vel.to_array(),
+            body_yaw: self.player.yaw,
+            grounded: self.player.grounded,
+            applied_correction_seq: self.corrections.last_seq(),
+        };
+        let idle = self.idle(&report);
+        let keepalive_due = self
+            .last_sent
+            .is_none_or(|sent| sent.tick.since(self.tick) >= proto::IDLE_SEND_TICKS as i32);
+        if idle && !keepalive_due {
+            return None;
+        }
+
         self.sent_at = Some(self.tick);
         self.seq = self.seq.wrapping_add(1);
+        let inputs = if idle {
+            Vec::new()
+        } else {
+            self.recent.iter().copied().collect()
+        };
+        self.last_sent = Some(SentReport {
+            tick: self.tick,
+            position: report.position,
+            grounded: report.grounded,
+            applied_correction_seq: report.applied_correction_seq,
+        });
         Some(proto::PlayerMovementPacket {
             seq: self.seq,
             player: player_id,
-            report: proto::MovementReport {
-                tick: self.tick,
-                position: self.player.pos.to_array(),
-                velocity: self.player.vel.to_array(),
-                body_yaw: self.player.yaw,
-                grounded: self.player.grounded,
-                applied_correction_seq: self.corrections.last_seq(),
-            },
-            inputs: self.recent.iter().copied().collect(),
+            report,
+            inputs,
         })
+    }
+
+    /// True when a report says nothing the server has not already been told:
+    /// no input, effectively no velocity, an unchanged pose and no new
+    /// correction to acknowledge. Any of those changing is a fact the shadow
+    /// needs, so the report is not idle.
+    fn idle(&self, report: &proto::MovementReport) -> bool {
+        let Some(sent) = self.last_sent else {
+            return false;
+        };
+        let newest = self.recent.front().copied().unwrap_or_default();
+        newest.move_x == 0
+            && newest.move_z == 0
+            && newest.buttons == 0
+            && report.grounded == sent.grounded
+            && report.applied_correction_seq == sent.applied_correction_seq
+            && report.velocity.iter().map(|v| v * v).sum::<f32>()
+                <= proto::IDLE_SPEED_EPSILON * proto::IDLE_SPEED_EPSILON
+            && report
+                .position
+                .iter()
+                .zip(sent.position.iter())
+                .all(|(a, b)| (a - b).abs() <= 1.0 / proto::QUANT_MM)
     }
 
     /// Applies a snapshot's placement and correction; false when no correction
@@ -217,5 +282,74 @@ impl Local {
         }
         self.player.apply_correction(c);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_client_sends_only_the_keepalive() {
+        let mut local = Local::default();
+        let first = local.report(7).expect("the first report is always sent");
+        assert_eq!(first.seq, 1);
+
+        let mut sent = 0;
+        // Two seconds of ticks: the 30 Hz cadence would send 60 packets.
+        for _ in 0..(proto::CLIENT_TICK_HZ * 2) {
+            local.step(proto::InputFrame::default());
+            if let Some(packet) = local.report(7) {
+                assert!(packet.inputs.is_empty(), "idle keepalive carried input");
+                sent += 1;
+            }
+        }
+        let expected = 2 * proto::IDLE_SEND_HZ as i32;
+        assert!(
+            (sent - expected).abs() <= 1,
+            "idle client sent {sent} reports, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn a_moving_client_keeps_the_full_cadence() {
+        let mut local = Local::default();
+        local.player.vel = Vec3::new(0.0, 0.0, -proto::MAX_SPEED);
+        let mut sent = 0;
+        for _ in 0..(proto::CLIENT_TICK_HZ * 2) {
+            local.step(proto::InputFrame {
+                move_z: -127,
+                ..Default::default()
+            });
+            if let Some(packet) = local.report(7) {
+                assert!(!packet.inputs.is_empty(), "movement report lost redundancy");
+                sent += 1;
+            }
+        }
+        // Two seconds at the 30 Hz cadence.
+        assert_eq!(sent, 2 * proto::INPUT_SEND_HZ as usize);
+    }
+
+    #[test]
+    fn an_idle_client_reports_a_fresh_correction_ack() {
+        let mut local = Local::default();
+        local.report(7).expect("first report");
+        local.corrections.accept(&proto::CollisionCorrection {
+            seq: 1,
+            tick: proto::Tick::new(1),
+            epoch: 1,
+            velocity_delta: [0.0; 3],
+            hard_normal: None,
+        });
+
+        let mut acked = None;
+        for _ in 0..proto::IDLE_SEND_TICKS {
+            local.step(proto::InputFrame::default());
+            if let Some(packet) = local.report(7) {
+                acked = Some(packet.report.applied_correction_seq);
+                break;
+            }
+        }
+        assert_eq!(acked, Some(1), "the correction ack was suppressed");
     }
 }

@@ -1,20 +1,19 @@
-//! Windowed client. WASD + Q/E, one local KCC solve per fixed tick.
+//! Windowed client. WASD + Q/E; Avian moves the virtual character once per fixed tick.
 
 use bevy::prelude::*;
+use kcc_avian::prelude::{MoveAndSlidePlugin, PhysicsPlugins};
 
+use crate::character::{self, Character};
 use crate::transport::{ClientNetPlugin, NetSet};
 use crate::{Args, Local, WorldRes};
 
 #[derive(Resource, Default)]
 struct PlayerRes {
-    accumulator: f32,
     input: proto::InputFrame,
 }
 
-#[derive(Component)]
-struct Avatar;
-
 pub fn run(args: &Args) {
+    let world = sim::StaticWorld::test_room();
     let mut app = App::new();
 
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -25,19 +24,24 @@ pub fn run(args: &Args) {
         }),
         ..default()
     }))
+    // `MoveAndSlidePlugin` must come after `PhysicsPlugins`: it orders itself
+    // inside the physics step sets those plugins create.
+    .add_plugins((
+        PhysicsPlugins::new(FixedPostUpdate),
+        MoveAndSlidePlugin::default(),
+    ))
+    .insert_resource(Time::<Fixed>::from_hz(proto::CLIENT_TICK_HZ as f64))
     .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
-    .insert_resource(WorldRes(sim::StaticWorld::test_room()))
+    .insert_resource(WorldRes(world))
     .init_resource::<Local>()
     .init_resource::<PlayerRes>()
     .add_systems(Startup, setup)
     .add_systems(
-        Update,
-        (sample_input, simulate, sync_avatar, follow)
-            .chain()
-            // Corrections land before the solve, reports leave after it.
-            .after(NetSet::Receive)
-            .before(NetSet::Send),
-    );
+        FixedUpdate,
+        (sample_input, tick_local, character::apply_local).chain(),
+    )
+    .add_systems(FixedLast, character::read_back)
+    .add_systems(Update, follow.after(NetSet::Receive));
 
     if let Some(addr) = args.connect {
         app.add_plugins(ClientNetPlugin {
@@ -65,18 +69,20 @@ fn setup(
         ..default()
     });
 
-    let unit = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    // The rendered boxes are the colliders; each mesh is built at the box size,
+    // so no `Transform` scale has to be mirrored into the collider.
     for (i, b) in world.0.boxes().iter().enumerate() {
         let size = b.max - b.min;
         let centre = (b.max + b.min) * 0.5;
         commands.spawn((
-            Mesh3d(unit.clone()),
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(if i == world.0.len() - 1 {
                 pillar.clone()
             } else {
                 stone.clone()
             }),
-            Transform::from_translation(centre).with_scale(size),
+            Transform::from_translation(centre),
+            character::terrain_bundle(b),
         ));
     }
 
@@ -100,19 +106,22 @@ fn setup(
         Transform::from_xyz(6.0, 12.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // The avatar is only a stand-in for the capsule; the KCC does the real work.
-    commands.spawn((
-        Avatar,
-        Mesh3d(meshes.add(Capsule3d::new(
-            proto::PLAYER_RADIUS,
-            proto::PLAYER_HEIGHT - proto::PLAYER_RADIUS * 2.0,
-        ))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.30, 0.65, 0.95),
-            ..default()
-        })),
-        Transform::from_xyz(0.0, 0.9, 0.0),
-    ));
+    // The capsule mesh rides on the virtual character itself; the controller
+    // writes its `Transform` every fixed step.
+    let player = commands
+        .spawn((
+            character::player_bundle(character::spawn_position()),
+            Mesh3d(meshes.add(Capsule3d::new(
+                proto::PLAYER_RADIUS,
+                character::CAPSULE_LENGTH,
+            ))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.30, 0.65, 0.95),
+                ..default()
+            })),
+        ))
+        .id();
+    commands.insert_resource(Character(player));
 }
 
 fn sample_input(
@@ -149,29 +158,8 @@ fn sample_input(
     };
 }
 
-fn simulate(
-    time: Res<Time>,
-    world: Res<WorldRes>,
-    mut local: ResMut<Local>,
-    mut res: ResMut<PlayerRes>,
-) {
-    res.accumulator += time.delta_secs();
-    let mut steps = 0;
-    while res.accumulator >= proto::CLIENT_TICK_DT && steps < 8 {
-        local.step(&world.0, res.input);
-        res.accumulator -= proto::CLIENT_TICK_DT;
-        steps += 1;
-    }
-    if steps == 8 {
-        res.accumulator = 0.0;
-    }
-}
-
-fn sync_avatar(mut q: Query<&mut Transform, With<Avatar>>, local: Res<Local>) {
-    for mut t in &mut q {
-        t.translation = local.player.pos;
-        t.rotation = Quat::from_rotation_y(local.player.yaw);
-    }
+fn tick_local(mut local: ResMut<Local>, res: Res<PlayerRes>) {
+    local.step(res.input);
 }
 
 fn follow(local: Res<Local>, mut q: Query<&mut Transform, With<Camera3d>>) {

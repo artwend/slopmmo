@@ -1,6 +1,7 @@
 # ADR 008 — Hybrid physics: kinematic character controller, geometry solved on the client
 
-- **Status:** Partial. The model is implemented in `sim::kcc`; Avian is not integrated yet.
+- **Status:** Implemented. The client's controller is Avian's `MoveAndSlide` (`crates/kcc-avian`);
+  `sim::kcc` remains the engine-free reference solver.
 - **Decided by:** project owner, second dialogue, turn 1 and the radio pick.
 - **Verbatim:** *«гибридная модель физики»*, then *«да, используем
   `avian/virtual-character/src/character_controller/virtual_character.rs` как основу»*.
@@ -48,16 +49,32 @@ the geometry layer and explicitly **not** `AutoMoveAndSlide`.
 
 ## What this repository does
 
-`crates/sim/src/kcc.rs` implements a small deterministic capsule-vs-AABB collide-and-slide
-(ground snap, slope limit, step-up, bounded slide iterations) and is used by the client for the
-local character. `crates/sim/src/authority.rs` uses the same kinematics for the server's shadow
-position. Avian itself is not a dependency yet: the prototype's "terrain" is a handful of
-axis-aligned boxes (`sim::world::StaticWorld`), so a full trimesh solver would have been untested
-weight.
+`crates/kcc-avian` ports the `virtual-character` branch's API to released `avian3d` 0.8 instead of
+forking the branch:
 
-Gap to close: replace `sim::kcc`'s static-solver with Avian's `MoveAndSlide` on real geometry while
-keeping the current `Kcc` interface, then confirm the client and the shadow agree tick-for-tick on
-flat ground.
+- `VirtualCharacter` + `AutoMoveAndSlide` are the entity-side API; `MoveAndSlidePlugin` runs the
+  step in `PhysicsSchedule`, after the broad phase (so the collider trees are current on the first
+  tick).
+- `UpDirection`, `Grounded`, `SlopeHandling`, `GroundSnapping` and `StairStepping` carry the
+  branch's fields and defaults. `Grounded` and `GroundSnapping` are applied because the movement
+  model reads them every tick; `slide_on_ground`, `slide_on_ceiling` and `StairStepping` are carried
+  for API parity but not applied yet.
+- `AutoMoveAndSlide::on_hit` keeps the branch's `fn(MoveAndSlideHitData) -> bool` signature and maps
+  `true`/`false` onto Avian 0.8's `Accept`/`Ignore`.
+
+The client is an ordinary Avian app: `PhysicsPlugins` + `MoveAndSlidePlugin` run in
+`FixedPostUpdate`, the avatar entity *is* the virtual character, and the movement model writes
+`LinearVelocity` in `FixedUpdate`. `character::read_back` copies `Position`, `LinearVelocity` and
+`Grounded` into `Local` for the report.
+
+`crates/sim/src/kcc.rs` stays as the engine-free reference solver: the deterministic
+capsule-vs-AABB collide-and-slide is what `sim`'s own tests and the server's bot benchmark use, so
+the cheap test crate never pulls in a physics engine. `crates/sim/src/authority.rs` is unaffected;
+the server's shadow still integrates reported motion and never solves terrain.
+
+Gap to close: real trimesh terrain. The prototype's terrain is still a handful of axis-aligned
+boxes, so the client builds box colliders; swapping in a trimesh is a change to
+`character::terrain_bundle`, not to the controller. Step-up is still absent, as in the branch.
 
 ## Open questions
 
