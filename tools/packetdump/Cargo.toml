@@ -1,0 +1,17 @@
+[package]
+name = "packetdump"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Developer tool: it is in the workspace so `cargo test --workspace` covers it,
+# but it is never published and no shipped crate depends on it.
+publish = false
+description = "Developer-only CLI packet analyzer for the lightyear movement protocol"
+
+[dependencies]
+proto.workspace = true
+# Decodes the message payloads. Lightyear serializes registered messages with
+# postcard; the framing itself is parsed in `src/wire.rs`.
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["alloc"] }

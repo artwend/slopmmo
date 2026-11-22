@@ -22,6 +22,7 @@ running code instead of arguing about them.
 | `crates/sim` | Pure simulation: capsule KCC, spatial hash, pair solver, server authority model |
 | `crates/server` | Headless Bevy app: fixed-step accumulator, bot benchmark, Lightyear endpoint |
 | `crates/client` | Bevy window (WASD + Q/E + Space) and a headless scripted CI mode |
+| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes Lightyear framing, both movement messages and ping/pong (packet rows, detail, rates) |
 
 `proto` and `sim` are deliberately engine-free apart from `bevy_math` vectors, so the same code
 runs unchanged on the client (prediction) and on the server (shadow).
@@ -78,7 +79,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 47 tests: proto, net, sim, server, client
+cargo test --workspace          # 70 tests: proto, net, sim, server, client, packetdump
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
@@ -199,6 +200,68 @@ Two things make an empty capture likely, and neither is a bug in the transport:
 
 If both of those check out and the capture is still empty, run the server with
 `RUST_LOG=lightyear_udp=trace` — it logs `Received UDP packet from new address` per new peer.
+
+### Parsed packet view (dev tool)
+
+`tools/packetdump` is a developer-only UDP relay that forwards traffic between a client and the
+server and prints every Lightyear packet with its decoded messages. It needs no Npcap, capture
+driver, or administrator rights, and it forwards the bytes unchanged. Point the client at the relay
+instead of the server:
+
+```sh
+cargo run -p server -- --listen 127.0.0.1:4000
+cargo run -p packetdump -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
+cargo run -p client -- --headless --connect 127.0.0.1:4001
+```
+
+The launcher wraps the same commands and manages every child process:
+
+```powershell
+.\tools\run-local.ps1 -Capture                          # server + 1 windowed client
+.\tools\run-local.ps1 -Capture -Clients 2               # two windowed clients
+.\tools\run-local.ps1 -Headless -Capture                # scripted clients instead
+.\tools\run-local.ps1 -Headless -Capture -Clients 2 -Detail
+.\tools\run-local.ps1 -Clients 0 -Capture               # server + analyzer only
+.\tools\run-local.ps1 -c -hl -n 2 -d                    # short forms of the above
+```
+
+Short forms: `-c` Capture, `-n` Clients, `-d` Detail, `-a` NoAcks, `-hl` Headless,
+`-t` Duration, `-sp` ServerPort, `-cp` CapturePort, `-pb` PlayerBase, `-r` Release,
+`-nb` NoBuild.
+
+It builds first (skip with `-NoBuild`), starts the server, starts packetdump when `-Capture` is
+set, launches the clients, and stops every child when the clients exit or you press Ctrl+C. By
+default each client opens a game window and runs until you close it. `-Headless` runs the fixed
+~20 s script instead, so keep `-Duration` above that, and prints those client logs at the end.
+
+It prints one row per datagram; a `Data` packet may carry several messages:
+
+```
+#000007  1.233s  C->S :52144   20 B  pkt=6     t=13        PING     id=1 net_id=0
+#000012  1.376s  S->C :52144   38 B  pkt=2     t=130       SNAPSHOT t=126 ack=14 shadow=(0.000, 0.900, -1.237) corr=none peers=0 resync=false
+#000013  1.409s  C->S :52144   86 B  pkt=9     t=18        INPUT    seq=16 player=1 t=32 pos=(0.000, 0.900, -1.591) vel=(0.000, 0.000, -5.567) yaw=0.0deg grounded=true applied=0 inputs=4
+```
+
+The `:<port>` column is the client's UDP endpoint, which keeps packets from different clients
+distinguishable when several are connected.
+
+`--detail` expands each message (`seq`, report, input frames, correction, peer colliders), `--hex`
+appends a dump of the raw datagram, `--no-acks` hides ACK-only packets, and `--dir c2s|s2c` filters
+one side. `--count N --stats-every 0` makes the tool usable from a script. Short flags are `-l`,
+`-s`, `-n`, `-t`, `-v`, `-x`, `-a`, `-d`, `-nc`. The two movement messages and Lightyear's
+`Ping`/`Pong` control messages are decoded; any other internal message is shown as `INTERNAL` and
+counted.
+
+The rate summary also reports packet-id gaps and reordering per direction, so loss shows up
+without opening Wireshark:
+
+```
+stats   1.00s  |  C->S    30 pkt      3.1 KiB    30.0 pkt/s      3.1 KiB/s  |  INPUT 30/3.1 KiB  |  gaps 0  reorder 0  bad 0
+               |  S->C    60 pkt      4.2 KiB    60.0 pkt/s      4.2 KiB/s  |  SNAPSHOT 60/4.2 KiB  |  gaps 0  reorder 0  bad 0
+```
+
+Because the relay sits in the path, very verbose output can slow it down. Use `--count`, `--no-acks`
+or `--dir` when timing matters.
 
 ### Windowed client
 
