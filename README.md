@@ -53,15 +53,18 @@ Client                                        Server
 ------                                        ------
 owns terrain                                  owns no terrain at all
 Avian virtual character, 60 Hz                shadow kinematics from reports, 60 Hz
-receives peer colliders, does not solve them  spatial hash -> pairs (K = 8), every tick
+solves terrain + replicated peers, 60 Hz      spatial hash -> pairs (K = 8), every tick
 predicts locally, never waits                 soft or hard impulse per pair
 applies corrections (velocity / normal)       sends snapshot + correction
 sends pose reports 30 Hz
 ```
 
-Peer colliders are on the wire (`ServerSnapshot::peers`) but are not yet fed into the client's
-solve, so that second line is half-built: prediction currently depends on terrain alone. The
-remaining half is on the open list in [`architecture-review.md`](architecture-review.md).
+Peer colliders are on the wire (`ServerSnapshot::peers`) and the client does solve against them:
+`sim::peers` keeps the replicated sets in a bounded, tick-keyed history and the local tick solves
+against the sample that belonged to the tick it is predicting, next to terrain. That is what makes
+prediction agree with the server instead of waiting for a correction. `SimConfig::replicate_peers`
+is on by default; only a client build without the local solve turns it off, and it then pays
+neither the AOI scan nor the wire bytes (ADR 011, ADR 015).
 
 Server and client both run at 60 Hz, and the server solves every collision mode on every tick.
 Nothing is sub-sampled below the tick that drives it, because a 20–30 Hz soft solve under a 60 Hz
@@ -75,17 +78,23 @@ Consequences that are enforced in code, not just documented:
   and fights the client's own solver; there is no replay whose determinism it would preserve.
 - **The server's position is a shadow.** It is reported back as `shadow_position`, marked
   informational in the packet type, and the client must not adopt it — except while the `resync`
-  flag is set, which happens only when a resumed session's claim had to be clamped.
+  flag is set, which happens only when a resumed session's claim, or a report that arrived after
+  `REPORT_WINDOW`, had to be clamped.
 - **No rewind anywhere.** Lag compensation is not implemented; the review argues it should be
   built on collider state, not on motion, and that is the shape the peer colliders take.
-- **Report rejects are counted, never clamped.** `Reject::{DuplicateSeq, StaleTick, TooFast,
-  Teleport}` are metrics and cheat signals. The one deliberate clamp is a resume: the reported
-  position is limited to the fixed resume budget from the parked shadow, not yet scaled by the time
-  since detach (`architecture-review.md` §8).
-- **Terrain is client-side, and peers do not block prediction.** The client predicts against static
-  terrain alone. A hard peer contact arrives as a velocity correction with a normal, not as a
-  position snap; a boss-vs-terrain contact that only the client can see therefore cannot be
-  resolved server-side. The intended client-side collider solve is on the open list.
+- **Rejects are cheat signals, with two deliberate clamps.** `Reject::{DuplicateSeq, StaleTick,
+  TooFast, Teleport}` are counted, not silently repaired: a report inside the window that claims
+  more travel than the server clock allows is rejected. A resume and a report that arrives after
+  `REPORT_WINDOW` are the exceptions — validation cannot distinguish a stall from a cheat there,
+  so the claim is clamped along the claimed direction and the client is told to adopt the
+  placement (`resync`) instead of being rejected for the rest of its life. The resume budget is a
+  fixed 5.4 m, not yet scaled by the time since detach (`docs/architecture-review.md` §8).
+- **Terrain is client-side; peers are replicated, not authoritative.** The client predicts against
+  its own terrain and against the peer colliders the server replicated for the tick it is
+  predicting (`sim::peers`), folding the contact impulse into its velocity before the terrain step.
+  A hard contact still arrives as a velocity correction with a normal, never as a position snap.
+  What the server cannot do is reproduce a contact that depends on terrain — it has none — so a
+  boss-vs-terrain squeeze is only ever resolved on the client.
 - **The simulation tick does not allocate.** The grid, the solver scratch and the snapshot buffer
   are owned and reused, and `crates/sim/tests/allocations.rs` fails the build if a tick starts
   allocating (`docs/architecture-review.md` §7). The guard covers penetrating pairs and correction
@@ -95,7 +104,7 @@ Consequences that are enforced in code, not just documented:
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 112 tests: proto, net, sim, kcc-avian, server, client, packetdump
+cargo test --workspace          # the whole suite: proto, net, sim, kcc-avian, server, client, packetdump
                                  # plus one ignored repro for the correction-stacking defect (§7.7)
 cargo fmt --check
 cargo clippy --workspace --all-targets
@@ -127,30 +136,29 @@ cargo run --release -p server -- --bots 32 --duration 5
 cargo run --release -p server -- --bots 256 --duration 5
 ```
 
-Deterministic seed, no sockets. One machine's numbers, for scale only:
+Deterministic seed, no sockets. The run prints one line per metric; the ones worth reading first:
 
 ```
-                   32 bots     256 bots
-ticks              300         300
-ms_per_tick        0.042       1.128
-solve_us_per_tick  31.4        1038.9
-pairs_last_tick    110         887
-corrections        9017        76451
-headroom_x         393.5       14.8
+ticks               how many ticks it ran
+wall_ms             wall time for the whole run
+ms_per_tick         wall time per tick
+solve_us_per_tick   time in the pair solver, per tick
+pairs_last_tick     pairs the broadphase produced on the final tick
+corrections         velocity deltas the solve emitted over the run
+headroom_x          how many times over the 60 Hz tick budget was met
 ```
 
-`headroom_x` is how many times over the tick budget is met at this bot count. Treat it as "the
-solver is not the bottleneck yet", not as a benchmark. The bots predict at 60 Hz and report in the
-client tick domain, so `rejected_stale` stays at zero.
+Everything else is the reject counters. Run it on your machine — the figures are specific to the
+machine and build that produced them, so read them as "the solver is not the bottleneck yet", not
+as a benchmark. The bots predict at 60 Hz and report in the client tick domain, so
+`rejected_stale` stays at zero.
 
-At 256 bots the solve is about 1.17 µs per pair. Linear extrapolation to 10k players is ~35–40k
-pairs, or ~40–47 ms per tick against the 16.7 ms budget; that is why zone sharding, not a bigger
-core, is the requirement at that scale (`docs/architecture-review.md` §3.4). The 32-bot column
-barely moves between builds because fixed per-tick bookkeeping dominates it; the 256-bot column is
-the one that responds to the data layout. The review pass in `docs/architecture-review.md` §7
-halved it in its own 3 s run (1.96 ms → 0.99 ms) and left `pairs` and `corrections` bit-identical
-*within that run*. The numbers above are a 5 s run of the current build and are not directly
-comparable to the 3 s figures.
+The low bot count is dominated by fixed per-tick bookkeeping and barely moves between builds; the
+high bot count is the one that responds to the data layout, and `solve_us_per_tick / pairs` is the
+per-pair cost to extrapolate from. Do that extrapolation before trusting any scaling argument: the
+pairs-per-tick curve reaches the 16.7 ms budget well before the population one process is expected
+to hold, which is why zone sharding, not a bigger core, is the stated requirement at that scale
+(`docs/architecture-review.md` §3.4).
 
 ### Live round trip
 
@@ -161,9 +169,9 @@ cargo run -p client -- --headless --connect 127.0.0.1:4000
 
 The server binds `0.0.0.0:4000` by default, which accepts peers from other hosts (Windows will ask
 about the firewall rule the first time). Pass `--listen 127.0.0.1:4000` to keep it on loopback; the
-intended default is loopback, and that change is still open (`architecture-review.md` §7.1). Use
-`--connect <host>:4000` on the client to reach any server; the client always binds an unspecified
-local address, not just a local one.
+intended default is loopback, and that change is still open
+(`docs/architecture-review.md` §7.1). Use `--connect <host>:4000` on the client to reach any server;
+the client always binds an unspecified local address, not just a local one.
 
 The headless script is replayed against the real server over Lightyear, paced to real time so
 round trips can complete. It reports `net_sent`, `net_snaps`, `net_corrections` and `net_resyncs`,
@@ -178,14 +186,20 @@ result          ok
 ```
 
 There is no `Hello`: the first movement packet's `player` field binds that link to a player id and
-spawns its shadow at the reported pose. Two clients claiming one id is a known limitation — the
-newest link wins while the body is live. A peer silent for 10 s is dropped, but its shadow is parked
-for `RESUME_WINDOW` (120 s); the next link for the same id is placed from that shadow, and its
-claimed position is clamped to the fixed 5.4 m resume budget (scaling that by the time since detach
-is still open; see `architecture-review.md` §8). A clamped resume makes the client adopt
-`shadow_position` (`net_resyncs` counts those snapshots), so the session continues from where the
-server put it instead of being rejected as a teleport for the rest of its life. After the window,
-the id is a first admission again.
+spawns its shadow at the reported pose. A link may only speak for the player it is bound to — a
+claim for another id is refused as `LinkBoundTo` — and a second link may take the player over only
+once the current owner has been quiet for `REBIND_GRACE` (500 ms); until then the claim is refused
+as `PlayerLive`. A superseded link keeps its binding row but no longer owns the player, so its
+packets are refused as `StaleBinding` and it times out on silence. The binding and the silence
+clock are updated only for accepted packets, so a link that replays duplicates or rejected claims
+cannot keep itself alive. Identity is still just the packet field, so an attacker willing to join
+under a fresh id is outside this check (ADR 006). A peer silent for 10 s is dropped, but its shadow
+is parked for `RESUME_WINDOW` (120 s); the next link for the same id is placed from that shadow,
+and its claimed position is clamped to the fixed 5.4 m resume budget (scaling that by the time
+since detach is still open; see `docs/architecture-review.md` §8). A clamped resume makes the
+client adopt `shadow_position` (`net_resyncs` counts those snapshots), so the session continues
+from where the server put it instead of being rejected as a teleport for the rest of its life.
+After the window, the id is a first admission again.
 
 The client's tick counter starts at zero while the server's has been running since launch, so
 every player carries a `(client tick, server tick)` anchor, re-anchored when a long hitch pushes its
@@ -318,7 +332,7 @@ implementation here diverges where the review concluded the design was wrong:
 | Dialogue | Here | Why |
 | --- | --- | --- |
 | `position_delta` in corrections | none | injects drift against the client's own solver; there is no replay to be deterministic about |
-| client predicts hard collisions | peers do not block prediction; hard contacts arrive as velocity corrections | the client cannot see peer positions reliably, and the server has no terrain to verify them |
+| client predicts hard collisions | the client also solves the replicated peer colliders, against terrain; corrections stay velocity-only | peers reach the client as a tick-keyed collider set, and the server has no terrain to verify a terrain contact |
 | declared velocity validated | position delta between reports validated | declared velocity proves nothing |
 | Soft solve at 20–30 Hz, hard at 60 Hz | one solve per 60 Hz server tick | a subsystem cannot outrun the tick that drives it |
 | exponential ground friction | linear | exponential settles below `max_speed` |
