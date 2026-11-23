@@ -2,9 +2,10 @@
 //!
 //! The client owns terrain and its own position; the server keeps a shadow
 //! position only to (a) validate that reported displacement is physically
-//! plausible and (b) run the capsule-vs-capsule solve that the client cannot do
-//! alone. Nothing here rewinds, and nothing here is "authoritative movement" —
-//! the review calls that out explicitly.
+//! plausible and (b) run the authoritative capsule-vs-capsule solve over the
+//! colliders the client predicts against (`sim::peers`). Nothing here rewinds,
+//! and nothing here is "authoritative movement" — the review calls that out
+//! explicitly.
 //!
 //! A departed player keeps its shadow in a small parked table. Admission cannot
 //! be allowed to trust a first report on a new link: deleting the shadow would
@@ -34,11 +35,11 @@ pub struct SimConfig {
     pub epoch: u32,
     /// Build the peer-collider list into snapshots.
     ///
-    /// Off by default: the client has no consumer for it yet — it predicts its
-    /// own pose and applies corrections, but there is no local peer solve — so
-    /// scanning for peers and putting them on the wire is pure cost. Turn this
-    /// on with the client-side consumer (ADR 011, ADR 015); the selection logic
-    /// and its tests are kept ready for that.
+    /// On by default now that the client has a consumer: `sim::peers` keeps the
+    /// replicated sets in a tick-keyed history and the local tick solves against
+    /// them before the terrain step (ADR 011, ADR 015). Turning it off is still
+    /// supported for a client build without the local solve; it then pays
+    /// neither the AOI scan nor the wire bytes.
     pub replicate_peers: bool,
 }
 
@@ -53,7 +54,7 @@ impl Default for SimConfig {
             report_window: proto::REPORT_WINDOW,
             resume_window: RESUME_WINDOW,
             epoch: 1,
-            replicate_peers: false,
+            replicate_peers: true,
         }
     }
 }
@@ -83,11 +84,7 @@ impl SimConfig {
         origin: (proto::Tick, proto::Tick),
         client: proto::Tick,
     ) -> proto::Tick {
-        let elapsed = i64::from(client.0.wrapping_sub(origin.0.0) as i32);
-        let scaled = elapsed * i64::from(self.tick_hz) / i64::from(proto::CLIENT_TICK_HZ);
-        // `scaled` is an i32-range delta; the cast keeps negative deltas as
-        // two's-complement wrapping sub, which is what `Tick::add` expects.
-        origin.1.add(scaled as u32)
+        proto::map_client_tick(origin, client, self.tick_hz)
     }
 
     /// Largest displacement a resume may claim from the shadow it left behind.

@@ -173,6 +173,14 @@ pub struct Local {
     /// Newest-first inputs, re-sent with each report so a lost one can be filled in.
     pub recent: VecDeque<proto::InputFrame>,
     pub corrections: CorrectionLog,
+    /// History-tracked peer colliders and the local solve against them.
+    pub peers: sim::peers::LocalPeerSolve,
+    /// Anchor mapping the client tick domain onto the server's. Set from the
+    /// first snapshot; used to look the collider set up by server tick.
+    server_origin: Option<(proto::Tick, proto::Tick)>,
+    /// Contacts the local peer solve produced, for diagnostics and tests.
+    pub peer_contacts: u64,
+    pub peer_hard_contacts: u64,
     /// Tick of the last report, so a redelivered frame cannot double-send.
     sent_at: Option<proto::Tick>,
     /// Last report put on the wire, or `None` before the first one.
@@ -187,6 +195,10 @@ impl Default for Local {
             seq: 0,
             recent: VecDeque::with_capacity(proto::MAX_INPUT_FRAMES),
             corrections: CorrectionLog::default(),
+            peers: sim::peers::LocalPeerSolve::default(),
+            server_origin: None,
+            peer_contacts: 0,
+            peer_hard_contacts: 0,
             sent_at: None,
             last_sent: None,
         }
@@ -206,8 +218,34 @@ impl Local {
             ..input
         };
         self.player.tick(&input, proto::CLIENT_TICK_DT);
+        // The peer solve runs before the terrain step, so Avian moves the
+        // character with the impulse already folded into its velocity. Peers
+        // are read from the history at the tick this one predicts, never from
+        // "the latest snapshot": that is what keeps a replay reproducible.
+        self.solve_peers();
         self.recent.push_front(input);
         self.recent.truncate(proto::MAX_INPUT_FRAMES);
+    }
+
+    /// Solves against the peer colliders the server had at the predicted tick.
+    fn solve_peers(&mut self) {
+        let Some(tick) = self.predicted_server_tick() else {
+            return;
+        };
+        let local = sim::collision::Body::player(0, self.player.pos, self.player.vel);
+        let impulse = self.peers.solve(tick, &local, proto::CORRECTION_BUDGET);
+        self.peer_contacts += u64::from(self.peers.contacts);
+        self.peer_hard_contacts += u64::from(self.peers.hard_contacts);
+        if impulse.delta_v != Vec3::ZERO {
+            self.player.vel += impulse.delta_v;
+        }
+    }
+
+    /// The server tick this client tick predicts, or `None` before the first
+    /// snapshot has anchored the two domains.
+    fn predicted_server_tick(&self) -> Option<proto::Tick> {
+        self.server_origin
+            .map(|origin| proto::map_client_tick(origin, self.tick, proto::SERVER_TICK_HZ))
     }
 
     /// The report due for the current tick, or `None` when the server can already
@@ -328,6 +366,7 @@ impl Local {
     /// Applies a snapshot's placement and correction; false when no correction
     /// was applied (a resync-only snapshot returns false).
     pub fn accept_snapshot(&mut self, snapshot: &proto::ServerSnapshot) -> bool {
+        self.record_peers(snapshot);
         if snapshot.resync {
             // A resumed session is placed by the server. This is the one case
             // where the shadow position is adopted instead of predicted;
@@ -345,6 +384,27 @@ impl Local {
         }
         self.player.apply_correction(c);
         true
+    }
+
+    /// Files the snapshot's collider set under the server tick it describes.
+    ///
+    /// The set is keyed by tick, not by arrival order, so two ticks that read
+    /// the same history see the same colliders and a late datagram cannot
+    /// rewrite an older tick's answer.
+    fn record_peers(&mut self, snapshot: &proto::ServerSnapshot) {
+        match self.server_origin {
+            Some(origin) => {
+                let mapped = proto::map_client_tick(origin, self.tick, proto::SERVER_TICK_HZ);
+                // A paused, hitched or restarted client drifts out of the
+                // anchored domain; re-anchor instead of sampling a mapping that
+                // no longer describes the stream.
+                if mapped.since(snapshot.server_tick).abs() > proto::REPORT_WINDOW as i32 {
+                    self.server_origin = Some((self.tick, snapshot.server_tick));
+                }
+            }
+            None => self.server_origin = Some((self.tick, snapshot.server_tick)),
+        }
+        self.peers.record(snapshot.server_tick, &snapshot.peers);
     }
 }
 
@@ -505,5 +565,87 @@ mod tests {
             }
         }
         assert_eq!(acked, Some(1), "the correction ack was suppressed");
+    }
+
+    fn snapshot_with_peers(
+        server_tick: u32,
+        peers: &[proto::PeerCollider],
+    ) -> proto::ServerSnapshot {
+        proto::ServerSnapshot {
+            server_tick: proto::Tick::new(server_tick),
+            peers: peers.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn peer_at(player: u64, x: f32) -> proto::PeerCollider {
+        proto::PeerCollider {
+            player,
+            position: [x, 0.9, 0.0],
+            body_yaw: 0.0,
+            mode: proto::peer_mode::SOFT,
+        }
+    }
+
+    #[test]
+    fn a_replicated_peer_is_solved_locally_before_any_correction_arrives() {
+        let mut with_peer = Local::default();
+        with_peer.player.pos = Vec3::new(0.0, 0.9, 0.0);
+        with_peer.player.vel = Vec3::new(3.0, 0.0, 0.0);
+        with_peer.accept_snapshot(&snapshot_with_peers(10, &[peer_at(2, 0.5)]));
+        with_peer.step(proto::InputFrame::default());
+
+        let mut control = Local::default();
+        control.player.pos = Vec3::new(0.0, 0.9, 0.0);
+        control.player.vel = Vec3::new(3.0, 0.0, 0.0);
+        control.step(proto::InputFrame::default());
+
+        assert_eq!(
+            with_peer.peer_contacts, 1,
+            "the replicated peer was never solved"
+        );
+        assert!(
+            with_peer.player.vel.x < control.player.vel.x - 0.5,
+            "peer did not slow the closing player: {} vs control {}",
+            with_peer.player.vel.x,
+            control.player.vel.x
+        );
+        assert_eq!(control.peer_contacts, 0, "an offline tick invented a peer");
+    }
+
+    #[test]
+    fn a_late_snapshot_cannot_replace_a_newer_collider_set() {
+        let mut local = Local::default();
+        local.player.pos = Vec3::new(0.0, 0.9, 0.0);
+        local.player.vel = Vec3::new(3.0, 0.0, 0.0);
+        // The newer datagram first: the peer is touching the player.
+        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]));
+        // A late datagram from an older tick claiming the peer is far away.
+        local.accept_snapshot(&snapshot_with_peers(20, &[peer_at(2, 20.0)]));
+
+        local.step(proto::InputFrame::default());
+        assert_eq!(
+            local.peer_contacts, 1,
+            "a late datagram rewrote the collider set for a newer tick"
+        );
+    }
+
+    #[test]
+    fn a_resync_places_the_player_and_keeps_the_peer_history() {
+        let mut local = Local::default();
+        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]));
+        local.accept_snapshot(&proto::ServerSnapshot {
+            resync: true,
+            shadow_position: [5.0, 0.9, 5.0],
+            ..snapshot_with_peers(31, &[peer_at(2, 0.5)])
+        });
+
+        assert_eq!(local.player.pos, Vec3::new(5.0, 0.9, 5.0));
+        assert_eq!(local.player.vel, Vec3::ZERO);
+        assert_eq!(
+            local.peers.history().len(),
+            2,
+            "a placement is not a reason to forget collider ticks"
+        );
     }
 }

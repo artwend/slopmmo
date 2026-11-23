@@ -209,6 +209,11 @@ pub struct ServerSnapshot {
     /// except while `resync` is set.
     pub shadow_position: [f32; 3],
     pub correction: Option<CollisionCorrection>,
+    /// Replicated colliders near this player.
+    ///
+    /// The client files the list under `server_tick`, so the local solve reads
+    /// the set that belonged to the tick it predicts rather than "whatever
+    /// arrived last" (`sim::peers::PeerHistory`).
     pub peers: PeerList,
     /// Set while a resumed session has not yet been seen at the server's
     /// placement: the client must adopt `shadow_position`. Kept set until an

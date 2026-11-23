@@ -16,13 +16,10 @@ decisions themselves — as the project owner made them, with verbatim quotes �
 
 ## Where every issue stands
 
-Every point this review raised, sorted into what the repository has closed, what it has deferred,
-and what it has not done. The sections below keep the full argument; this is the working set.
+Every point this review raised, sorted into what the repository has closed and what it has
+not done. The sections below keep the full argument; this is the working set.
 Unnumbered on purpose: ADRs and code comments cite "§2.1", "§7 of the review", so the numbering must
 not move.
-
-**Deferred** means the question is answered *only* because the feature is absent. It is not solved,
-and the section below says what would re-open it. Do not read it as "Closed".
 
 ### Closed
 
@@ -30,26 +27,23 @@ and the section below says what would re-open it. Do not read it as "Closed".
 | --- | --- |
 | §2.1 Frequencies do not add up | 60 Hz tick with every collision mode solved on every tick; the pose the solver reads is dead-reckoned from the last report, so the 30 Hz report cadence no longer leaves it stale (ADR 013, `Simulation::step`). |
 | §2.2 `position_delta` on corrections | Corrections carry `velocity_delta` and `hard_normal` only; the server applies a velocity delta and never a position delta. |
+| §2.3 Predicting hard collision | The client solves the replicated colliders itself (`sim::peers::LocalPeerSolve`) from a tick-keyed history, so a hard contact is resolved against the set that belonged to the predicted tick instead of being predicted blind. |
 | §2.4 "Authoritative movement state" | The struct is a shadow, the wire field is `shadow_position`, and the docs use the same word. |
+| §2.5 Prediction on non-rewound state | Predicted motion reads static terrain plus server-supplied colliders sampled from `PeerHistory` at the predicted tick. Nothing outside that history enters the local solve, and an out-of-order datagram is refused, so a later snapshot cannot change an earlier tick's answer. |
 | §2.6 Soft collision numbers | Inelastic relative-normal impulse, vector-sum budget (`CORRECTION_BUDGET = 2.0`), 5 cm contact dead zone (`SOFT_MARGIN`). |
 | §2.7 Capsule distance on X/Z only | `vertical_overlap` gates every pair. |
 | §2.7 Input channel | `InputChannel` is `UnorderedUnreliable`, not sequenced: a late datagram still delivers its redundancy frames, and the ingest path's per-packet dedupe handles ordering. |
 | §2.7 "Nearest 8" without a radius | `NEIGHBOUR_RADIUS = 2.0` and the K limit both apply. |
 | §2.7 Validation from the self-declared velocity | The displacement check (`\|Δpos\| ≤ v_max · Δt · k`) is the primary rule; the velocity field is only sanity-checked for finiteness and magnitude. |
 | §3.3 Idempotency of corrections | Monotonic `seq` + `epoch`, client `CorrectionLog`, `acked_seq` echoed in the snapshot. Sequence-keyed rather than tick-keyed replay, because there is no rewind to replay. |
-| §3.5 Tick mapping 60/30 | `SimConfig::map_client_tick` scales elapsed client ticks; corrections are stamped with the server tick. Only the combat hit-tick is left, and that is §3.6. |
+| §3.5 Tick mapping 60/30 | `proto::map_client_tick` scales elapsed client ticks and is shared by server ingest and the client's peer-history lookup; corrections are stamped with the server tick. Only the combat hit-tick is left, and that is §3.6. |
 | §3.7 Bevy/Avian API risk | Closed by implementation: `crates/kcc-avian` uses released `avian3d` 0.8's `MoveAndSlide` through the `virtual-character` component/plugin API, and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
+| §4.1 Client-side collider solve | `sim::peers::LocalPeerSolve` samples the replicated collider set at the predicted server tick and runs the same `contact_pair` / `solve_into` path as the server, before the terrain step consumes the velocity. `SimConfig::replicate_peers` is on by default now that the consumer exists. |
 | §5 Correction budget and teleport threshold | `CORRECTION_BUDGET` and the displacement validator set both. The numbers exist; playtest tuning does not. |
+| §5 Peer-collider history | `sim::peers::PeerHistory`: bounded at 32 samples, keyed by server tick, monotonic inserts (a late datagram is refused), interpolated between samples and held — never extrapolated — at the ends. |
 | §5 Server tick: 60 Hz or 30 Hz | 60 Hz, every collision mode solved (ADR 013). |
 | §7 Findings 1–10 (hot path) | All replaced; the zero-allocation guard (§7.4) now exercises penetrating pairs and correction emission, and fails the build if a tick allocates. Finding 11 (the listen default) is a documentation mismatch, not a hot-path defect; it is still open. |
 | §8 Reconnect/resume | The shadow is parked on departure, a resume is clamped to it, and `resync` repeats until a report lands. |
-
-### Deferred
-
-| Item | Why it is not closed |
-| --- | --- |
-| §2.3 Predicting hard collision | Answered by omission today: peers do not block local prediction at all, so the client cannot mispredict them. §4.1's client-side collider solve would re-open it unless the collider set is history-tracked. |
-| §2.5 Prediction on non-rewound state | Same omission: prediction depends on static terrain alone, so there is nothing to rewind. Feeding peer colliders into the local solver re-opens it. |
 
 ### Open
 
@@ -59,11 +53,9 @@ and the section below says what would re-open it. Do not read it as "Closed".
 | §3.2 and §5 Zone handover | No zone or handover code; `epoch` is threaded through corrections and snapshots, but nothing bumps it at a boundary crossing. |
 | §3.4 Arithmetic at 10k | Measured to 256 bots, not closed for 10k. At 256 bots the solve is ~1.04 ms for ~890 pairs (~1.2 µs per pair); linear scaling to 10k is ~35–40k pairs, ~40–47 ms per tick against a 16.7 ms budget. "A few ms/core" needs zone sharding (or a much faster solver), and the per-pair cost needs a phase-level profile before anyone parallelises. |
 | §3.6 Combat lag compensation | No server-side position history and no rewind (ADR 013 open question): hitscan would resolve against current positions. |
-| §4.1 Client-side collider solve | Snapshots carry peer colliders; the client does not feed them into its solver. Doing so is what would re-open §2.3 and §2.5, so it needs the history-tracked collider set first. |
 | §4.2 and §5 Walkability oracle | No coarse grid and no authoring story; the server cannot reject "inside a wall". |
-| §5 Peer-collider history | Whether that set is history-tracked from day one or after the first prototype. |
 | §7.5 Parallel solve, incremental grid | Deferred by decision, not defects: the tick keeps ~15× headroom and the solver owns ~90 % of it, so a parallel solve changes results and needs its own determinism test first. Profile the per-pair cost before building it; the current 1.2 µs/pair is high enough that a better sequential solver may buy more than threads. |
-| §7.7 Correction stacking | The shadow is still `anchor + vel × age`, so a new velocity delta is applied to every tick since the report instead of once, and corrections still on the wire are not discounted. In the 256-bot benchmark corrections run at ~1.0 per bot per tick, so this is the normal path, not an edge case. It needs a per-tick integration plus an in-flight-correction set before the client-side collider solve can be trusted. |
+| §7.7 Correction stacking | The shadow is still `anchor + vel × age`, so a new velocity delta is applied to every tick since the report instead of once, and corrections still on the wire are not discounted. In the 256-bot benchmark corrections run at ~1.0 per bot per tick, so this is the normal path, not an edge case. It needs a per-tick integration plus an in-flight-correction set before the correction channel is the exception path §4.1 describes; the client-side solve is now built and history-tracked, but it predicts against that unpriced channel. |
 | ADR 013 Adaptive snapshot rate | Snapshots are tied to the tick; an adaptive rate needs a client interpolation buffer to be worth anything. |
 | §8 Resume allowance | `resume_travel()` is a fixed 5.4 m, not scaled by the time since detach. A rapid disconnect/reconnect cycle can bank the full amount per cycle. The fix is `min(cap, Δt · v_max · k) + slack`, where `Δt` comes from the parked shadow's tick. |
 | §8 Server-sanctioned displacement | Only a clamped resume has a `resync` path. Respawn, teleport abilities, knockback and mounts have no way to move the shadow: a legitimate large displacement is rejected as `Teleport`, and `v_max` is a constant, so a faster mount trips the same check. Needs a `place_player`-style operation (bump `epoch`, set `needs_resync`, reset the report baseline) and a per-player speed scale. |
@@ -100,9 +92,9 @@ report final position        ──────────────▶    sh
 The client's position is authoritative for terrain. The server's position is a *shadow* — it
 must never be described as authoritative.
 
-Not every line of the left column is built: the client does not separate from peers locally today,
-because it does not feed peer colliders into its solve at all. That is the §4.1 split on the open
-list, and it is why §2.3 and §2.5 are currently answered by omission.
+Every line of the left column is now built: the client samples the replicated peer colliders from a
+tick-keyed history and separates from them in the same tick the terrain solve runs (§4.1). That is
+why §2.3 and §2.5 are closed rather than merely answered by omission.
 
 ---
 
@@ -145,10 +137,11 @@ when it matters — a dash through a shield.
 Resolution: remote players either do not block local prediction at all, or block it without
 being part of the rollback set.
 
-Status: **deferred, not solved.** The shipped client does not feed peer colliders into its solver,
-so it cannot mispredict them. That is the first branch of the resolution, and it holds only while
-the feature is absent. §4.1's client-side collider solve is the second branch and would re-open this
-unless the collider set is history-tracked.
+Status: **closed.** The client feeds peer colliders into its own solve, and the set it reads is
+history-tracked: `sim::peers::PeerHistory` files each replicated set under the server tick it
+describes, refuses out-of-order datagrams, interpolates between samples and holds the ends instead
+of extrapolating. A hard contact is therefore resolved against the collider state that belonged to
+the predicted tick, not against whatever happened to arrive last.
 
 ### 2.4 "Authoritative movement state" is a fiction — **closed**
 
@@ -167,9 +160,10 @@ Resolution: predicted motion may depend **only** on static geometry plus server-
 colliders that are themselves history-tracked. NPCs and decoration are non-blocking for
 prediction.
 
-Status: **deferred for the same reason as §2.3.** Prediction depends on static terrain alone today,
-so there is nothing that would have to be rewound. The moment peer colliders enter the local solve,
-this becomes the gating question again.
+Status: **closed for the same reason as §2.3.** Predicted motion now reads static terrain plus the
+replicated colliders from the tick-keyed history; nothing outside that history enters the local
+solve. A correction arriving later cannot rewrite an earlier tick's collider set, because the
+history refuses an older sample rather than letting it land behind a newer one.
 
 ### 2.6 Soft collision numbers are wrong — **closed**
 
@@ -248,15 +242,19 @@ Consequences: no `EntityCollisionCorrection` carrying impulses, no idempotency p
 is history-tracked too. The server's correction channel becomes an *exception* path, not the
 normal path.
 
-Status: the server half — validation and collider state — is implemented. The client half, feeding
-those colliders into the local solve, is not; it is on the open list, and it is what would re-open
-§2.3 and §2.5 if done without a history-tracked set.
+Status: **implemented on both sides.** The server keeps validation and collider state. The client
+files the replicated colliders into `sim::peers::PeerHistory`, keyed by server tick, and its fixed
+tick solves the local capsule against the set that belonged to the predicted tick — before the
+terrain step consumes the velocity, so terrain and peers are resolved in the same tick. The history
+is what keeps this from re-opening §2.3 and §2.5: an older datagram is refused, the ends are held
+rather than extrapolated, and the contact rule is the server's `collision::contact_pair`, not a
+second definition. `SimConfig::replicate_peers` is now on by default because the consumer exists.
 
-The claim that corrections become an *exception* path is the target state, not the current one. The
-shipped server still synthesises motion from reports and emits an impulse per contact: the 256-bot
-benchmark records **76,451 corrections over 300 ticks**, about one per bot per tick. That is the
-normal path. Until the client half exists, §4.1 describes an inversion to build, not a
-characterisation of the code.
+The claim that corrections become an *exception* path is still the target state, not the current
+one. The shipped server synthesises motion from reports and emits an impulse per contact: the
+256-bot benchmark records **76,451 corrections over 300 ticks**, about one per bot per tick. That is
+the normal path. §7.7's correction stacking is the remaining prerequisite for making it the
+exception path; the client half is built, but it predicts against that unpriced channel.
 
 ### 4.2 A cheap terrain oracle instead of no terrain
 
@@ -271,7 +269,6 @@ needs it before a boss can push anyone.
 
 ## 5. Open questions to resolve before feature work
 
-- Is the client's peer-collider set history-tracked from day one, or after the first prototype?
 - Walkability grid resolution and how it is authored.
 - Handover protocol for collision state across zone boundaries.
 
@@ -284,7 +281,8 @@ A running skeleton that answers the cheapest question first:
 - shared wire protocol (`proto`) — tick-keyed input frames with redundancy, merged
   `PlayerMovementPacket`, aggregated server corrections with idempotency keys, peer colliders;
 - pure simulation crate (`sim`) — kinematic model, spatial hash, soft/hard capsule solve,
-  position validation, all unit-tested without Bevy;
+  position validation, and the client's tick-keyed peer-collider history and local solve, all
+  unit-tested without Bevy;
 - headless Bevy server (`server`) — fixed tick, UDP, N bot clients for load measurement;
 - Bevy client (`client`) — windowed, or `--headless` to run scripted ticks in CI.
 
@@ -476,7 +474,9 @@ in the next solve instead of 2 × `dt`, which can overshoot the contact and re-d
 direction. The benchmark hides the effect because its bots report every tick; it is still the normal
 path in a real session, where the measured rate is ~1.0 correction per bot per tick.
 
-The intended fix has two halves, and both need a test before the client half of §4.1 is built:
+The intended fix has two halves, and both need a test before the correction channel can be trusted
+as the exception path §4.1 describes. The client half of §4.1 is now built and history-tracked, so
+this is the remaining defect on that path:
 
 1. integrate the shadow one tick at a time (`pos += vel * dt`) instead of recomputing it from the
    anchor with the current velocity, so a new delta cannot reach into ticks already integrated;

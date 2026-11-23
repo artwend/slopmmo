@@ -46,8 +46,9 @@ first:
 tie-breaking by id. `crates/sim/src/collision.rs` builds the pair set with the union rule and the
 per-player cap. `MAX_SNAPSHOT_PEERS = 16` is deliberately larger than `K = 8`, so the client can
 know about colliders the server is not currently solving and avoid walking into them. The list is
-only built when `SimConfig::replicate_peers` is on; it defaults to off because the client-side
-consumer does not exist yet (ADR 015), and paying to scan and transmit it would be pure cost.
+built when `SimConfig::replicate_peers` is on, which is the default now that the client-side solve
+exists (ADR 015); the client keeps the replicated sets in a tick-keyed history
+(`sim::peers::PeerHistory`).
 
 ## Open questions
 

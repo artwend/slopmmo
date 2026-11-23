@@ -737,22 +737,21 @@ fn a_clamped_resume_does_not_drift_before_the_next_report() {
 }
 
 #[test]
-fn peer_colliders_are_not_built_until_a_client_consumes_them() {
+fn peer_colliders_are_built_for_the_client_side_solve() {
     let world = StaticWorld::test_room();
     let mut sim = Simulation::new(SimConfig::default());
     sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
     sim.add_player(2, Vec3::new(1.0, 0.9, 0.0));
 
     sim.step(&world);
-    for (_, snapshot) in sim.snapshots() {
-        assert!(
-            snapshot.peers.is_empty(),
-            "peer colliders were built for a client that does not read them"
-        );
-    }
+    let peers = &sim.snapshots()[0].1.peers;
     assert!(
-        !sim.config.replicate_peers,
-        "the shipped configuration must not pay for the peer list"
+        peers.iter().any(|p| p.player == 2),
+        "the shipped configuration must replicate the peer the client solves against"
+    );
+    assert!(
+        sim.config.replicate_peers,
+        "the client-side solve has landed, so the wire side is on by default"
     );
 }
 

@@ -159,6 +159,7 @@ struct Report {
     received: u64,
     corrections: u64,
     resyncs: u64,
+    peer_contacts: u64,
 }
 
 fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
@@ -234,6 +235,7 @@ fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Repo
         received: stats.received,
         corrections: stats.corrections,
         resyncs: stats.resyncs,
+        peer_contacts: local.peer_contacts,
     }
 }
 
@@ -255,6 +257,7 @@ pub fn run(args: &Args) -> ExitCode {
     println!("peak_y          {:.4}", a.peak_y);
     println!("max_abs_x       {:.4}", a.max_abs_x);
     println!("max_abs_z       {:.4}", a.max_abs_z);
+    println!("peer_contacts   {}", a.peer_contacts);
 
     let deterministic = a.pos == b.pos && a.vel == b.vel && a.ticks == b.ticks;
     println!("deterministic   {deterministic}");
@@ -270,6 +273,7 @@ pub fn run(args: &Args) -> ExitCode {
         println!("net_snaps       {}", r.received);
         println!("net_corrections {}", r.corrections);
         println!("net_resyncs     {}", r.resyncs);
+        println!("net_peer_hits   {}", r.peer_contacts);
         if r.received == 0 {
             failures.push("no snapshots from the server");
         }

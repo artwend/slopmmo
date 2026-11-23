@@ -31,6 +31,16 @@ impl Mode {
             Self::Hard => proto::peer_mode::HARD,
         }
     }
+
+    /// Reads a replicated mode. An unknown byte is treated as `None`, so a
+    /// malformed peer collider cannot block prediction.
+    pub fn from_wire(raw: u8) -> Self {
+        match raw {
+            proto::peer_mode::SOFT => Self::Soft,
+            proto::peer_mode::HARD => Self::Hard,
+            _ => Self::None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,7 +157,7 @@ impl PairScratch {
                 insert_nearest(&mut self.nearest, (d, j as u32), neighbour_limit);
             }
 
-            for &(d, j) in &self.nearest {
+            for &(_, j) in &self.nearest {
                 // Each contact is discovered from both sides; keep the one where
                 // the scanning body has the lower index so the list is
                 // de-duplicated.
@@ -159,26 +169,10 @@ impl PairScratch {
                 } else {
                     (j, i as u32)
                 };
-                let a = &bodies[lo as usize];
-                let b = &bodies[hi as usize];
-                let delta = b.pos - a.pos;
-                let horizontal = Vec3::new(delta.x, 0.0, delta.z);
-                let len = horizontal.length();
-                // Perfectly coincident centres: pick a deterministic direction.
-                let normal = if len > 1e-4 {
-                    horizontal / len
-                } else {
-                    Vec3::new(1.0, 0.0, 0.0)
-                };
-                let reach = a.radius + b.radius;
-                self.raw.push(Pair {
-                    a: lo,
-                    b: hi,
-                    normal,
-                    distance: d,
-                    penetration: (reach - d).max(0.0),
-                    mode: contact_mode(a, b),
-                });
+                if let Some(pair) = contact_pair(&bodies[lo as usize], &bodies[hi as usize], lo, hi)
+                {
+                    self.raw.push(pair);
+                }
             }
         }
 
@@ -265,6 +259,42 @@ fn contact_mode(a: &Body, b: &Body) -> Mode {
     } else {
         Mode::None
     }
+}
+
+/// One contact between `a` and `b`, or `None` when the capsules do not touch.
+///
+/// This is the single definition of "a contact" used by the server's
+/// broadphase and by the client's local peer solve: the same vertical-overlap
+/// gate, the same reach plus [`proto::SOFT_MARGIN`], the same normal and the
+/// same mode promotion. The client must not grow a second, slightly different
+/// contact rule or the two solvers disagree by construction.
+pub fn contact_pair(a: &Body, b: &Body, a_index: u32, b_index: u32) -> Option<Pair> {
+    let mode = contact_mode(a, b);
+    if mode == Mode::None || !vertical_overlap(a, b) {
+        return None;
+    }
+    let distance = horizontal_distance(a.pos, b.pos);
+    let reach = a.radius + b.radius;
+    if distance > reach + proto::SOFT_MARGIN {
+        return None;
+    }
+    let delta = b.pos - a.pos;
+    let horizontal = Vec3::new(delta.x, 0.0, delta.z);
+    let len = horizontal.length();
+    // Perfectly coincident centres: pick a deterministic direction.
+    let normal = if len > 1e-4 {
+        horizontal / len
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    Some(Pair {
+        a: a_index,
+        b: b_index,
+        normal,
+        distance,
+        penetration: (reach - distance).max(0.0),
+        mode,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]

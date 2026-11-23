@@ -75,13 +75,14 @@ every tick. `plan_snapshot` decides three things independently: whether anything
 correction that lands between peer refreshes leaves immediately and carries the peer list that was
 last sent, so peer traffic stays capped without delaying corrections. `resync` is exempt: it is a
 rare placement request and the client cannot act on it without the current collider set. A client
-interpolates peers between updates; without that, 30 Hz would be visible (the client-side consumer
-does not exist yet — see the peer-list paragraph).
+interpolates peers between updates; without that, 30 Hz would be visible. The client-side consumer
+now exists: `sim::peers::PeerHistory` keeps the replicated sets keyed by server tick and the fixed
+tick interpolates between them.
 
 **Server, peer list.** `ServerSnapshot::peers` is built only when `SimConfig::replicate_peers` is on.
-The client does not read it — there is no local peer solve yet — so the shipped configuration neither
-scans for peers nor transmits them. The AOI selection and its tests are kept for the consumer that
-lands with ADR 006's remaining plan; enabling the flag is then a one-line change.
+It is on by default now that the client solves against the list; `sim::peers::LocalPeerSolve` reads
+the tick-keyed history before the terrain step. Setting the flag to `false` skips both the AOI scan
+and the wire bytes, for a client build without the local solve.
 
 The simulation still builds a snapshot for every player every tick. The filter lives in the
 transport, so diagnostics, tests and future readers of `Simulation::snapshots()` see the full state.
@@ -98,9 +99,8 @@ transport, so diagnostics, tests and future readers of `Simulation::snapshots()`
   area, the server→client stream is effectively heartbeat-only. Measured on loopback: 184 snapshots
   over a 20 s script (~9/s) versus 77 with the old fixed 250 ms.
 - **Moving peers (when enabled):** with `replicate_peers` on, peer motion goes out at 30 Hz instead
-  of 60 Hz, halving the snapshot stream in a crowd, and corrections ride along at tick rate. With
-  the shipped default off, a moving player generates no snapshots at all: the client predicts its
-  pose, the shadow is not streamed, and corrections still go out on contact.
+  of 60 Hz, halving the snapshot stream in a crowd, and corrections ride along at tick rate. This is
+  the shipped configuration now that the client solves against the peer set.
 - **Loss statistics:** `acked_seq` arrives at the heartbeat rate during quiet periods instead of every
   tick. Nothing in the client consumes it today; this would need revisiting before it is used for
   loss estimation.
@@ -125,15 +125,15 @@ transport, so diagnostics, tests and future readers of `Simulation::snapshots()`
   snapshot when a link is released.
 - `crates/proto/src/lib.rs`: `IDLE_SEND_HZ`, `IDLE_SEND_TICKS`, `IDLE_SPEED_EPSILON`,
   `PEER_UPDATE_HZ`.
-- `crates/sim/src/authority.rs`: `SimConfig::replicate_peers` (default `false`) gates `aoi_peers`.
-  A simulation test pins the default, so the shipped configuration cannot start paying for the peer
-  list unnoticed; the AOI tests turn the flag on to keep the selection covered.
+- `crates/sim/src/authority.rs`: `SimConfig::replicate_peers` (default `true`) gates `aoi_peers`.
+  A simulation test pins the default and the built list, so the shipped configuration cannot
+  silently stop carrying the colliders the client solves against; the AOI tests keep the selection
+  covered.
 
 ## Open questions
 
-- ~~The peer list is transmitted for a consumer that does not exist.~~ Resolved: it is no longer
-  built or sent by default (`SimConfig::replicate_peers`, see below). What remains is the
-  client-side consumer; the switch turns the feature back on with it.
+- ~~The peer list is transmitted for a consumer that does not exist.~~ Resolved: the client-side
+  consumer now exists (`sim::peers`), and `SimConfig::replicate_peers` is on by default.
 - **Peer positions are absolute `f32` triples with a `u64` id per collider.** Millimetre
   fixed-point and a per-connection `u16` peer id would cut a peer entry roughly in half; delta
   encoding against the previous acknowledged peer set would cut it further.

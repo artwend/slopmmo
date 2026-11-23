@@ -145,16 +145,17 @@ Invariants:
 
 The server's collider set is `players ∪ bosses`, replicated to clients with a mode. There is no
 terrain on the server — this is the decision that makes the tick cheap (ADR 012) and the reason
-corrections carry velocity, not position.
+corrections carry velocity, not position. The client solves the replicated set from a tick-keyed
+history before its terrain step (§4.1); the wire list is on by default (`SimConfig::replicate_peers`).
 
 ### 3.3 Pair budget (ADR 011)
 
 `MAX_NEIGHBOURS = 8`, `NEIGHBOUR_RADIUS = 2.0 m`, `MAX_PAIRS_PER_PLAYER = 8` after de-duplication,
 deterministic order by distance then id. `MAX_SNAPSHOT_PEERS = 16` is the AOI replication cap, so a
-client can learn about colliders the server is not currently solving. It is **not built or sent by
-default**: the client has no local peer solve yet, so `SimConfig::replicate_peers` is `false` and the
-shipped server skips both the scan and the bytes. The selection logic and its tests are kept for the
-consumer that lands with ADR 006's remaining plan.
+client can learn about colliders the server is not currently solving. It is **built and sent by
+default**: the client has the local peer solve, so `SimConfig::replicate_peers` is `true` and the
+shipment carries both the scan and the bytes. Turning it off (`false`) skips both, for a client
+build without the solve.
 
 ### 3.4 Replication (ADR 001, ADR 007)
 
@@ -170,10 +171,10 @@ once.
 
 Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while the state changes, ≈ 0.8 KB/s
 at the 10 Hz walking anchor, and ≈ 200 B/s when stationary (4 Hz keepalive, no redundancy frames).
-Server: ≈ 28 B per changed snapshot with the
-peer list off (the shipped default), or ≈ 28 B + 23 B per peer when `SimConfig::replicate_peers` is
-enabled — 1.5 KB/s with 4 peers at 60 Hz, ~7 KB/s at the 16-peer AOI cap. Both are back-of-envelope;
-the peer list is the reason AOI exists, and it stays dark until a client consumes it.
+Server: ≈ 28 B + 23 B per peer when `SimConfig::replicate_peers` is on (the shipped default) —
+1.5 KB/s with 4 peers, ~7 KB/s at the 16-peer AOI cap — or ≈ 28 B per changed snapshot with the
+peer list off. Both are back-of-envelope; the peer list is the reason AOI exists, and it is on
+because the client's local solve reads it.
 
 Neither side streams on a fixed cadence any more (ADR 015). The client stays silent while its input,
 pose, grounding and correction acknowledgement are unchanged — including while walking at a steady
@@ -281,7 +282,7 @@ create → auth → character select → place in zone instance → play → han
 | Peer refresh rate | 30 Hz, independent of the tick | `proto::PEER_UPDATE_HZ` |
 | Client packet | ~81 B | `proto::PlayerMovementPacket` |
 | Snapshot | 28 B + 23 B per peer | `proto::ServerSnapshot` |
-| Peer cap in snapshot | 16 when enabled; list omitted in the shipped config | `proto::MAX_SNAPSHOT_PEERS`, `SimConfig::replicate_peers` |
+| Peer cap in snapshot | 16, enabled in the shipped config | `proto::MAX_SNAPSHOT_PEERS`, `SimConfig::replicate_peers` |
 | Neighbour cap | 8 | `proto::MAX_NEIGHBOURS` |
 | Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
 | Report window | 30 server ticks (0.5 s) | `proto::REPORT_WINDOW` |
@@ -289,7 +290,7 @@ create → auth → character select → place in zone instance → play → han
 | Resume travel allowance | 5.4 m fixed cap; not yet scaled by time since detach | `SimConfig::resume_travel()` |
 | Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
 | Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.023 ms at 32 bots, 0.436 ms at 256 bots (0.040 / 1.139 with the peer AOI enabled) | `server --bots N --duration 5` |
+| Measured tick cost | 0.040 ms at 32 bots, 1.139 ms at 256 bots with the peer AOI on (the shipped config); 0.023 / 0.436 ms with it off | `server --bots N --duration 5` |
 | Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
@@ -308,7 +309,8 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | --- | --- |
 | Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
 | Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc-avian`) |
-| Client-side peer-collider solve | Absent — and the wire side is off by default (`SimConfig::replicate_peers`) so nothing is paid for until the solve exists |
+| Client-side peer-collider solve | Implemented — `sim::peers::LocalPeerSolve` samples the tick-keyed collider history and solves before the terrain step; `SimConfig::replicate_peers` is on |
+| Peer-collider history | Implemented — `sim::peers::PeerHistory`, 32 tick-keyed samples, monotonic, interpolated, held (not extrapolated) at the ends |
 | Server shadow + validation | Implemented |
 | Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
 | Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |

@@ -132,6 +132,24 @@ impl Tick {
     }
 }
 
+/// Maps a client tick onto the server tick domain anchored by `origin`, a
+/// `(client tick, server tick)` pair.
+///
+/// The two clocks do not share a rate: the client predicts at
+/// [`CLIENT_TICK_HZ`], the server ticks at `server_tick_hz`. Elapsed client
+/// ticks are therefore scaled, not added one-for-one.
+///
+/// Shared by the server's ingest validation and the client's peer-collider
+/// history lookup, so a collider set is sampled at exactly the tick the server
+/// would have keyed it at.
+pub fn map_client_tick(origin: (Tick, Tick), client: Tick, server_tick_hz: u32) -> Tick {
+    let elapsed = i64::from(client.0.wrapping_sub(origin.0.0) as i32);
+    let scaled = elapsed * i64::from(server_tick_hz) / i64::from(CLIENT_TICK_HZ);
+    // `scaled` is an i32-range delta; the cast keeps negative deltas as
+    // two's-complement wrapping sub, which is what `Tick::add` expects.
+    origin.1.add(scaled as u32)
+}
+
 /// One input sample, addressed to the tick it was produced on.
 ///
 /// `move_x`/`move_z` are the camera-relative stick, quantised to `-127..=127`.
