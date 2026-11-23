@@ -121,6 +121,9 @@ pub struct SimStats {
     pub wrong_version: u32,
     pub resumed: u32,
     pub resume_clamped: u32,
+    /// Reports that arrived after [`SimConfig::report_window`] and had their
+    /// claimed travel clamped to what that window allows.
+    pub late_clamped: u32,
     pub pairs: u32,
     pub corrections: u32,
     pub hard_contacts: u32,
@@ -392,17 +395,8 @@ impl Simulation {
 
         let report = &packet.report;
         let reported = Vec3::from_array(report.position);
-        let offset = reported - shadow.pos;
-        let claim = offset.length();
         let allowed = self.config.resume_travel();
-        let clamped = !claim.is_finite() || claim > allowed;
-        let pos = if !claim.is_finite() {
-            shadow.pos
-        } else if clamped {
-            shadow.pos + offset / claim * allowed
-        } else {
-            reported
-        };
+        let (pos, clamped) = clamp_claim(shadow.pos, reported, allowed);
 
         let now = self.tick;
         let player = self.add_player(packet.player, pos);
@@ -479,8 +473,14 @@ impl Simulation {
         };
         let player = &mut players[slot as usize];
 
-        // Wrap-aware monotonic sequence. Equal or older is a duplicate retransmit.
-        if packet.seq <= player.last_seq && player.last_seq.wrapping_sub(packet.seq) < 0x8000 {
+        // Wrap-aware monotonic sequence. `ahead` is the distance forward modulo
+        // `u16`: zero is a retransmit and anything at or beyond half the space
+        // is behind. Comparing the raw numbers instead let a late pre-wrap
+        // packet (`last_seq = 2`, `seq = 65530`) through as if it were new and
+        // moved the shadow backwards; at 30 Hz the counter wraps every ~36
+        // minutes.
+        let ahead = packet.seq.wrapping_sub(player.last_seq);
+        if ahead == 0 || ahead >= 0x8000 {
             stats.duplicate += 1;
             return Err(Reject::DuplicateSeq);
         }
@@ -547,14 +547,33 @@ impl Simulation {
         // the subtraction negative and clamped the allowance to a single tick:
         // a legitimate catch-up report after a stalled stream was rejected as a
         // teleport and the shadow could never be re-synced.
-        let elapsed = player.last_server_tick.since(*tick).max(1) as f32;
+        //
+        // Capped at `report_window`, the allowance the resume path already gives
+        // a client that was gone. Without the ceiling a client that withheld
+        // reports for ten seconds banked ten seconds of travel and could claim a
+        // cross-map jump the moment it spoke again.
+        let window = config.report_window.min(i32::MAX as u32) as i32;
+        let since_report = player.last_server_tick.since(*tick).max(1);
+        let late = since_report > window;
+        let elapsed = since_report.min(window) as f32;
         let allowed =
             proto::MAX_SPEED * config.speed_slack * elapsed * config.dt() + proto::POSITION_SLACK;
         let travelled = (pos - player.anchor_pos).length();
-        if travelled > allowed {
+        let clamped = travelled > allowed;
+        if clamped && !late {
             stats.teleport += 1;
             return Err(Reject::Teleport);
         }
+        // A report past the window cannot be validated: rejecting a legitimate
+        // catch-up left the shadow permanently unsynced, so it is placed at the
+        // cap instead and the client is told to adopt that placement.
+        let pos = if clamped {
+            stats.late_clamped += 1;
+            let (placed, _) = clamp_claim(player.anchor_pos, pos, allowed);
+            placed
+        } else {
+            pos
+        };
 
         // The anchor is the only pose extrapolation and the displacement check
         // may start from; `pos` will be advanced by the tick.
@@ -568,8 +587,9 @@ impl Simulation {
         player.last_seq = packet.seq;
         player.last_tick = report.tick;
         player.last_server_tick = *tick;
-        // An accepted report proves the session is at the server's placement.
-        player.needs_resync = false;
+        // A report accepted as placed proves the session is where the server
+        // put it; a clamped one has just been moved, so it needs the resync.
+        player.needs_resync = clamped;
 
         stats.accepted += 1;
         Ok(())
@@ -691,6 +711,27 @@ impl Simulation {
         }
         vel
     }
+}
+
+/// Places a claimed position no farther than `allowed` from `from`.
+///
+/// Returns the placement and whether the claim had to be clamped. A non-finite
+/// claim resolves to `from`. Shared by a resume and by a report that arrived
+/// too late to validate: neither can be checked against a plausible
+/// displacement, so both land somewhere the client can be told to adopt
+/// (`needs_resync`) instead of being rejected outright.
+fn clamp_claim(from: Vec3, reported: Vec3, allowed: f32) -> (Vec3, bool) {
+    let offset = reported - from;
+    let claim = offset.length();
+    let clamped = !claim.is_finite() || claim > allowed;
+    let pos = if !claim.is_finite() {
+        from
+    } else if clamped {
+        from + offset / claim * allowed
+    } else {
+        reported
+    };
+    (pos, clamped)
 }
 
 fn push_out_of_blockers(_players: &mut [ServerPlayer], _world: &StaticWorld, _dt: f32) {

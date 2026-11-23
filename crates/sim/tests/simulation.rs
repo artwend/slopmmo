@@ -358,6 +358,46 @@ fn duplicate_and_stale_packets_are_rejected_without_moving_the_shadow() {
 }
 
 #[test]
+fn sequence_numbers_are_compared_across_the_u16_wrap() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::ZERO);
+    sim.player_mut(1).unwrap().last_seq = u16::MAX - 1;
+
+    // The newest packet before the counter wraps.
+    assert_eq!(
+        sim.ingest(&packet(u16::MAX, 0, 1, Vec3::ZERO, Vec3::ZERO)),
+        Ok(())
+    );
+
+    // The client's counter wrapped, so a small seq is newer than the largest.
+    sim.tick = Tick::new(101);
+    assert_eq!(
+        sim.ingest(&packet(1, 1, 1, Vec3::ZERO, Vec3::ZERO)),
+        Ok(()),
+        "the first packet after the wrap was taken for a replay"
+    );
+    assert_eq!(sim.player(1).unwrap().last_seq, 1);
+
+    // A late packet from just before the wrap is older, not newer: comparing
+    // the raw numbers accepted it as new and moved the shadow backwards.
+    sim.tick = Tick::new(102);
+    assert_eq!(
+        sim.ingest(&packet(u16::MAX, 2, 1, Vec3::ZERO, Vec3::ZERO)),
+        Err(Reject::DuplicateSeq),
+        "a pre-wrap packet was accepted as new"
+    );
+
+    // The exact case from the review: `last_seq = 2`, `seq = 65530`.
+    sim.player_mut(1).unwrap().last_seq = 2;
+    sim.tick = Tick::new(103);
+    assert_eq!(
+        sim.ingest(&packet(65530, 3, 1, Vec3::ZERO, Vec3::ZERO)),
+        Err(Reject::DuplicateSeq)
+    );
+}
+
+#[test]
 fn a_client_clock_unrelated_to_the_server_tick_still_joins() {
     let mut sim = Simulation::new(SimConfig::default());
     sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
@@ -732,6 +772,55 @@ fn a_stalled_report_stream_catches_up_within_the_window() {
         "a legitimate catch-up after a stalled stream was rejected"
     );
     assert_eq!(sim.player(1).unwrap().anchor_pos, caught_up);
+}
+
+#[test]
+fn a_silent_client_cannot_bank_travel_past_the_report_window() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.tick = Tick::new(100);
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+    let start = packet(1, 100, 1, Vec3::new(0.0, 0.9, 0.0), Vec3::ZERO);
+    assert_eq!(sim.ingest(&start), Ok(()));
+
+    // The client keeps ticking but stops reporting for 9.5 s, then claims a
+    // cross-map position. Its own clock is fresh, so only the server's clock can
+    // bound the travel, and that allowance is capped at the report window.
+    let silence = proto::SERVER_TICK_HZ * 9 + proto::SERVER_TICK_HZ / 2;
+    sim.tick = Tick::new(100 + silence);
+    let claim = Vec3::new(80.0, 0.9, 0.0);
+    let late = packet(2, 100 + silence, 1, claim, Vec3::ZERO);
+    assert_eq!(
+        sim.ingest(&late),
+        Ok(()),
+        "a long-delayed report was rejected outright instead of clamped"
+    );
+
+    let p = sim.player(1).unwrap();
+    assert!(p.needs_resync, "a clamped report did not ask for a resync");
+    let allowed = sim.config.resume_travel();
+    assert!(
+        (p.anchor_pos.x - allowed).abs() < 1e-3,
+        "clamped to {} instead of the {allowed} m the window allows",
+        p.anchor_pos.x
+    );
+    assert!(
+        (p.anchor_pos.y - 0.9).abs() < 1e-6,
+        "the clamp left the floor"
+    );
+    assert_eq!(sim.stats.late_clamped, 1);
+    assert_eq!(sim.stats.teleport, 0);
+
+    // A catch-up that fits the capped allowance is still taken as reported: the
+    // cap must not turn every delayed stream into a resync.
+    let placed = sim.player(1).unwrap().anchor_pos;
+    sim.tick = Tick::new(100 + 2 * silence);
+    let close = placed + Vec3::new(2.0, 0.0, 0.0);
+    let catch_up = packet(3, 100 + 2 * silence, 1, close, Vec3::ZERO);
+    assert_eq!(sim.ingest(&catch_up), Ok(()));
+    let p = sim.player(1).unwrap();
+    assert_eq!(p.anchor_pos, close);
+    assert!(!p.needs_resync);
+    assert_eq!(sim.stats.late_clamped, 1);
 }
 
 #[test]

@@ -127,9 +127,15 @@ pub struct Peers {
     pub snapshots_skipped: u64,
     /// Corrections the client acknowledged.
     pub correction_acked: u64,
-    /// Packets dropped because a link already spoke for another player, or
-    /// because the player already had a live link.
+    /// Packets dropped because a link already spoke for another player, because
+    /// the player already had a live link, or because the link's binding was
+    /// superseded.
     pub rejected_bind: u64,
+    /// Packets the simulation's validator refused, excluding duplicate sequence
+    /// numbers (a retransmitting link produces those routinely). Logged on
+    /// powers of two: a client claiming a teleport every tick must not be able
+    /// to flood the log.
+    pub rejected_packet: u64,
     /// Packets dropped for a `PROTOCOL_VERSION` mismatch.
     pub rejected_version: u64,
     /// Links the server tore down (timeout, orphan, or over the link cap).
@@ -242,6 +248,11 @@ enum Admission {
     LinkBoundTo(u64),
     /// Another link still owns this player and is still talking.
     PlayerLive(Entity),
+    /// This link is still bound to the player, but the player has since been
+    /// handed to another link (or to none). Honouring the stale binding let a
+    /// superseded link flip snapshot routing back, so two links could
+    /// ping-pong ownership of one player.
+    StaleBinding,
 }
 
 /// Whether a packet from `link` may be admitted, and if not, why.
@@ -259,11 +270,16 @@ fn admission(
         return Admission::WrongVersion;
     }
     if let Some(bound) = peers.player_of.get(&link).copied() {
-        return if bound == packet.player {
-            Admission::Accept
-        } else {
-            Admission::LinkBoundTo(bound)
-        };
+        if bound != packet.player {
+            return Admission::LinkBoundTo(bound);
+        }
+        // A binding is only as good as the ownership table: after a takeover
+        // the superseded link keeps its stale binding, and trusting it let the
+        // pair keep passing packets for the same player.
+        if peers.entity_of.get(&bound) != Some(&link) {
+            return Admission::StaleBinding;
+        }
+        return Admission::Accept;
     }
     if let Some(other) = peers.entity_of.get(&packet.player).copied()
         && other != link
@@ -386,22 +402,41 @@ fn ingest(
                 Admission::LinkBoundTo(bound) => {
                     // Rebinding a link on every packet let any client take over
                     // another player's shadow, and let a delayed datagram from a
-                    // superseded address steal the binding back.
+                    // superseded address steal the binding back. Logged on powers
+                    // of two: a claim sent every tick must not flood the log.
                     peers.rejected_bind += 1;
-                    info!(
-                        "link {entity} is bound to player {bound}; ignoring a claim for {}",
-                        packet.player
-                    );
+                    if peers.rejected_bind.is_power_of_two() {
+                        info!(
+                            "link {entity} is bound to player {bound}; ignoring a claim for {} ({} rejected)",
+                            packet.player, peers.rejected_bind
+                        );
+                    }
                     continue;
                 }
                 Admission::PlayerLive(other) => {
                     // The player already has a link that is still talking; only
                     // one that has gone quiet may be replaced.
                     peers.rejected_bind += 1;
-                    info!(
-                        "player {} already has live link {other}; refusing {entity}",
-                        packet.player
-                    );
+                    if peers.rejected_bind.is_power_of_two() {
+                        info!(
+                            "player {} already has live link {other}; refusing {entity} ({} rejected)",
+                            packet.player, peers.rejected_bind
+                        );
+                    }
+                    continue;
+                }
+                Admission::StaleBinding => {
+                    // The link's binding outlived the takeover that superseded
+                    // it. Honouring it would route every snapshot back to this
+                    // link, so it is treated as a link that never bound: it
+                    // times out on silence instead of refreshing `last_seen`.
+                    peers.rejected_bind += 1;
+                    if peers.rejected_bind.is_power_of_two() {
+                        info!(
+                            "link {entity} lost player {} to another link; refusing its claim ({} rejected)",
+                            packet.player, peers.rejected_bind
+                        );
+                    }
                     continue;
                 }
             }
@@ -414,32 +449,57 @@ fn ingest(
                 packet.report.applied_correction_seq,
             );
 
-            let mut consumed = false;
-            if !game.0.sim.contains_player(packet.player) {
-                if let Some(resume) = game.0.sim.resume_player(&packet) {
-                    // `resume_player` consumed this report: it placed the body
-                    // and armed the seq/tick baseline from it. Re-ingesting it
-                    // would let the claim undo its own clamp.
-                    peers.resumed += 1;
-                    if resume.clamped {
-                        peers.resume_clamped += 1;
-                        info!(
-                            "player {} resumed at {:?}, clamped from {:?}",
-                            packet.player, resume.pos, resume.reported
-                        );
-                    } else {
-                        info!("player {} resumed at {:?}", packet.player, resume.pos);
+            // The packet must be accepted before it may touch the link's
+            // binding. Refreshing `last_seen` for anything admitted let a link
+            // that only replayed duplicates or rejected claims keep itself alive
+            // forever, so `PEER_TIMEOUT` never fired.
+            let accepted = if game.0.sim.contains_player(packet.player) {
+                match game.0.sim.ingest(&packet) {
+                    Ok(()) => true,
+                    Err(reject) => {
+                        if reject != Reject::DuplicateSeq {
+                            // A client claiming a teleport every tick used to
+                            // write one line per packet; report on powers of two
+                            // so a persistent offender stays visible.
+                            peers.rejected_packet += 1;
+                            if peers.rejected_packet.is_power_of_two() {
+                                info!(
+                                    "rejected packet from player {}: {reject:?} ({} rejected)",
+                                    packet.player, peers.rejected_packet
+                                );
+                            }
+                        }
+                        false
                     }
-                    consumed = true;
-                } else {
-                    // First sight of this identity: admission trusts the report.
-                    // A real deployment authenticates the session here and
-                    // spawns at a zone-defined point instead.
-                    let pos = Vec3::from_array(packet.report.position);
-                    game.0.sim.add_player(packet.player, pos);
-                    peers.admitted += 1;
-                    info!("admitted player {} on link {entity}", packet.player);
                 }
+            } else if let Some(resume) = game.0.sim.resume_player(&packet) {
+                // `resume_player` consumed this report: it placed the body
+                // and armed the seq/tick baseline from it. Re-ingesting it
+                // would let the claim undo its own clamp.
+                peers.resumed += 1;
+                if resume.clamped {
+                    peers.resume_clamped += 1;
+                    info!(
+                        "player {} resumed at {:?}, clamped from {:?}",
+                        packet.player, resume.pos, resume.reported
+                    );
+                } else {
+                    info!("player {} resumed at {:?}", packet.player, resume.pos);
+                }
+                true
+            } else {
+                // First sight of this identity: admission trusts the report.
+                // A real deployment authenticates the session here and
+                // spawns at a zone-defined point instead.
+                let pos = Vec3::from_array(packet.report.position);
+                game.0.sim.add_player(packet.player, pos);
+                peers.admitted += 1;
+                info!("admitted player {} on link {entity}", packet.player);
+                true
+            };
+
+            if !accepted {
+                continue;
             }
 
             if !peers.player_of.contains_key(&entity)
@@ -457,13 +517,6 @@ fn ingest(
             peers.player_of.insert(entity, packet.player);
             peers.entity_of.insert(packet.player, entity);
             peers.last_seen.insert(entity, now);
-
-            if !consumed
-                && let Err(reject) = game.0.sim.ingest(&packet)
-                && reject != Reject::DuplicateSeq
-            {
-                info!("rejected packet from player {}: {reject:?}", packet.player);
-            }
         }
     }
 }
@@ -1011,6 +1064,7 @@ mod tests {
         let link = world.spawn_empty().id();
         let mut peers = Peers::default();
         peers.player_of.insert(link, 7);
+        peers.entity_of.insert(7, link);
         peers.last_seen.insert(link, now);
 
         assert_eq!(
@@ -1022,6 +1076,27 @@ mod tests {
             Admission::LinkBoundTo(7),
             "a bound link took over another player"
         );
+    }
+
+    #[test]
+    fn a_superseded_link_cannot_take_its_player_back() {
+        let now = Instant::now();
+        let mut world = World::new();
+        let old = world.spawn_empty().id();
+        let new = world.spawn_empty().id();
+        let mut peers = Peers::default();
+        // Both links still carry a binding; only `new` owns the player.
+        peers.player_of.insert(old, 7);
+        peers.player_of.insert(new, 7);
+        peers.entity_of.insert(7, new);
+        peers.last_seen.insert(new, now);
+
+        assert_eq!(
+            admission(&claiming(7), old, &peers, now),
+            Admission::StaleBinding,
+            "a superseded link took the player back and could flip routing"
+        );
+        assert_eq!(admission(&claiming(7), new, &peers, now), Admission::Accept);
     }
 
     #[test]

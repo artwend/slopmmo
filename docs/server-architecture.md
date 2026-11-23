@@ -128,7 +128,10 @@ Invariants:
   its claim is clamped to the travel possible since the last accepted report. Reconnecting is never
   a way to move.
 - Travel is measured against the **server's** ticks since the last accepted report, never against
-  the client-declared report tick. The report tick decides staleness and ordering only.
+  the client-declared report tick. The report tick decides staleness and ordering only. That
+  elapsed time is capped at `REPORT_WINDOW`: a client that goes quiet cannot bank the silence as
+  travel, and a report past the cap that overshoots is clamped to the cap and answered with
+  `resync` instead of being rejected.
 - Everything is deterministic: fixed `dt`, tie-broken iteration order, no wall-clock input.
 - The steady state **does not allocate** and does not block. See §3.5.
 

@@ -530,7 +530,12 @@ The fix keeps that check's baseline instead of deleting it:
   elapsed since the last accepted report, not from the difference between the report's own tick
   fields. The report tick is client data; measuring with it let a forged tick jump — which the clock
   re-anchor deliberately accepts — buy an unbounded allowance, so the clamp could be walked back one
-  packet later.
+  packet later. The elapsed count is capped at `REPORT_WINDOW` (the same allowance the resume path
+  uses), so a client that withholds reports for ten seconds cannot bank ten seconds of travel. A
+  report past that window that overshoots the cap takes the resume path's treatment rather than
+  `Reject::Teleport`: it is clamped along the claimed direction, accepted, and answered with
+  `resync`. Rejecting a legitimate catch-up was the earlier bug — the shadow could never be
+  re-synced.
 - **The client is told to adopt the placement.** A clamped resume sets `resync` on the player's
   snapshots. The client applies `shadow_position` (and zeroes its velocity) while the flag is set;
   the server clears it on the first accepted report. Repeating it matters: the snapshot channel is
