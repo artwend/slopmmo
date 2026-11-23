@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 proto.workspace = true
 bevy_math = "0.20"
+# `Aabb3d` moved out of `bevy_math` in 0.20. Default features would only add `rand`.
+bevy_shape = { version = "0.20", default-features = false, features = ["std"] }

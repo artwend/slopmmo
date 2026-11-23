@@ -21,12 +21,13 @@ pub mod spatial;
 pub mod world;
 
 pub use authority::{Reject, Resume, ServerPlayer, SimConfig, SimStats, Simulation};
+pub use bevy_shape::Aabb3d;
 pub use collision::{Body, Impulse, Mode, Pair, PairScratch};
 pub use kcc::{Capsule, KccParams, MoveOutput};
 pub use movement::{MoveParams, step_velocity};
 pub use peers::{LocalPeerSolve, PEER_HISTORY_DEPTH, PeerHistory, SampledPeer};
 pub use spatial::SpatialGrid;
-pub use world::{Aabb, StaticWorld};
+pub use world::{Aabb3dExt, StaticWorld};
 
 pub use collision::{build_pairs, solve, solve_into};
 pub use kcc::move_and_slide;

@@ -10,8 +10,9 @@
 //! is flat.
 
 use bevy_math::Vec3;
+use bevy_shape::Aabb3d;
 
-use crate::world::StaticWorld;
+use crate::world::{Aabb3dExt, StaticWorld};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Capsule {
@@ -172,7 +173,7 @@ pub fn move_and_slide(
 /// direction, so a capsule driven exactly along that diagonal is stopped rather
 /// than deflected. That is correct for a sharp corner; content that wants
 /// rounded corners should bevel the collision geometry.
-pub fn contact(capsule: &Capsule, aabb: &crate::world::Aabb, pos: Vec3) -> Option<(Vec3, f32)> {
+pub fn contact(capsule: &Capsule, aabb: &Aabb3d, pos: Vec3) -> Option<(Vec3, f32)> {
     let (a, b) = capsule.segment(pos);
     let on_box = aabb.closest_to_vertical_segment(pos.x, pos.z, a.y, b.y);
     let sy = on_box.y.clamp(a.y, b.y);

@@ -52,9 +52,9 @@ pub fn spawn_terrain(world: &mut World, terrain: &sim::StaticWorld) {
     }
 }
 
-pub fn terrain_bundle(b: &sim::Aabb) -> impl Bundle {
+pub fn terrain_bundle(b: &sim::Aabb3d) -> impl Bundle {
     let size = b.max - b.min;
-    let centre = (b.max + b.min) * 0.5;
+    let centre = Vec3::from((b.max + b.min) * 0.5);
     (
         RigidBody::Static,
         Collider::cuboid(size.x, size.y, size.z),

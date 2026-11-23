@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use kcc_avian::prelude::*;
-use sim::Aabb;
+use sim::Aabb3d;
 use sim::world::StaticWorld;
 
 const GRAVITY: f32 = -24.0;
@@ -34,7 +34,7 @@ impl Rig {
             app.world_mut().spawn((
                 RigidBody::Static,
                 Collider::cuboid(size.x, size.y, size.z),
-                Position::from(centre),
+                Position::from(Vec3::from(centre)),
                 Rotation::default(),
             ));
         }
@@ -158,11 +158,11 @@ fn pillar_contact_slides_along_the_surface() {
 #[test]
 fn kcc_does_not_climb_a_ledge_taller_than_the_capsule_radius() {
     let mut world = StaticWorld::new();
-    world.add(Aabb::new(
+    world.add(Aabb3d::new(
         Vec3::new(0.0, -0.5, 0.0),
         Vec3::new(20.0, 0.5, 20.0),
     ));
-    world.add(Aabb::from_min_max(
+    world.add(Aabb3d::from_min_max(
         Vec3::new(3.0, 0.0, -5.0),
         Vec3::new(10.0, 0.9, 5.0),
     ));

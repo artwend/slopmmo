@@ -13,7 +13,7 @@ use sim::kcc::{self, Capsule, KccParams};
 use sim::movement::{self, MoveParams};
 use sim::spatial::SpatialGrid;
 use sim::world::StaticWorld;
-use sim::{Aabb, move_and_slide};
+use sim::{Aabb3d, move_and_slide};
 
 /// The KCC and movement model are client-side, so these tests step them at the
 /// client prediction rate. Server-side tests use `SimConfig::dt()`.
@@ -984,13 +984,13 @@ fn corrections_are_integrated_once_per_tick() {
 #[test]
 fn kcc_does_not_climb_a_ledge_taller_than_the_capsule_radius() {
     let mut world = StaticWorld::new();
-    world.add(Aabb::new(
+    world.add(Aabb3d::new(
         Vec3::new(0.0, -0.5, 0.0),
         Vec3::new(20.0, 0.5, 20.0),
     ));
     // 0.9 m ledge: taller than the 0.4 m capsule radius, so no amount of
     // corner rounding should let the capsule walk onto it without a jump.
-    world.add(Aabb::from_min_max(
+    world.add(Aabb3d::from_min_max(
         Vec3::new(3.0, 0.0, -5.0),
         Vec3::new(10.0, 0.9, 5.0),
     ));

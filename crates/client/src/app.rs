@@ -85,7 +85,7 @@ fn setup(
             } else {
                 stone.clone()
             }),
-            Transform::from_translation(centre),
+            Transform::from_translation(Vec3::from(centre)),
             character::terrain_bundle(b),
         ));
     }
