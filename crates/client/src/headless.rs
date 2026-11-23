@@ -159,6 +159,8 @@ struct Report {
     received: u64,
     corrections: u64,
     resyncs: u64,
+    unacked: u16,
+    disconnects: u64,
     peer_contacts: u64,
 }
 
@@ -235,6 +237,8 @@ fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Repo
         received: stats.received,
         corrections: stats.corrections,
         resyncs: stats.resyncs,
+        unacked: stats.unacked,
+        disconnects: stats.disconnects,
         peer_contacts: local.peer_contacts,
     }
 }
@@ -273,9 +277,14 @@ pub fn run(args: &Args) -> ExitCode {
         println!("net_snaps       {}", r.received);
         println!("net_corrections {}", r.corrections);
         println!("net_resyncs     {}", r.resyncs);
+        println!("net_unacked     {}", r.unacked);
+        println!("net_disconnects {}", r.disconnects);
         println!("net_peer_hits   {}", r.peer_contacts);
         if r.received == 0 {
             failures.push("no snapshots from the server");
+        }
+        if r.disconnects > 0 {
+            failures.push("the live link closed");
         }
     }
 
@@ -353,9 +362,12 @@ mod tests {
             }),
             ..default()
         };
-        assert!(local.accept_snapshot(&snapshot));
+        assert!(local.accept_snapshot(&snapshot, 0));
         let after_first = local.player.vel;
-        assert!(!local.accept_snapshot(&snapshot), "duplicate applied twice");
+        assert!(
+            !local.accept_snapshot(&snapshot, 0),
+            "duplicate applied twice"
+        );
         assert_eq!(local.player.vel, after_first);
     }
 
@@ -363,16 +375,19 @@ mod tests {
     fn hard_normal_removes_velocity_into_the_wall() {
         let mut local = Local::default();
         local.player.vel = Vec3::new(-4.0, 0.0, 0.0);
-        let applied = local.accept_snapshot(&proto::ServerSnapshot {
-            correction: Some(proto::CollisionCorrection {
-                seq: 1,
-                tick: proto::Tick::new(1),
-                epoch: 1,
-                velocity_delta: [0.0, 0.0, 0.0],
-                hard_normal: Some([1.0, 0.0, 0.0]),
-            }),
-            ..default()
-        });
+        let applied = local.accept_snapshot(
+            &proto::ServerSnapshot {
+                correction: Some(proto::CollisionCorrection {
+                    seq: 1,
+                    tick: proto::Tick::new(1),
+                    epoch: 1,
+                    velocity_delta: [0.0, 0.0, 0.0],
+                    hard_normal: Some([1.0, 0.0, 0.0]),
+                }),
+                ..default()
+            },
+            0,
+        );
         assert!(applied);
         assert!(
             local.player.vel.x >= -1e-4,

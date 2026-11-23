@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use lightyear::connection::client::Disconnecting;
+use lightyear::connection::client::{Disconnected, Disconnecting};
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
 
@@ -22,6 +22,30 @@ use sim::authority::Reject;
 ///
 /// UDP has no disconnect, so silence is the only signal that a client is gone.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a live link keeps its player before another link may take it over.
+///
+/// A reconnect from a new address (NAT rebind, crash restart) is legitimate, but
+/// so is a stranger claiming someone else's player id. A link that is still
+/// sending owns its binding; one that has been quiet for this long does not.
+pub const REBIND_GRACE: Duration = Duration::from_millis(500);
+
+/// Total transmissions allowed for one unacknowledged correction.
+///
+/// A correction rides an unreliable channel, so one lost datagram would lose it.
+/// The transport keeps the newest unacknowledged correction in flight and repeats
+/// it on the ordinary send cadence until the client's `applied_correction_seq`
+/// catches up, bounded by this count and [`CORRECTION_INFLIGHT_TTL`].
+pub const CORRECTION_RESEND_LIMIT: u8 = 4;
+/// Hard age limit for an unacknowledged correction.
+pub const CORRECTION_INFLIGHT_TTL: Duration = Duration::from_secs(2);
+
+/// Ceiling on simultaneous links.
+///
+/// Lightyear opens a link for any inbound datagram from a new address, and has
+/// no admission control of its own. The cap turns a flood of spoofed sources
+/// from unbounded growth into a bounded, logged rejection.
+pub const MAX_LINKS: usize = 4096;
 
 /// How often the peer list may change on the wire.
 ///
@@ -90,6 +114,8 @@ pub struct Peers {
     /// Last snapshot put on the wire for a player. The next tick's snapshot is
     /// compared against it so an unchanged one is not sent.
     last_sent: HashMap<u64, SentSnapshot>,
+    /// Newest correction sent to a player that the client has not acknowledged.
+    inflight: HashMap<u64, InFlight>,
     pub admitted: u64,
     pub dropped: u64,
     pub resumed: u64,
@@ -99,6 +125,23 @@ pub struct Peers {
     /// Ticks whose snapshot was identical to the last one sent, so no datagram
     /// was produced.
     pub snapshots_skipped: u64,
+    /// Corrections the client acknowledged.
+    pub correction_acked: u64,
+    /// Packets dropped because a link already spoke for another player, or
+    /// because the player already had a live link.
+    pub rejected_bind: u64,
+    /// Packets dropped for a `PROTOCOL_VERSION` mismatch.
+    pub rejected_version: u64,
+    /// Links the server tore down (timeout, orphan, or over the link cap).
+    pub disconnected: u64,
+}
+
+/// A correction the client has not confirmed applying.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    correction: proto::CollisionCorrection,
+    first: Instant,
+    sends: u8,
 }
 
 impl Peers {
@@ -113,8 +156,10 @@ impl Peers {
         if self.entity_of.get(&player) == Some(&entity) {
             self.entity_of.remove(&player);
             // A resume is a new stream: its first snapshot must not be compared
-            // against what the old link happened to have been sent.
+            // against what the old link happened to have been sent, and a
+            // correction in flight to a departed link will never be acknowledged.
             self.last_sent.remove(&player);
+            self.inflight.remove(&player);
             // The pose is kept, not deleted: admission cannot validate a
             // reconnect against anything if the shadow is gone, which made
             // "drop the link, reconnect anywhere" a free teleport.
@@ -148,10 +193,141 @@ impl Plugin for NetPlugin {
         .add_systems(Update, ingest.in_set(SimSet::Ingest))
         .add_systems(
             Update,
-            (evict_silent, evict_orphans, dispatch)
+            (evict_silent, evict_orphans, report_disconnects, dispatch)
                 .chain()
                 .in_set(SimSet::Dispatch),
+        )
+        // Lightyear opens a link per remote address from the first datagram it
+        // receives, before decoding it, and has no idle timeout. Seeding the
+        // timer here is what makes such a link reapable at all.
+        .add_observer(link_opened);
+    }
+}
+
+/// Starts the silence clock for every link lightyear opens, and enforces the cap.
+fn link_opened(trigger: On<Add<ClientOf>>, mut peers: ResMut<Peers>, mut commands: Commands) {
+    let now = Instant::now();
+    peers.last_seen.insert(trigger.entity, now);
+    if peers.last_seen.len() > MAX_LINKS {
+        warn!(
+            "{} links open, above the {MAX_LINKS} cap; dropping the newest",
+            peers.last_seen.len()
         );
+        commands.entity(trigger.entity).try_insert(Disconnecting);
+    }
+}
+
+/// Logs every teardown lightyear performs or that we force.
+fn report_disconnects(
+    mut peers: ResMut<Peers>,
+    mut gone: Query<(&Disconnected, Option<&RemoteId>), Added<Disconnected>>,
+) {
+    for (disconnected, remote) in &mut gone {
+        peers.disconnected += 1;
+        info!(
+            "link {:?} closed: {}",
+            remote.map(|r| r.0),
+            disconnected.reason
+        );
+    }
+}
+
+/// Why a packet may not be accepted from the link that carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Accept,
+    /// Built by a different tree; no amount of retrying helps.
+    WrongVersion,
+    /// This link already speaks for a different player.
+    LinkBoundTo(u64),
+    /// Another link still owns this player and is still talking.
+    PlayerLive(Entity),
+}
+
+/// Whether a packet from `link` may be admitted, and if not, why.
+///
+/// Pure so the policy can be tested without a world: identity is the packet
+/// field, so a hostile client sending someone else's `player` is the case worth
+/// getting right.
+fn admission(
+    packet: &proto::PlayerMovementPacket,
+    link: Entity,
+    peers: &Peers,
+    now: Instant,
+) -> Admission {
+    if !packet.is_current_version() {
+        return Admission::WrongVersion;
+    }
+    if let Some(bound) = peers.player_of.get(&link).copied() {
+        return if bound == packet.player {
+            Admission::Accept
+        } else {
+            Admission::LinkBoundTo(bound)
+        };
+    }
+    if let Some(other) = peers.entity_of.get(&packet.player).copied()
+        && other != link
+        && peers
+            .last_seen
+            .get(&other)
+            .is_some_and(|seen| now.duration_since(*seen) < REBIND_GRACE)
+    {
+        return Admission::PlayerLive(other);
+    }
+    Admission::Accept
+}
+
+/// Stops repeating a correction the client reports having applied.
+fn ack_correction(peers: &mut Peers, player: u64, applied_seq: u16) -> bool {
+    let acked = peers
+        .inflight
+        .get(&player)
+        .is_some_and(|flight| flight.correction.seq == applied_seq);
+    if acked {
+        peers.inflight.remove(&player);
+        peers.correction_acked += 1;
+    }
+    acked
+}
+
+/// The correction this tick's snapshot must carry.
+///
+/// The simulation's own correction when it produced one — a newer delta always
+/// supersedes an unacknowledged older one — otherwise the newest unacknowledged
+/// correction, so a lost datagram costs a round trip instead of the correction.
+fn correction_to_send(
+    snapshot: &proto::ServerSnapshot,
+    inflight: &HashMap<u64, InFlight>,
+    player: u64,
+) -> Option<proto::CollisionCorrection> {
+    snapshot
+        .correction
+        .or_else(|| inflight.get(&player).map(|flight| flight.correction))
+}
+
+/// Records a correction that just went on the wire, and drops it once the resend
+/// budget is spent.
+fn track_correction(
+    peers: &mut Peers,
+    player: u64,
+    correction: proto::CollisionCorrection,
+    now: Instant,
+) {
+    let flight = peers.inflight.entry(player).or_insert(InFlight {
+        correction,
+        first: now,
+        sends: 0,
+    });
+    if flight.correction.seq != correction.seq {
+        *flight = InFlight {
+            correction,
+            first: now,
+            sends: 0,
+        };
+    }
+    flight.sends = flight.sends.saturating_add(1);
+    if flight.sends >= CORRECTION_RESEND_LIMIT {
+        peers.inflight.remove(&player);
     }
 }
 
@@ -188,6 +364,56 @@ fn ingest(
         for packet in receiver.receive() {
             peers.packets_in += 1;
 
+            match admission(&packet, entity, &peers, now) {
+                Admission::Accept => {}
+                Admission::WrongVersion => {
+                    // A client from a different tree cannot be repaired packet
+                    // by packet, and admission must not run for it. Log on powers
+                    // of two so a persistent mismatch is visible without
+                    // flooding the log.
+                    peers.rejected_version += 1;
+                    if peers.rejected_version.is_power_of_two() {
+                        warn!(
+                            "player {} speaks protocol v{}, this server v{} ({} rejected)",
+                            packet.player,
+                            packet.version,
+                            proto::PROTOCOL_VERSION,
+                            peers.rejected_version
+                        );
+                    }
+                    continue;
+                }
+                Admission::LinkBoundTo(bound) => {
+                    // Rebinding a link on every packet let any client take over
+                    // another player's shadow, and let a delayed datagram from a
+                    // superseded address steal the binding back.
+                    peers.rejected_bind += 1;
+                    info!(
+                        "link {entity} is bound to player {bound}; ignoring a claim for {}",
+                        packet.player
+                    );
+                    continue;
+                }
+                Admission::PlayerLive(other) => {
+                    // The player already has a link that is still talking; only
+                    // one that has gone quiet may be replaced.
+                    peers.rejected_bind += 1;
+                    info!(
+                        "player {} already has live link {other}; refusing {entity}",
+                        packet.player
+                    );
+                    continue;
+                }
+            }
+
+            // The client echoes the last correction it applied; seeing it means
+            // the in-flight repeat can stop.
+            ack_correction(
+                &mut peers,
+                packet.player,
+                packet.report.applied_correction_seq,
+            );
+
             let mut consumed = false;
             if !game.0.sim.contains_player(packet.player) {
                 if let Some(resume) = game.0.sim.resume_player(&packet) {
@@ -214,13 +440,18 @@ fn ingest(
                     peers.admitted += 1;
                     info!("admitted player {} on link {entity}", packet.player);
                 }
-            } else if peers
-                .entity_of
-                .get(&packet.player)
-                .is_some_and(|e| *e != entity)
+            }
+
+            if !peers.player_of.contains_key(&entity)
+                && let Some(other) = peers.entity_of.get(&packet.player).copied()
+                && other != entity
             {
-                // Same player on a new address: a NAT rebind or a reconnect.
-                info!("player {} moved to link {entity}", packet.player);
+                // Allowed only once the previous link went quiet; see the
+                // rebind grace above.
+                info!(
+                    "player {} moved to link {entity} (was {other})",
+                    packet.player
+                );
             }
 
             peers.player_of.insert(entity, packet.player);
@@ -280,10 +511,10 @@ type ClientLinks<'w, 's> = Query<
         Option<&'static mut MessageSender<proto::ServerSnapshot>>,
         Option<&'static Link>,
     ),
-    With<ClientOf>,
+    (With<ClientOf>, With<Connected>),
 >;
 
-/// Sends the most recent completed tick's snapshots, at most once each.
+/// Sends the snapshots produced since the last dispatch, at most once each.
 ///
 /// A snapshot is put on the wire only when it carries something the client can
 /// act on — a correction, a resync, or a peer refresh — or when the heartbeat is
@@ -292,12 +523,16 @@ type ClientLinks<'w, 's> = Query<
 /// last peer list so the two cadences stay independent. The server still builds
 /// a snapshot for every player every tick
 /// ([`sim::authority::Simulation::step`]); this filter is about the network bill.
+///
+/// A frame may have advanced several ticks (`Game::advance`), so the pending
+/// queue is what is dispatched, not the simulation's latest output: the earlier
+/// ticks' corrections are merged into it rather than overwritten.
 fn dispatch(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut clients: ClientLinks) {
-    if !game.0.snapshots_pending {
+    if game.0.pending().is_empty() {
         return;
     }
     let now = Instant::now();
-    for &(id, snapshot) in game.0.sim.snapshots() {
+    for &(id, snapshot) in game.0.pending() {
         let Some(entity) = peers.entity_of.get(&id).copied() else {
             continue;
         };
@@ -308,13 +543,26 @@ fn dispatch(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut clients: Cl
             continue;
         };
         let heartbeat = heartbeat_interval(link.map_or(Duration::ZERO, |l| l.stats.rtt));
+
+        // An unacknowledged correction rides the next snapshot we send, so a
+        // lost datagram costs a round trip rather than the correction. Bounded in
+        // count and age: a client that never acknowledges must not pin it.
+        if let Some(flight) = peers.inflight.get(&id)
+            && now.duration_since(flight.first) >= CORRECTION_INFLIGHT_TTL
+        {
+            peers.inflight.remove(&id);
+        }
+        let mut out = snapshot;
+        if let Some(correction) = correction_to_send(&snapshot, &peers.inflight, id) {
+            out.correction = Some(correction);
+        }
+
         let prev = peers.last_sent.get(&id).copied();
-        let plan = plan_snapshot(prev.as_ref(), &snapshot, now, heartbeat);
+        let plan = plan_snapshot(prev.as_ref(), &out, now, heartbeat);
         if !plan.send {
             peers.snapshots_skipped += 1;
             continue;
         }
-        let mut out = snapshot;
         let peers_at = if plan.refresh_peers {
             now
         } else {
@@ -329,6 +577,9 @@ fn dispatch(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut clients: Cl
         // flat copy instead of a per-player heap clone.
         sender.send::<net::SnapshotChannel>(out);
         peers.snapshots_out += 1;
+        if let Some(correction) = out.correction {
+            track_correction(&mut peers, id, correction, now);
+        }
         peers.last_sent.insert(
             id,
             SentSnapshot {
@@ -338,7 +589,7 @@ fn dispatch(mut game: ResMut<GameRes>, mut peers: ResMut<Peers>, mut clients: Cl
             },
         );
     }
-    game.0.snapshots_pending = false;
+    game.0.clear_pending();
 }
 
 /// Decides whether the next snapshot goes out, and whether it carries a fresh
@@ -409,6 +660,7 @@ mod tests {
 
     fn reconnect_packet(player: u64, pos: Vec3) -> proto::PlayerMovementPacket {
         proto::PlayerMovementPacket {
+            version: proto::PROTOCOL_VERSION,
             seq: 1,
             player,
             report: proto::MovementReport {
@@ -735,11 +987,128 @@ mod tests {
         peers
             .last_sent
             .insert(1, sent_at(snapshot_with(&[]), now, now));
+        track_correction(&mut peers, 1, correction(1), now);
 
         peers.release(link, &mut game);
         assert!(
             peers.last_sent.is_empty(),
             "a resume compared against the old stream"
+        );
+        assert!(
+            peers.inflight.is_empty(),
+            "a correction was left waiting for a link that is gone"
+        );
+    }
+
+    fn claiming(player: u64) -> proto::PlayerMovementPacket {
+        reconnect_packet(player, Vec3::ZERO)
+    }
+
+    #[test]
+    fn a_link_may_only_speak_for_the_player_it_was_bound_to() {
+        let now = Instant::now();
+        let mut world = World::new();
+        let link = world.spawn_empty().id();
+        let mut peers = Peers::default();
+        peers.player_of.insert(link, 7);
+        peers.last_seen.insert(link, now);
+
+        assert_eq!(
+            admission(&claiming(7), link, &peers, now),
+            Admission::Accept
+        );
+        assert_eq!(
+            admission(&claiming(8), link, &peers, now),
+            Admission::LinkBoundTo(7),
+            "a bound link took over another player"
+        );
+    }
+
+    #[test]
+    fn a_live_player_cannot_be_taken_over_by_a_second_link() {
+        let now = Instant::now();
+        let mut world = World::new();
+        let live = world.spawn_empty().id();
+        let newcomer = world.spawn_empty().id();
+        let mut peers = Peers::default();
+        peers.player_of.insert(live, 7);
+        peers.entity_of.insert(7, live);
+        peers.last_seen.insert(live, now);
+
+        assert_eq!(
+            admission(&claiming(7), newcomer, &peers, now),
+            Admission::PlayerLive(live)
+        );
+
+        // Once the old link has gone quiet the reconnect is allowed again.
+        let quiet = now + REBIND_GRACE;
+        assert_eq!(
+            admission(&claiming(7), newcomer, &peers, quiet),
+            Admission::Accept
+        );
+    }
+
+    #[test]
+    fn a_packet_from_another_protocol_revision_is_refused() {
+        let now = Instant::now();
+        let link = World::new().spawn_empty().id();
+        let peers = Peers::default();
+        let mut packet = claiming(7);
+        packet.version = proto::PROTOCOL_VERSION.wrapping_add(1);
+
+        assert_eq!(
+            admission(&packet, link, &peers, now),
+            Admission::WrongVersion
+        );
+    }
+
+    #[test]
+    fn an_unacknowledged_correction_is_repeated_then_dropped() {
+        let now = Instant::now();
+        let mut peers = Peers::default();
+        let quiet = snapshot_with(&[]);
+        assert!(correction_to_send(&quiet, &peers.inflight, 1).is_none());
+
+        // Sent once: while unacknowledged it rides the next snapshot even when
+        // the simulation produced nothing new.
+        track_correction(&mut peers, 1, correction(5), now);
+        assert_eq!(
+            correction_to_send(&quiet, &peers.inflight, 1).map(|c| c.seq),
+            Some(5)
+        );
+
+        // A newer delta supersedes it: the client applies the newest state, not
+        // a backlog of superseded velocity changes.
+        let fresh = proto::ServerSnapshot {
+            correction: Some(correction(6)),
+            ..quiet
+        };
+        assert_eq!(
+            correction_to_send(&fresh, &peers.inflight, 1).map(|c| c.seq),
+            Some(6)
+        );
+
+        // Still repeated until the client echoes the sequence it applied.
+        assert!(!ack_correction(&mut peers, 1, 4), "an older ack stopped it");
+        assert_eq!(peers.correction_acked, 0);
+        assert!(ack_correction(&mut peers, 1, 5));
+        assert_eq!(peers.correction_acked, 1);
+        assert!(
+            correction_to_send(&quiet, &peers.inflight, 1).is_none(),
+            "the correction kept repeating after the ack"
+        );
+    }
+
+    #[test]
+    fn the_resend_budget_bounds_an_unacknowledged_correction() {
+        let now = Instant::now();
+        let mut peers = Peers::default();
+        for _ in 0..CORRECTION_RESEND_LIMIT {
+            track_correction(&mut peers, 1, correction(5), now);
+        }
+        assert!(
+            peers.inflight.is_empty(),
+            "a client that never acknowledges pinned the correction"
         );
     }
 }

@@ -87,6 +87,20 @@ and the wire bytes, for a client build without the local solve.
 The simulation still builds a snapshot for every player every tick. The filter lives in the
 transport, so diagnostics, tests and future readers of `Simulation::snapshots()` see the full state.
 
+**Server, correction repetition.** A correction is no longer single-shot. The transport keeps the
+newest unacknowledged correction per player in flight and repeats it on the ordinary send cadence —
+which is the heartbeat cadence, so a repeat costs no extra datagram that the heartbeat would not
+have sent anyway — until the client's `applied_correction_seq` echoes it, bounded by
+`CORRECTION_RESEND_LIMIT` transmissions and `CORRECTION_INFLIGHT_TTL`. A newer correction supersedes
+an unacknowledged older one: the client applies velocity deltas, not a timeline of them, so only the
+newest state is worth sending. This is an exception to "superseded state stays off the wire" and it
+is the intended one — an unacknowledged correction has not been superseded, it has been lost.
+
+**Client, channel flush.** The input channel flushes every frame. Its `send_frequency` used to be
+set to `INPUT_SEND_HZ`, which made lightyear hold each report until its own repeating timer wrapped:
+up to one full period of extra one-way latency for a cadence the client already enforces. Only the
+client's report gating decides when an input packet exists.
+
 ## Consequences
 
 - **Steady client:** a constant velocity is already described by `pos + vel × age`, so 30 reports/s

@@ -2,13 +2,19 @@
 //!
 //! Lightyear owns framing, sequencing and the reliability rules; this crate only
 //! says *what* travels on the wire. Both binaries add [`MovementProtocol`], so
-//! channels and messages are registered in the same order on both ends —
-//! lightyear hashes that order and refuses a session whose hashes disagree.
+//! channels and messages are registered in the same order on both ends.
+//!
+//! That order is load-bearing: lightyear assigns channel and message ids by
+//! registration. It only compares the resulting protocol hash across peers when
+//! its `replication` feature is enabled, which this build does not turn on, so
+//! the hash is *not* checked here. `proto::PROTOCOL_VERSION` in every client
+//! packet is the substitute: a mismatch is rejected and logged instead of being
+//! silently ignored.
 
 use bevy_app::{App, Plugin};
 use core::time::Duration;
 use lightyear::prelude::*;
-use proto::{CLIENT_TICK_HZ, INPUT_SEND_HZ, PlayerMovementPacket, SERVER_TICK_HZ, ServerSnapshot};
+use proto::{CLIENT_TICK_HZ, PlayerMovementPacket, SERVER_TICK_HZ, ServerSnapshot};
 
 /// Duration of one client prediction tick. The client's Lightyear timeline uses it.
 pub const CLIENT_TICK_DURATION: Duration =
@@ -19,10 +25,15 @@ pub const CLIENT_TICK_DURATION: Duration =
 pub const SERVER_TICK_DURATION: Duration =
     Duration::from_nanos(1_000_000_000 / SERVER_TICK_HZ as u64);
 
-/// Largest packet we are willing to put in one UDP datagram.
+/// Largest message we are willing to put in one datagram.
 ///
-/// Well under the 1472-byte UDP payload limit, so a snapshot never fragments.
-pub const DATAGRAM_BUDGET: usize = 1200;
+/// Lightyear's `DEFAULT_MTU` is the size of a whole datagram including the
+/// 13-byte packet header, and anything larger than the fragment size is split
+/// across several packets — which, on an unreliable channel, means one lost
+/// fragment loses the message. The budget is therefore the MTU minus the header,
+/// and a message at the budget still fits one packet.
+pub const HEADER_BYTES: usize = 13;
+pub const MESSAGE_BUDGET: usize = lightyear::link::DEFAULT_MTU - HEADER_BYTES;
 
 /// Client → server input and movement reports.
 pub struct InputChannel;
@@ -41,10 +52,13 @@ impl Plugin for MovementProtocol {
             // missed ticks. Ordering is handled by the per-packet dedupe
             // (packet.seq), not by dropping the whole datagram at the channel.
             mode: ChannelMode::UnorderedUnreliable,
-            // Inputs are pointless once superseded, so the sender only flushes
-            // them at the rate the client produces them.
-            send_frequency: Duration::from_nanos(1_000_000_000 / INPUT_SEND_HZ as u64),
-            priority: 2.0,
+            // Flush every frame, *not* at the report rate. A non-default
+            // `send_frequency` makes lightyear hold messages until its timer
+            // wraps, so a report produced just after a boundary waits a whole
+            // period before it can leave — up to 33 ms of one-way input latency
+            // for a 30 Hz channel. The client's own cadence already gates
+            // reports, so the frequency setting bought nothing.
+            send_frequency: Duration::default(),
             retry_unsent_messages: false,
             ..Default::default()
         })
@@ -53,7 +67,6 @@ impl Plugin for MovementProtocol {
         app.add_channel::<SnapshotChannel>(ChannelSettings {
             mode: ChannelMode::SequencedUnreliable,
             send_frequency: Duration::default(),
-            priority: 1.0,
             retry_unsent_messages: false,
             ..Default::default()
         })
@@ -78,6 +91,7 @@ mod tests {
     /// frames at full deflection, longest varints in every field.
     fn worst_case_client_packet() -> PlayerMovementPacket {
         PlayerMovementPacket {
+            version: proto::PROTOCOL_VERSION,
             seq: u16::MAX,
             player: u64::MAX,
             report: MovementReport {
@@ -146,16 +160,18 @@ mod tests {
     fn worst_case_packets_fit_one_datagram() {
         let input = postcard::to_allocvec(&worst_case_client_packet()).expect("serialise");
         assert!(
-            input.len() <= DATAGRAM_BUDGET,
-            "input packet: {} B",
-            input.len()
+            input.len() <= MESSAGE_BUDGET,
+            "input message: {} B, budget {} B",
+            input.len(),
+            MESSAGE_BUDGET
         );
 
         let snapshot = postcard::to_allocvec(&worst_case_snapshot()).expect("serialise");
         assert!(
-            snapshot.len() <= DATAGRAM_BUDGET,
-            "snapshot packet: {} B",
-            snapshot.len()
+            snapshot.len() <= MESSAGE_BUDGET,
+            "snapshot message: {} B, budget {} B",
+            snapshot.len(),
+            MESSAGE_BUDGET
         );
     }
 }

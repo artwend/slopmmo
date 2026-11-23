@@ -310,6 +310,7 @@ impl Local {
             input: newest,
         });
         Some(proto::PlayerMovementPacket {
+            version: proto::PROTOCOL_VERSION,
             seq: self.seq,
             player: player_id,
             report,
@@ -365,8 +366,15 @@ impl Local {
 
     /// Applies a snapshot's placement and correction; false when no correction
     /// was applied (a resync-only snapshot returns false).
-    pub fn accept_snapshot(&mut self, snapshot: &proto::ServerSnapshot) -> bool {
-        self.record_peers(snapshot);
+    ///
+    /// `one_way_ticks` is the measured one-way delay, used only to anchor the
+    /// client's clock to the server's present tick when filing the collider set.
+    pub fn accept_snapshot(
+        &mut self,
+        snapshot: &proto::ServerSnapshot,
+        one_way_ticks: i32,
+    ) -> bool {
+        self.record_peers(snapshot, one_way_ticks);
         if snapshot.resync {
             // A resumed session is placed by the server. This is the one case
             // where the shadow position is adopted instead of predicted;
@@ -391,18 +399,25 @@ impl Local {
     /// The set is keyed by tick, not by arrival order, so two ticks that read
     /// the same history see the same colliders and a late datagram cannot
     /// rewrite an older tick's answer.
-    fn record_peers(&mut self, snapshot: &proto::ServerSnapshot) {
+    ///
+    /// The clock anchor is biased by the one-way delay: the snapshot was built
+    /// `one_way_ticks` ago, so the server's *present* tick is that much ahead of
+    /// it. Without the bias every local solve would be resolved against peers one
+    /// round trip stale. The collider set itself stays filed at its own tick — it
+    /// is genuine data for that tick, not for the present one.
+    fn record_peers(&mut self, snapshot: &proto::ServerSnapshot, one_way_ticks: i32) {
+        let observed = snapshot.server_tick.add(one_way_ticks.max(0) as u32);
         match self.server_origin {
             Some(origin) => {
                 let mapped = proto::map_client_tick(origin, self.tick, proto::SERVER_TICK_HZ);
                 // A paused, hitched or restarted client drifts out of the
                 // anchored domain; re-anchor instead of sampling a mapping that
                 // no longer describes the stream.
-                if mapped.since(snapshot.server_tick).abs() > proto::REPORT_WINDOW as i32 {
-                    self.server_origin = Some((self.tick, snapshot.server_tick));
+                if mapped.since(observed).abs() > proto::REPORT_WINDOW as i32 {
+                    self.server_origin = Some((self.tick, observed));
                 }
             }
-            None => self.server_origin = Some((self.tick, snapshot.server_tick)),
+            None => self.server_origin = Some((self.tick, observed)),
         }
         self.peers.record(snapshot.server_tick, &snapshot.peers);
     }
@@ -592,7 +607,7 @@ mod tests {
         let mut with_peer = Local::default();
         with_peer.player.pos = Vec3::new(0.0, 0.9, 0.0);
         with_peer.player.vel = Vec3::new(3.0, 0.0, 0.0);
-        with_peer.accept_snapshot(&snapshot_with_peers(10, &[peer_at(2, 0.5)]));
+        with_peer.accept_snapshot(&snapshot_with_peers(10, &[peer_at(2, 0.5)]), 0);
         with_peer.step(proto::InputFrame::default());
 
         let mut control = Local::default();
@@ -619,9 +634,9 @@ mod tests {
         local.player.pos = Vec3::new(0.0, 0.9, 0.0);
         local.player.vel = Vec3::new(3.0, 0.0, 0.0);
         // The newer datagram first: the peer is touching the player.
-        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]));
+        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]), 0);
         // A late datagram from an older tick claiming the peer is far away.
-        local.accept_snapshot(&snapshot_with_peers(20, &[peer_at(2, 20.0)]));
+        local.accept_snapshot(&snapshot_with_peers(20, &[peer_at(2, 20.0)]), 0);
 
         local.step(proto::InputFrame::default());
         assert_eq!(
@@ -631,14 +646,40 @@ mod tests {
     }
 
     #[test]
+    fn the_peer_anchor_is_biased_by_the_measured_one_way_delay() {
+        // No sample (or no measurable RTT): the anchor is the snapshot tick.
+        let mut unbiased = Local::default();
+        unbiased.accept_snapshot(&snapshot_with_peers(100, &[peer_at(2, 0.5)]), 0);
+        assert_eq!(
+            unbiased.predicted_server_tick(),
+            Some(proto::Tick::new(100))
+        );
+
+        // With a sample, the client predicts the server's *present* tick, not
+        // the tick the snapshot was built on.
+        let mut biased = Local::default();
+        biased.accept_snapshot(&snapshot_with_peers(100, &[peer_at(2, 0.5)]), 4);
+        assert_eq!(
+            biased.predicted_server_tick(),
+            Some(proto::Tick::new(104)),
+            "the clock was anchored one round trip in the past"
+        );
+        // The collider set itself is still filed under the tick it describes.
+        assert_eq!(biased.peers.history().newest(), Some(proto::Tick::new(100)));
+    }
+
+    #[test]
     fn a_resync_places_the_player_and_keeps_the_peer_history() {
         let mut local = Local::default();
-        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]));
-        local.accept_snapshot(&proto::ServerSnapshot {
-            resync: true,
-            shadow_position: [5.0, 0.9, 5.0],
-            ..snapshot_with_peers(31, &[peer_at(2, 0.5)])
-        });
+        local.accept_snapshot(&snapshot_with_peers(30, &[peer_at(2, 0.5)]), 0);
+        local.accept_snapshot(
+            &proto::ServerSnapshot {
+                resync: true,
+                shadow_position: [5.0, 0.9, 5.0],
+                ..snapshot_with_peers(31, &[peer_at(2, 0.5)])
+            },
+            0,
+        );
 
         assert_eq!(local.player.pos, Vec3::new(5.0, 0.9, 5.0));
         assert_eq!(local.player.vel, Vec3::ZERO);

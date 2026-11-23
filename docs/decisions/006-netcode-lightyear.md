@@ -46,16 +46,23 @@ Non-goals that were made explicit in the dialogue:
 **Done — Lightyear owns the wire.** The raw UDP path (`crates/server/src/net.rs`,
 `crates/client/src/net.rs`) is deleted.
 
-- `crates/net` declares the protocol: `InputChannel` (client → server,
-  `UnorderedUnreliable`, `send_frequency = INPUT_SEND_HZ`, priority 2) and `SnapshotChannel`
-  (server → client, `SequencedUnreliable`, on change with an RTT-adaptive heartbeat, priority 1), plus the two
-  messages (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel
-  and message hashes agreed at handshake.
+- `crates/net` declares the protocol: `InputChannel` (client → server, `UnorderedUnreliable`,
+  flushed every frame — the client owns the report cadence, so a channel-level
+  `send_frequency` would only add a timer's worth of latency) and `SnapshotChannel` (server →
+  client, `SequencedUnreliable`, on change with an RTT-adaptive heartbeat), plus the two messages
+  (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel and
+  message *ids* agree.
+- Protocol identity is **not** hash-checked in this build: lightyear only compares protocol hashes
+  when its `replication` feature is enabled. `proto::PROTOCOL_VERSION` is stamped in every movement
+  packet instead, and the server rejects and logs a mismatch. Enabling replicon later would restore
+  the hash check; the in-band version can stay either way.
 - `crates/server/src/transport.rs`: a `ServerUdpIo` endpoint; lightyear spawns one link per remote
-  address, and our admission system binds a `player` id to that link on the first movement packet.
-  Peer timeout, superseded-link release and snapshot fan-out live here. A timed-out or torn-down link
+  address, and our admission system binds a `player` id to that link on the first movement packet —
+  one player per link, with a rebind allowed only after the previous link has gone quiet. Peer
+  timeout, superseded-link release and snapshot fan-out live here. A timed-out or torn-down link
   parks its shadow (`Simulation::detach_player`), so the next link for the same id resumes from the
-  server's pose rather than being admitted wherever it claims.
+  server's pose rather than being admitted wherever it claims. An unacknowledged correction is kept
+  in flight and repeated, bounded, until the client echoes it.
 - `crates/client/src/transport.rs`: `RawClient` + `UdpIo` + `LocalAddr(0.0.0.0:0)` +
   `PeerAddr(server)`, `Connect`, then a plain `MessageSender`/`MessageReceiver` pair.
 - Verified live: `client --headless --connect 127.0.0.1:4000` → `net_sent 600`,
@@ -74,8 +81,9 @@ KCC, which is exactly what a stock state-copy prediction would get wrong.
 - No delta compression or prioritisation. Snapshots are change-gated (ADR 015), so a tick that
   changes nothing the client can act on is not sent. The hand-encoded peer set is still the
   convergence target for step 1 above, and is switched off entirely until a client consumes it
-  (`SimConfig::replicate_peers`); when on, a snapshot is budgeted against `DATAGRAM_BUDGET = 1200`
-  worst case.
+  (`SimConfig::replicate_peers`); when on, a snapshot is budgeted against
+  `net::MESSAGE_BUDGET` — lightyear's `DEFAULT_MTU` minus the 13-byte packet header — so one message
+  stays one datagram.
 - A running client that never sends is never admitted (no `Hello`): identity is the `player` field
   of the first movement packet, per ADR 007.
 
@@ -91,7 +99,20 @@ KCC, which is exactly what a stock state-copy prediction would get wrong.
 
 Acceptance: the live round trip passes through Lightyear, the headless invariant script produces
 the same `peak_y`/`deterministic` result, and the bot benchmark still fits the tick budget.
-The first clause is green today (`cargo test --workspace` = 39 tests, plus the live check).
+The first clause is green today (`cargo test --workspace`, plus the live check).
+
+## Tick domains
+
+Lightyear advances its own `LocalTimeline` at the configured tick duration, but nothing in the game
+reads it: the wire and the simulation use `proto::Tick`, which wraps and is compared through
+`since()`. That is deliberate and currently harmless — no message or channel is registered with
+`on_timeline`, and no component is replicated.
+
+Treat it as a constraint rather than a detail. Adopting `on_timeline`, `lightyear_prediction` or
+`Replicate` means switching to `Res<LocalTimeline>` and stopping the use of `proto::Tick` across
+that layer: 0.31's `Tick` is non-wrapping and saturating, so the two are not interchangeable. There
+are also two tick *rates* in play — the client's fixed step and the server's accumulator — which is
+why `proto::map_client_tick` scales instead of adding.
 
 ## Open questions
 

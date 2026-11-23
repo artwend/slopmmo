@@ -107,6 +107,8 @@ pub enum Reject {
     TooFast,
     Teleport,
     MalformedTick,
+    /// The packet was built by a binary with a different `PROTOCOL_VERSION`.
+    WrongVersion,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,6 +118,7 @@ pub struct SimStats {
     pub stale: u32,
     pub too_fast: u32,
     pub teleport: u32,
+    pub wrong_version: u32,
     pub resumed: u32,
     pub resume_clamped: u32,
     pub pairs: u32,
@@ -464,6 +467,13 @@ impl Simulation {
             slots,
             ..
         } = self;
+        // A build mismatch is not a cheat and cannot be repaired per packet:
+        // report it distinctly so the transport can log it once instead of
+        // counting it as a validation failure.
+        if !packet.is_current_version() {
+            stats.wrong_version += 1;
+            return Err(Reject::WrongVersion);
+        }
         let Some(slot) = slots.get(&packet.player).copied() else {
             return Err(Reject::UnknownPlayer);
         };

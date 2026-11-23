@@ -6376,7 +6376,9 @@ dependencies = [
 name = "packetdump"
 version = "0.1.0"
 dependencies = [
+ "bevy_app",
  "clap",
+ "lightyear",
  "postcard",
  "proto",
  "ron",

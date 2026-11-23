@@ -331,6 +331,73 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    /// Pushes a payload through the real lightyear transport and decodes the
+    /// datagram it produced.
+    ///
+    /// Everything else in this module checks the parser against bytes this
+    /// module built, which cannot catch a change in lightyear's layout. This test
+    /// can: it is the reason to re-verify `wire.rs` when the dependency moves.
+    #[test]
+    fn decodes_a_packet_produced_by_lightyear() {
+        use lightyear::core::plugin::CorePlugins;
+        use lightyear::link::prelude::{Link, Linked};
+        use lightyear::transport::plugin::TransportPlugin;
+        use lightyear::transport::prelude::{
+            ChannelMode, ChannelRegistry, ChannelSettings, PriorityConfig, Transport,
+        };
+
+        struct WireChannel;
+
+        let mut app = bevy_app::App::new();
+        app.add_plugins(CorePlugins {
+            tick_duration: core::time::Duration::from_millis(16),
+        });
+        app.init_resource::<ChannelRegistry>();
+        let settings = ChannelSettings {
+            mode: ChannelMode::UnorderedUnreliable,
+            ..Default::default()
+        };
+        let (_, id) = app
+            .world_mut()
+            .resource_mut::<ChannelRegistry>()
+            .add_channel::<WireChannel>(settings);
+        app.add_plugins(TransportPlugin);
+
+        let mut transport = Transport::new(PriorityConfig::default());
+        transport.add_channel_send::<WireChannel>(settings, id);
+        let entity = app
+            .world_mut()
+            .spawn((Link::default(), Linked, transport))
+            .id();
+
+        const PAYLOAD: &[u8] = b"wire-format-tripwire";
+        app.world_mut()
+            .entity_mut(entity)
+            .get_mut::<Transport>()
+            .expect("transport")
+            .send_with_priority::<WireChannel>(PAYLOAD.to_vec().into(), 1.0)
+            .expect("buffer the payload");
+
+        // `TransportPlugin` registers its send system in `finish`.
+        app.finish();
+        app.cleanup();
+        app.update();
+
+        let packet = {
+            let mut link = app.world_mut().get_mut::<Link>(entity).expect("link");
+            link.send.pop().expect("the transport produced no packet")
+        };
+        let decoded = Packet::parse(packet.as_ref()).expect("decoder rejected a real packet");
+        let Body::Data(batches) = &decoded.body else {
+            panic!("expected a data packet, got {:?}", decoded.body);
+        };
+        assert_eq!(batches.len(), 1, "one channel batch");
+        assert_eq!(batches[0].channel, id);
+        assert_eq!(batches[0].messages.len(), 1, "one message");
+        assert_eq!(batches[0].messages[0].payload, PAYLOAD);
+        assert_eq!(decoded.len, packet.len(), "datagram length");
+    }
+
     fn put_varint(out: &mut Vec<u8>, value: u64) {
         if value <= 63 {
             out.push(value as u8);

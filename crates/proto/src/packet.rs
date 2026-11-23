@@ -38,7 +38,11 @@ pub struct MovementReport {
     pub angular_velocity: [f32; 3],
     pub body_yaw: f32,
     pub grounded: bool,
-    /// Last correction the client has applied, for idempotent re-delivery.
+    /// Last correction the client has applied.
+    ///
+    /// The server's transport keeps an unacknowledged correction in flight and
+    /// repeats it (bounded) until this field catches up, so a correction lost
+    /// with its datagram is repaired instead of silently dropped.
     pub applied_correction_seq: u16,
 }
 
@@ -46,6 +50,12 @@ pub struct MovementReport {
 /// the same tick window, and splitting them doubled the header cost.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlayerMovementPacket {
+    /// [`crate::PROTOCOL_VERSION`] of the sender. First field on the wire so a
+    /// mismatched build is rejected before the rest is looked at.
+    ///
+    /// `Default` is *not* a valid version; a zero here means "not stamped" and
+    /// the server rejects it, which is what a hand-built packet should do.
+    pub version: u16,
     /// Per-connection packet counter, used for loss statistics.
     pub seq: u16,
     pub player: u64,
@@ -132,6 +142,15 @@ impl PeerList {
     }
 }
 
+impl PlayerMovementPacket {
+    /// True when the packet was produced by the same protocol revision as this
+    /// build. Every sender stamps [`crate::PROTOCOL_VERSION`]; a hand-built
+    /// packet with the default `0` is therefore rejected rather than trusted.
+    pub fn is_current_version(&self) -> bool {
+        self.version == crate::PROTOCOL_VERSION
+    }
+}
+
 impl Default for PeerList {
     fn default() -> Self {
         Self::new()
@@ -204,6 +223,10 @@ pub struct CollisionCorrection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerSnapshot {
     pub server_tick: Tick,
+    /// Last client packet sequence the server accepted for this player.
+    ///
+    /// The client compares it with the sequence it last sent to estimate how
+    /// many reports are still in flight; nothing else depends on it.
     pub acked_seq: u16,
     /// Server shadow position. Informational: the client must not adopt it,
     /// except while `resync` is set.
@@ -249,6 +272,7 @@ mod tests {
     #[test]
     fn client_packet_roundtrip() {
         let pkt = PlayerMovementPacket {
+            version: crate::PROTOCOL_VERSION,
             seq: 77,
             player: 0xDEAD_BEEF,
             report: MovementReport {

@@ -11,6 +11,7 @@ This document is the *review*: it records where the dialogue was wrong and what 
 decisions themselves — as the project owner made them, with verbatim quotes — are in
 [`decisions/`](decisions/README.md); the assembled system is in
 [`server-architecture.md`](server-architecture.md). Where the two disagree, the ADRs win.
+The transport half has its own audit in [`network-review.md`](network-review.md).
 
 ---
 
@@ -55,7 +56,7 @@ not move.
 | §3.6 Combat lag compensation | No server-side position history and no rewind (ADR 013 open question): hitscan would resolve against current positions. |
 | §4.2 and §5 Walkability oracle | No coarse grid and no authoring story; the server cannot reject "inside a wall". |
 | §7.5 Parallel solve, incremental grid | Deferred by decision, not defects: the tick keeps ~15× headroom and the solver owns ~90 % of it, so a parallel solve changes results and needs its own determinism test first. Profile the per-pair cost before building it; the current 1.2 µs/pair is high enough that a better sequential solver may buy more than threads. |
-| §7.7 Correction stacking | The shadow is still `anchor + vel × age`, so a new velocity delta is applied to every tick since the report instead of once, and corrections still on the wire are not discounted. In the 256-bot benchmark corrections run at ~1.0 per bot per tick, so this is the normal path, not an edge case. It needs a per-tick integration plus an in-flight-correction set before the correction channel is the exception path §4.1 describes; the client-side solve is now built and history-tracked, but it predicts against that unpriced channel. |
+| §7.7 Correction stacking | The shadow is still `anchor + vel × age`, so a new velocity delta is applied to every tick since the report instead of once. In the 256-bot benchmark corrections run at ~1.0 per bot per tick, so this is the normal path, not an edge case. The **in-flight half is done**: the transport keeps the newest unacknowledged correction and repeats it, bounded, until `applied_correction_seq` echoes it (see [`network-review.md`](network-review.md) N9), so a correction lost with its datagram is no longer lost. What remains is per-tick integration in the shadow, which is what would make the correction channel the exception path §4.1 describes. |
 | ADR 013 Adaptive snapshot rate | Snapshots are tied to the tick; an adaptive rate needs a client interpolation buffer to be worth anything. |
 | §8 Resume allowance | `resume_travel()` is a fixed 5.4 m, not scaled by the time since detach. A rapid disconnect/reconnect cycle can bank the full amount per cycle. The fix is `min(cap, Δt · v_max · k) + slack`, where `Δt` comes from the parked shadow's tick. |
 | §8 Server-sanctioned displacement | Only a clamped resume has a `resync` path. Respawn, teleport abilities, knockback and mounts have no way to move the shadow: a legitimate large displacement is rejected as `Teleport`, and `v_max` is a constant, so a faster mount trips the same check. Needs a `place_player`-style operation (bump `epoch`, set `needs_resync`, reset the report baseline) and a per-player speed scale. |

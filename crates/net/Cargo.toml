@@ -9,9 +9,10 @@ license.workspace = true
 proto.workspace = true
 bevy_app = "0.20"
 
-# Both ends of the protocol live here so the registration order — and therefore
-# the protocol hash — is identical on the client and the server.
-lightyear = { version = "0.31", default-features = false, features = ["std", "client", "server"] }
+# The protocol crate needs neither role: channels and messages are declared with
+# transport-level APIs only. The two binaries add `client` / `server` themselves,
+# so cargo's feature unification no longer links both halves into both binaries.
+lightyear = { version = "0.31", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 postcard = { version = "1", features = ["alloc"] }

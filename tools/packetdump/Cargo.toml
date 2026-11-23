@@ -21,3 +21,11 @@ ron = "0.12"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 # Reads the display filter from `packetdump.toml`.
 toml = "1"
+
+[dev-dependencies]
+# `src/wire.rs` is a hand-written restatement of lightyear's packet layout. This
+# dependency exists so a test can push a payload through the real transport and
+# parse the resulting datagram: when lightyear changes the framing, that test is
+# the tripwire instead of the tool silently decoding nonsense.
+lightyear = { version = "0.31", default-features = false, features = ["std"] }
+bevy_app = "0.20"

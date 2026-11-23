@@ -36,9 +36,10 @@ pub struct Game {
     pub world: StaticWorld,
     pub move_params: MoveParams,
     pub accumulator: f32,
-    /// Set by a tick, cleared once the snapshots have been sent. Without this the
-    /// network system would re-send the same snapshot on every frame.
-    pub snapshots_pending: bool,
+    /// Snapshots produced since the last dispatch, merged per player. A frame can
+    /// advance several ticks, and the simulation's own buffer only keeps the
+    /// latest one, so the queue is what preserves the earlier ticks' corrections.
+    pending: Vec<(u64, proto::ServerSnapshot)>,
 }
 
 impl Default for Game {
@@ -54,8 +55,18 @@ impl Game {
             world: StaticWorld::test_room(),
             move_params: MoveParams::default(),
             accumulator: 0.0,
-            snapshots_pending: false,
+            pending: Vec::new(),
         }
+    }
+
+    /// Snapshots waiting to go out, one per player, in the simulation's order.
+    pub fn pending(&self) -> &[(u64, proto::ServerSnapshot)] {
+        &self.pending
+    }
+
+    /// Drops the dispatched snapshots without freeing the buffer.
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     /// Advances at most `max_ticks` fixed steps for `delta` seconds of wall time.
@@ -79,8 +90,61 @@ impl Game {
         // `Simulation::step` owns the tick counter and writes the snapshots into
         // its own buffer, so this is the whole fixed step.
         self.sim.step(&self.world);
-        self.snapshots_pending = true;
+        self.collect_snapshots();
     }
+
+    /// Folds this tick's snapshots into the pending queue.
+    ///
+    /// Players keep their order in the simulation's dense array, so the queue is
+    /// merged positionally; when the order changed (a player left mid-frame) the
+    /// queue restarts from this tick rather than matching the wrong bodies.
+    fn collect_snapshots(&mut self) {
+        let fresh = self.sim.snapshots();
+        let aligned = self.pending.len() == fresh.len()
+            && self
+                .pending
+                .iter()
+                .zip(fresh)
+                .all(|((a, _), (b, _))| a == b);
+        if !aligned {
+            self.pending.clear();
+            self.pending.extend_from_slice(fresh);
+            return;
+        }
+        for ((_, merged), (_, next)) in self.pending.iter_mut().zip(fresh) {
+            merge_snapshot(merged, next);
+        }
+    }
+}
+
+/// Folds `next`'s correction into `merged`, keeping the newer informational fields.
+///
+/// Both ticks' corrections describe velocity changes the client has not seen, so
+/// they are summed instead of the older one being dropped; the newest normal and
+/// sequence number win, because the client dedupes by sequence.
+fn merge_snapshot(merged: &mut proto::ServerSnapshot, next: &proto::ServerSnapshot) {
+    match (&mut merged.correction, next.correction) {
+        (Some(into), Some(from)) => {
+            let a = Vec3::from_array(into.velocity_delta);
+            let b = Vec3::from_array(from.velocity_delta);
+            into.velocity_delta = (a + b).to_array();
+            into.seq = from.seq;
+            into.tick = from.tick;
+            into.epoch = from.epoch;
+            if from.hard_normal.is_some() {
+                into.hard_normal = from.hard_normal;
+            }
+        }
+        (slot @ None, from) => *slot = from,
+        // `merged` carries a correction `next` no longer does: keep it, it has
+        // not been sent yet.
+        (Some(_), None) => {}
+    }
+    merged.server_tick = next.server_tick;
+    merged.acked_seq = next.acked_seq;
+    merged.shadow_position = next.shadow_position;
+    merged.resync = next.resync;
+    merged.peers = next.peers;
 }
 
 #[derive(Resource)]
@@ -169,6 +233,7 @@ fn run_bot_benchmark(bot_count: usize, duration_s: f32) {
 
         for bot in roster.iter_mut() {
             let packet = proto::PlayerMovementPacket {
+                version: proto::PROTOCOL_VERSION,
                 seq: (client_tick.0 & 0xFFFF) as u16,
                 player: bot.id,
                 report: proto::MovementReport {
@@ -274,5 +339,80 @@ mod tests {
         let ran = g.advance(5.0, 8);
         assert_eq!(ran, 8);
         assert_eq!(g.accumulator, 0.0);
+    }
+
+    fn correction(seq: u16, dv: f32) -> proto::CollisionCorrection {
+        proto::CollisionCorrection {
+            seq,
+            tick: proto::Tick::new(9),
+            epoch: 1,
+            velocity_delta: [dv, 0.0, 0.0],
+            hard_normal: None,
+        }
+    }
+
+    #[test]
+    fn a_later_tick_without_a_correction_keeps_the_unsent_one() {
+        let mut merged = proto::ServerSnapshot {
+            server_tick: proto::Tick::new(9),
+            correction: Some(correction(3, 1.0)),
+            ..Default::default()
+        };
+        let next = proto::ServerSnapshot {
+            server_tick: proto::Tick::new(10),
+            ..Default::default()
+        };
+        merge_snapshot(&mut merged, &next);
+
+        let kept = merged
+            .correction
+            .expect("the frame dropped a correction that was never sent");
+        assert_eq!(kept.seq, 3);
+        assert_eq!(merged.server_tick, proto::Tick::new(10));
+    }
+
+    #[test]
+    fn two_ticks_of_contact_leave_as_one_accumulated_correction() {
+        let mut merged = proto::ServerSnapshot {
+            correction: Some(correction(3, 1.0)),
+            ..Default::default()
+        };
+        let mut next = proto::ServerSnapshot {
+            correction: Some(proto::CollisionCorrection {
+                hard_normal: Some([1.0, 0.0, 0.0]),
+                ..correction(4, 0.5)
+            }),
+            ..Default::default()
+        };
+        next.resync = true;
+        merge_snapshot(&mut merged, &next);
+
+        let c = merged.correction.expect("correction lost");
+        assert_eq!(c.seq, 4, "the newer sequence number must win");
+        assert!(
+            (c.velocity_delta[0] - 1.5).abs() < 1e-6,
+            "deltas were not summed"
+        );
+        assert_eq!(c.hard_normal, Some([1.0, 0.0, 0.0]));
+        assert!(
+            merged.resync,
+            "resync is sticky and must come from the newest tick"
+        );
+    }
+
+    #[test]
+    fn a_multi_tick_frame_keeps_a_snapshot_for_every_player() {
+        let mut game = Game::new();
+        game.sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+        game.sim.add_player(2, Vec3::new(0.3, 0.9, 0.0));
+        let step = proto::SERVER_TICK_DT;
+        game.advance(step * 2.5, 8);
+
+        assert_eq!(game.pending().len(), 2, "a player lost its snapshot");
+        assert_eq!(game.pending()[0].0, 1);
+        assert_eq!(game.pending()[1].0, 2);
+
+        game.clear_pending();
+        assert!(game.pending().is_empty());
     }
 }

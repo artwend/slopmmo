@@ -211,6 +211,7 @@ mod tests {
 
     fn sample_input() -> PlayerMovementPacket {
         PlayerMovementPacket {
+            version: proto::PROTOCOL_VERSION,
             seq: 77,
             player: 0xDEAD_BEEF,
             report: MovementReport {

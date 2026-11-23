@@ -18,6 +18,15 @@ pub use packet::{
 use core::f32::consts::TAU;
 use serde::{Deserialize, Serialize};
 
+/// Wire-compatibility tag carried by every [`PlayerMovementPacket`].
+///
+/// Lightyear only compares protocol hashes when its `replication` feature is on,
+/// and this build does not enable it, so message registration order is unchecked.
+/// Both ends therefore state their version in-band and the server rejects a
+/// packet that does not match instead of silently ignoring a client built from a
+/// different tree. Bump it on any layout or registration change.
+pub const PROTOCOL_VERSION: u16 = 1;
+
 /// Client prediction rate: the KCC and the local solve run this fast.
 pub const CLIENT_TICK_HZ: u32 = 60;
 /// Seconds per client prediction tick.

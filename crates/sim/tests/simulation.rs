@@ -270,6 +270,7 @@ fn jump_leaves_the_ground_then_returns() {
 
 fn packet(seq: u16, tick: u32, player: u64, pos: Vec3, vel: Vec3) -> proto::PlayerMovementPacket {
     proto::PlayerMovementPacket {
+        version: proto::PROTOCOL_VERSION,
         seq,
         player,
         report: proto::MovementReport {
@@ -282,6 +283,25 @@ fn packet(seq: u16, tick: u32, player: u64, pos: Vec3, vel: Vec3) -> proto::Play
         },
         inputs: Vec::new(),
     }
+}
+
+#[test]
+fn a_packet_from_another_protocol_revision_is_rejected() {
+    let mut sim = Simulation::new(SimConfig::default());
+    sim.add_player(1, Vec3::new(0.0, 0.9, 0.0));
+    sim.tick = Tick::new(100);
+
+    let mut packet = packet(1, 100, 1, Vec3::new(0.0, 0.9, 0.0), Vec3::ZERO);
+    packet.version = proto::PROTOCOL_VERSION.wrapping_add(1);
+    assert_eq!(sim.ingest(&packet), Err(Reject::WrongVersion));
+    assert_eq!(sim.stats.wrong_version, 1);
+    assert_eq!(sim.stats.accepted, 0);
+
+    // The same report from this build is accepted, so the guard is the version
+    // and not the packet.
+    let mut current = packet;
+    current.version = proto::PROTOCOL_VERSION;
+    assert_eq!(sim.ingest(&current), Ok(()));
 }
 
 #[test]
