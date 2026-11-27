@@ -121,6 +121,14 @@ impl Plugin for SharedPlugin {
     }
 }
 
+/// The capsule collider every player carries, client and server.
+///
+/// The reference solver in [`kcc`] defaults to this collider, so both describe
+/// the same body.
+pub fn player_collider() -> Collider {
+    Collider::capsule(PLAYER_RADIUS, CAPSULE_LENGTH)
+}
+
 /// Physics bundle shared by server-spawned players and client-side predicted
 /// copies. Only the networked components are replicated; the rest is rebuilt
 /// locally on the client.
@@ -132,7 +140,7 @@ pub fn player_physics_bundle(position: Vec3) -> impl Bundle {
         GroundSnapping::default(),
         StairStepping::default(),
         UpDirection::default(),
-        Collider::capsule(PLAYER_RADIUS, CAPSULE_LENGTH),
+        player_collider(),
         Position::from(position),
         Rotation::default(),
         LinearVelocity::default(),
