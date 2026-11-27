@@ -18,13 +18,11 @@ running code instead of arguing about them.
 
 | Crate | Role |
 | --- | --- |
-| `crates/shared` | The network protocol (components, inputs, `ProtocolPlugin`), the physics/character pipeline and the one movement system both sides run |
-| `crates/sim` | Pure simulation math: the velocity model, the reference capsule solver, the static test room. No Bevy ECS |
+| `crates/shared` | Everything both sides share: the network protocol (components, inputs, `ProtocolPlugin`), the physics/character pipeline, the one movement system, and the pure simulation math (velocity model, reference capsule solver, static test room) |
 | `crates/kcc-avian` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`) |
 | `crates/server` | Headless Bevy app: UDP endpoint, one replicated player per connected client |
 | `crates/client` | Bevy window with the predicted character, plus a headless scripted CI mode |
-| `crates/proto` | Legacy packet format kept for the developer tool below; the game no longer uses it |
-| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes the legacy Lightyear framing and movement messages |
+| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes the live Lightyear protocol: input messages, protocol metadata, replicon traffic and ping/pong |
 
 ## Design in one page
 
@@ -46,7 +44,7 @@ The details that matter:
 - **The character controller is the predicted simulation.** A player is a `VirtualCharacter`
   with a capsule collider, not a rigid body. `shared::apply_player_input` turns the
   `Movement`/`Jump`/`Sprint` action values into a velocity with the same
-  `sim::movement::step_velocity_raw` on both sides, and `MoveAndSlidePlugin` moves the capsule
+  `shared::step_velocity_raw` on both sides, and `MoveAndSlidePlugin` moves the capsule
   during `PhysicsSchedule`. `Position`, `Rotation` and `LinearVelocity` are registered with
   custom (non-rigid-body) replication, prediction, interpolation and correction rules.
 - **Input is BEI actions.** The server owns and replicates the action entities; the owning client
@@ -73,7 +71,7 @@ The details that matter:
 
 [ADR 006](docs/decisions/006-netcode-lightyear.md) is now **implemented**: the wire, the input
 buffering, prediction/rollback, interpolation and visual correction all come from Lightyear. The
-older hand-rolled `net` path was removed; `proto` survives only for `packetdump`.
+older hand-rolled `net` path was removed; `proto` survives only for the legacy packet types.
 
 ## Build, test, run
 
@@ -128,15 +126,22 @@ cargo run -p client -- --connect 127.0.0.1:5888
 Controls: **WASD** move, **Space** jump, **Shift** sprint. The camera follows the predicted
 player.
 
-### Parsed packet view (dev tool, legacy format)
+### Parsed packet view (dev tool)
 
-`tools/packetdump` decodes the **old** `PlayerMovementPacket`/`ServerSnapshot` framing. The live
-game now speaks Lightyear's replication protocol, so the tool is kept as a reference for the
-previous wire format rather than as a current analyzer:
+`tools/packetdump` is a transparent UDP relay: point a client at it and it forwards every datagram
+to the server while printing what it contains. It decodes the live protocol — the client's
+`InputMessage` (end tick, target entities and their action states), the `ProtocolCheck` and
+`SenderMetadata` metadata messages, and ping/pong. The three replicon channels carry
+`bevy_replicon`'s own replication framing rather than messages, so they are reported by channel
+and size:
 
 ```sh
 cargo run -p packetdump -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
+cargo run -p client -- --connect 127.0.0.1:4001
 ```
+
+`--detail` prints the decoded message as RON, `--hex` appends a datagram dump, and
+`tools/packetdump/packetdump.toml` holds the display filter.
 
 ## What is not here
 

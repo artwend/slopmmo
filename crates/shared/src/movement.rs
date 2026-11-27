@@ -7,6 +7,11 @@
 
 use bevy_math::Vec3;
 
+/// Top ground speed, metres per second.
+pub const MAX_SPEED: f32 = 6.0;
+/// Ground acceleration, metres per second squared.
+pub const MAX_ACCEL: f32 = 24.0;
+
 #[derive(Clone, Copy, Debug)]
 pub struct MoveParams {
     pub max_speed: f32,
@@ -21,9 +26,9 @@ pub struct MoveParams {
 impl Default for MoveParams {
     fn default() -> Self {
         Self {
-            max_speed: proto::MAX_SPEED,
-            sprint_speed: proto::MAX_SPEED * 1.5,
-            ground_accel: proto::MAX_ACCEL,
+            max_speed: MAX_SPEED,
+            sprint_speed: MAX_SPEED * 1.5,
+            ground_accel: MAX_ACCEL,
             ground_friction: 14.0,
             air_accel: 6.0,
             gravity: -24.0,
@@ -40,42 +45,6 @@ impl MoveParams {
             self.max_speed
         }
     }
-}
-
-/// Rotates the stick axes into world space using the frame's camera yaw.
-///
-/// Bevy cameras look down local `-Z`, so at yaw 0 "forward" is world `-Z`.
-pub fn wish_world(input: &proto::InputFrame) -> Vec3 {
-    let [x, z] = input.wish_dir();
-    let yaw = input.camera_yaw_rad();
-    let (s, c) = yaw.sin_cos();
-    let dir = Vec3::new(c * x + s * z, 0.0, -s * x + c * z);
-    if dir.length_squared() > 1.0 {
-        dir.normalize()
-    } else {
-        dir
-    }
-}
-
-/// One tick of velocity integration from a wire-format input frame.
-pub fn step_velocity(
-    params: &MoveParams,
-    input: &proto::InputFrame,
-    velocity: Vec3,
-    grounded: bool,
-    dt: f32,
-) -> Vec3 {
-    // Stick input is camera-relative; yaw comes from the frame so the server can
-    // replay the exact same vector from the same bytes.
-    step_velocity_raw(
-        params,
-        wish_world(input),
-        input.sprint(),
-        input.jump(),
-        velocity,
-        grounded,
-        dt,
-    )
 }
 
 /// One tick of velocity integration from a world-space wish direction.

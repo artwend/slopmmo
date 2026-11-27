@@ -17,7 +17,7 @@ use crate::message::{Kind, MessageKey};
 /// Config file name looked up when `--config` is not given.
 pub const FILE_NAME: &str = "packetdump.toml";
 
-const KNOWN_NAMES: &str = "input, snapshot, ping, pong, internal or ack";
+const KNOWN_NAMES: &str = "input, metadata, replication, ping, pong, internal or ack";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,8 +151,8 @@ impl Target {
     }
 }
 
-/// Names are case-insensitive and ignore `_` and `-`, so `PlayerMovementPacket`
-/// and `player-movement-packet` both work.
+/// Names are case-insensitive and ignore `_` and `-`, so `InputMessage` and
+/// `input-message` both work.
 fn kind_from_name(name: &str) -> Option<Kind> {
     let normalized: String = name
         .chars()
@@ -160,8 +160,11 @@ fn kind_from_name(name: &str) -> Option<Kind> {
         .map(|ch| ch.to_ascii_lowercase())
         .collect();
     match normalized.as_str() {
-        "input" | "playermovementpacket" => Some(Kind::Input),
-        "snapshot" | "serversnapshot" => Some(Kind::Snapshot),
+        "input" | "inputmessage" => Some(Kind::Input),
+        "metadata" | "protocol" | "protocolcheck" | "sendermetadata" => Some(Kind::Metadata),
+        "replication" | "updates" | "mutations" | "mutationacks" | "acks" => {
+            Some(Kind::Replication)
+        }
         "ping" => Some(Kind::Ping),
         "pong" => Some(Kind::Pong),
         "internal" | "unknown" | "compressed" => Some(Kind::Internal),
@@ -214,7 +217,8 @@ mod tests {
         let filter = PacketFilter::default();
         for kind in [
             Kind::Input,
-            Kind::Snapshot,
+            Kind::Metadata,
+            Kind::Replication,
             Kind::Ping,
             Kind::Pong,
             Kind::Internal,
@@ -228,7 +232,7 @@ mod tests {
     fn a_bare_entry_selects_only_that_packet() {
         let filter = filter(&["input"]);
         assert!(filter.allows(key(Kind::Input)));
-        assert!(!filter.allows(key(Kind::Snapshot)));
+        assert!(!filter.allows(key(Kind::Metadata)));
         assert!(!filter.allows(MessageKey::ack()), "ACK is a packet too");
     }
 
@@ -245,14 +249,14 @@ mod tests {
     fn exclusion_wins_over_inclusion() {
         let filter = filter(&["input", "!input"]);
         assert!(!filter.allows(key(Kind::Input)));
-        assert!(!filter.allows(key(Kind::Snapshot)));
+        assert!(!filter.allows(key(Kind::Metadata)));
     }
 
     #[test]
     fn names_are_case_insensitive_and_match_the_struct_names() {
-        let filter = filter(&["PlayerMovementPacket", "server_snapshot"]);
+        let filter = filter(&["InputMessage", "protocol_check"]);
         assert!(filter.allows(key(Kind::Input)));
-        assert!(filter.allows(key(Kind::Snapshot)));
+        assert!(filter.allows(key(Kind::Metadata)));
         assert!(!filter.allows(key(Kind::Ping)));
     }
 
@@ -260,11 +264,11 @@ mod tests {
     fn a_number_matches_the_message_net_id() {
         let filter = filter(&["!3"]);
         assert!(!filter.allows(MessageKey {
-            kind: Kind::Snapshot,
+            kind: Kind::Metadata,
             net_id: Some(3),
         }));
         assert!(filter.allows(MessageKey {
-            kind: Kind::Snapshot,
+            kind: Kind::Metadata,
             net_id: Some(4),
         }));
         assert!(filter.allows(key(Kind::Internal)), "no net id to match");

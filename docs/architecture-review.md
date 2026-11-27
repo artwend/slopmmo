@@ -70,7 +70,7 @@ not move.
 | Replication | Snapshot state replication + message protocol hybrid |
 | Transport | UDP, unreliable + sequenced where applicable, Protobuf-like binary |
 | Engine | Bevy 0.20, fixed 60 Hz server tick |
-| KCC | Avian's virtual character (`VirtualCharacter` + `MoveAndSlidePlugin`) in `crates/kcc-avian`; `sim::kcc` is the engine-free reference solver. |
+| KCC | Avian's virtual character (`VirtualCharacter` + `MoveAndSlidePlugin`) in `crates/kcc-avian`; `shared::kcc` is the engine-free reference solver. |
 | Terrain collision | **Client only.** Server holds no landscape data at all |
 | Entity collision | **Server only** (players in PvP, bosses), custom capsule solver, no Avian |
 | Anti-cheat | Deliberately deprioritised. Cheap checks only; "don't make cheating trivial" |

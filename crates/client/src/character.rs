@@ -74,7 +74,10 @@ pub fn spawn_terrain(
 }
 
 fn capsule_mesh(meshes: &mut Assets<Mesh>) -> Mesh3d {
-    Mesh3d(meshes.add(Capsule3d::new(sim::PLAYER_RADIUS, sim::CAPSULE_LENGTH)))
+    Mesh3d(meshes.add(Capsule3d::new(
+        shared::PLAYER_RADIUS,
+        shared::CAPSULE_LENGTH,
+    )))
 }
 
 /// Own player: predicts the character controller locally.

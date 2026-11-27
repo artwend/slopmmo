@@ -10,11 +10,21 @@ publish = false
 description = "Developer-only CLI packet analyzer for the lightyear movement protocol"
 
 [dependencies]
-proto.workspace = true
 # Command line parsing and `--help`.
 clap = { version = "4", features = ["derive"] }
-# Decodes the message payloads. Lightyear serializes registered messages with
-# postcard; the framing itself is parsed in `src/wire.rs`.
+# The message types are lightyear's own, so their layout cannot drift from the
+# wire format the way a hand-written mirror could. The feature set must match
+# the client's: `interpolation` adds a field to `InputMessage`.
+#
+# The packet framing itself is still parsed in `src/wire.rs`.
+lightyear = { version = "0.31", default-features = false, features = [
+  "std",
+  "replication",
+  "interpolation",
+  "input_bei",
+] }
+# Decodes the message payloads; lightyear serializes registered messages with
+# postcard.
 postcard = { version = "1", features = ["alloc"] }
 # RON is the console representation of decoded packet content.
 ron = "0.12"
@@ -27,5 +37,4 @@ toml = "1"
 # dependency exists so a test can push a payload through the real transport and
 # parse the resulting datagram: when lightyear changes the framing, that test is
 # the tripwire instead of the tool silently decoding nonsense.
-lightyear = { version = "0.31", default-features = false, features = ["std"] }
 bevy_app = "0.20"

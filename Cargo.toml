@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/shared",
     "crates/proto",
-    "crates/sim",
     "crates/kcc-avian",
     "crates/server",
     "crates/client",
@@ -17,8 +16,6 @@ rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-proto = { path = "crates/proto" }
-sim = { path = "crates/sim" }
 kcc-avian = { path = "crates/kcc-avian" }
 shared = { path = "crates/shared" }
 serde = { version = "1", default-features = false, features = [

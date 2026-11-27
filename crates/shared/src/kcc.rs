@@ -2,8 +2,8 @@
 //!
 //! This is the engine-free *reference* solver. The client uses
 //! `crates/kcc-avian` instead, which runs Avian's `MoveAndSlide` over the same
-//! terrain; keeping this one pure is what lets `sim`'s tests and the server's
-//! bot benchmark run without a physics engine.
+//! terrain; keeping this one pure is what lets the collider math be reasoned
+//! about (and unit-tested) without a physics engine.
 //!
 //! No step-up yet — see the `TODO` on [`move_and_slide`]. Without a step height
 //! the controller cannot climb a 0.3 m ledge, which is fine while the test room
@@ -13,6 +13,7 @@ use bevy_math::Vec3;
 use bevy_shape::Aabb3d;
 
 use crate::world::{Aabb3dExt, StaticWorld};
+use crate::{PLAYER_HEIGHT, PLAYER_RADIUS};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Capsule {
@@ -65,7 +66,7 @@ pub struct KccParams {
 impl Default for KccParams {
     fn default() -> Self {
         Self {
-            capsule: Capsule::from_height(proto::PLAYER_RADIUS, proto::PLAYER_HEIGHT),
+            capsule: Capsule::from_height(PLAYER_RADIUS, PLAYER_HEIGHT),
             skin: 0.001,
             ground_probe: 0.15,
             max_slope_cos: 0.6,

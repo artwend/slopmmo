@@ -15,9 +15,12 @@
     the traffic to the server and prints each parsed packet. Without -Capture
     the clients connect straight to the server.
 
-    Headless clients write their output to target/local-run/client-<player>.log
+    Headless clients write their output to target/local-run/client-<slot>.log
     and are printed when the run finishes. Keep -Duration above the scripted
     session length; -Duration is ignored for windowed clients.
+
+    Player identity is assigned by the server; -PlayerBase only numbers the
+    client slots in console output and headless log names.
 
 .EXAMPLE
     .\tools\run-local.ps1
@@ -246,39 +249,39 @@ try {
     }
 
     for ($index = 0; $index -lt $Clients; $index++) {
-        $player = $PlayerBase + $index
+        $slot = $PlayerBase + $index
         if ($Headless) {
-            $log = Join-Path $LogDir "client-$player.log"
-            $err = Join-Path $LogDir "client-$player.err.log"
+            $log = Join-Path $LogDir "client-$slot.log"
+            $err = Join-Path $LogDir "client-$slot.err.log"
             Remove-Item -LiteralPath $log, $err -ErrorAction SilentlyContinue
             $seconds = $Duration.ToString([System.Globalization.CultureInfo]::InvariantCulture)
             $process = Start-Process -FilePath $clientExe `
-                -ArgumentList @('--headless', '--connect', $clientTarget, '--player', "$player", '--seconds', $seconds) `
+                -ArgumentList @('--headless', '--connect', $clientTarget, '--seconds', $seconds) `
                 -WorkingDirectory $RepoRoot `
                 -RedirectStandardOutput $log `
                 -RedirectStandardError $err `
                 -PassThru -WindowStyle Hidden
             $clientRuns += [pscustomobject]@{
                 Process  = $process
-                Player   = $player
+                Slot     = $slot
                 Log      = $log
                 Err      = $err
                 Headless = $true
             }
-            Write-Host "client   player $player -> $clientTarget (headless, pid $($process.Id), log $log)"
+            Write-Host "client $slot -> $clientTarget (headless, pid $($process.Id), log $log)"
         } else {
             $process = Start-Process -FilePath $clientExe `
-                -ArgumentList @('--connect', $clientTarget, '--player', "$player") `
+                -ArgumentList @('--connect', $clientTarget) `
                 -WorkingDirectory $RepoRoot `
                 -PassThru
             $clientRuns += [pscustomobject]@{
                 Process  = $process
-                Player   = $player
+                Slot     = $slot
                 Log      = $null
                 Err      = $null
                 Headless = $false
             }
-            Write-Host "client   player $player -> $clientTarget (windowed, pid $($process.Id))"
+            Write-Host "client $slot -> $clientTarget (windowed, pid $($process.Id))"
         }
     }
 
@@ -313,7 +316,7 @@ try {
     # sending so their logs can be collected and the run can finish cleanly.
     foreach ($run in $clientRuns) {
         if (-not $run.Process.HasExited) {
-            Stop-Child -Process $run.Process -Label "client player $($run.Player)"
+            Stop-Child -Process $run.Process -Label "client $($run.Slot)"
             $run.Process.WaitForExit(2000) | Out-Null
         }
     }
@@ -321,11 +324,11 @@ try {
     foreach ($run in $clientRuns) {
         $exitCode = if ($run.Process.HasExited) { $run.Process.ExitCode } else { -1 }
         if (-not $run.Headless) {
-            Write-Host "client player $($run.Player) window closed (exit $exitCode)" -ForegroundColor DarkGray
+            Write-Host "client $($run.Slot) window closed (exit $exitCode)" -ForegroundColor DarkGray
             continue
         }
         Write-Host ""
-        Write-Host "=== client player $($run.Player) (exit $exitCode) ===" -ForegroundColor Cyan
+        Write-Host "=== client $($run.Slot) (exit $exitCode) ===" -ForegroundColor Cyan
         if ($run.Log) {
             $lines = Get-Content -LiteralPath $run.Log -ErrorAction SilentlyContinue
             if ($lines) {
@@ -341,7 +344,7 @@ try {
         }
         if ($exitCode -ne 0) {
             $failed = $true
-            Write-Warning "client player $($run.Player) failed with exit code $exitCode"
+            Write-Warning "client $($run.Slot) failed with exit code $exitCode"
         }
     }
 
@@ -358,7 +361,7 @@ try {
     $failed = $true
 } finally {
     foreach ($run in $clientRuns) {
-        Stop-Child -Process $run.Process -Label "client player $($run.Player)"
+        Stop-Child -Process $run.Process -Label "client $($run.Slot)"
     }
     Stop-Child -Process $relay -Label 'packetdump'
     Stop-Child -Process $server -Label 'server'

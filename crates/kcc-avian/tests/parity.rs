@@ -1,16 +1,15 @@
 //! The virtual character has to answer the same questions as the reference
-//! solver.
+//! solver in `shared::kcc`.
 //!
-//! Each test mirrors one in `crates/sim/tests/simulation.rs`, so the client can
-//! switch backends without changing what the movement model relies on. Fixed
-//! steps are driven by the test, not the wall clock.
+//! Each test mirrors one in the pure-solver suite, so the client can switch
+//! backends without changing what the movement model relies on. Fixed steps are
+//! driven by the test, not the wall clock.
 
 use std::time::Duration;
 
 use bevy::prelude::*;
 use kcc_avian::prelude::*;
-use sim::Aabb3d;
-use sim::world::StaticWorld;
+use shared::{Aabb3d, StaticWorld};
 
 const GRAVITY: f32 = -24.0;
 const TIMESTEP_HZ: f64 = 60.0;

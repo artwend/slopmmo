@@ -3,8 +3,20 @@
 //! The protocol ([`protocol`]) is registered identically on both ends, and the
 //! physics pipeline is installed once here so both sides simulate the character
 //! with the same plugins, the same fixed timestep and the same movement model.
+//!
+//! Split of responsibility:
+//!
+//! * [`kcc`] — the reference capsule-vs-static-geometry solver.
+//! * [`movement`] — the input→velocity model. This is the single movement
+//!   implementation: the networked client and server both feed it the
+//!   enhanced-input action values every fixed tick.
+//! * [`world`] — the static test room, shared by both sides so they collide
+//!   against identical geometry.
 
+pub mod kcc;
+pub mod movement;
 pub mod protocol;
+pub mod world;
 
 use core::time::Duration;
 
@@ -20,12 +32,24 @@ use kcc_avian::prelude::{
 use lightyear::avian3d::plugin::{AvianReplicationMode, LightyearAvianPlugin};
 use lightyear::input::bei::prelude::{Action, Actions};
 use lightyear::prelude::*;
-use sim::{MoveParams, StaticWorld};
 
 use crate::protocol::*;
 
+pub use bevy_shape::Aabb3d;
+pub use kcc::{Capsule, KccParams, MoveOutput, move_and_slide};
 pub use kcc_avian::avian3d::prelude::{Collider, LinearVelocity, Position, Rotation};
 pub use kcc_avian::prelude::Grounded;
+pub use movement::{MAX_ACCEL, MAX_SPEED, MoveParams, step_velocity_raw};
+pub use world::{Aabb3dExt, StaticWorld};
+
+/// Capsule radius used for every player, client and server.
+pub const PLAYER_RADIUS: f32 = 0.4;
+/// Full capsule height, including both caps.
+pub const PLAYER_HEIGHT: f32 = 1.8;
+/// Length of the capsule's cylindrical section, excluding both caps.
+pub const CAPSULE_LENGTH: f32 = PLAYER_HEIGHT - 2.0 * PLAYER_RADIUS;
+/// Height of the capsule centre while resting on the floor.
+pub const RESTING_HEIGHT: f32 = CAPSULE_LENGTH * 0.5 + PLAYER_RADIUS;
 
 /// The movement model's tunables, stored as a Bevy resource.
 #[derive(Resource, Clone, Copy, Debug, Default)]
@@ -106,7 +130,7 @@ pub fn player_physics_bundle(position: Vec3) -> impl Bundle {
         GroundSnapping::default(),
         StairStepping::default(),
         UpDirection::default(),
-        Collider::capsule(sim::PLAYER_RADIUS, sim::CAPSULE_LENGTH),
+        Collider::capsule(PLAYER_RADIUS, CAPSULE_LENGTH),
         Position::from(position),
         Rotation::default(),
         LinearVelocity::default(),
@@ -117,7 +141,7 @@ pub fn player_physics_bundle(position: Vec3) -> impl Bundle {
 }
 
 /// Collider-only bundle for one static terrain box.
-pub fn terrain_bundle(b: &sim::Aabb3d) -> impl Bundle {
+pub fn terrain_bundle(b: &Aabb3d) -> impl Bundle {
     let size = b.max - b.min;
     let centre = Vec3::from((b.max + b.min) * 0.5);
     (
@@ -136,7 +160,7 @@ pub fn test_room() -> StaticWorld {
 /// Spawn a player slot for a peer.
 pub fn initial_position(peer_id: PeerId) -> Vec3 {
     let slot = (peer_id.to_bits() % 6) as f32;
-    Vec3::new((slot - 2.5) * 6.0, sim::RESTING_HEIGHT, 0.0)
+    Vec3::new((slot - 2.5) * 6.0, RESTING_HEIGHT, 0.0)
 }
 
 /// Feeds the player's BEI action values into the shared velocity model.
@@ -176,7 +200,7 @@ fn apply_player_input(
         if wish.length_squared() > 1.0 {
             wish = wish.normalize();
         }
-        velocity.0 = sim::step_velocity_raw(
+        velocity.0 = step_velocity_raw(
             &params,
             wish,
             pressed_sprint,

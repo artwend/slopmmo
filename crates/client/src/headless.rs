@@ -106,7 +106,7 @@ impl Script {
         let phases = phases();
         Self {
             left: phases[0].ticks,
-            peak_y: sim::RESTING_HEIGHT,
+            peak_y: shared::RESTING_HEIGHT,
             phases,
             index: 0,
             budget,
@@ -166,7 +166,7 @@ fn apply_script(
     };
     let dt = time.delta_secs();
     if let Ok((mut velocity, grounded)) = players.single_mut() {
-        velocity.0 = sim::step_velocity_raw(
+        velocity.0 = shared::step_velocity_raw(
             &params.0,
             phase.wish,
             phase.sprint,
@@ -225,7 +225,7 @@ fn run_offline(seconds: f32) -> Report {
         .world_mut()
         .spawn(shared::player_physics_bundle(Vec3::new(
             0.0,
-            sim::RESTING_HEIGHT,
+            shared::RESTING_HEIGHT,
             0.0,
         )))
         .id();
@@ -459,7 +459,7 @@ pub fn run(args: &Args) -> ExitCode {
     if !a.grounded {
         failures.push("did not settle back to the floor");
     }
-    if (a.pos.y - sim::RESTING_HEIGHT).abs() > 0.05 {
+    if (a.pos.y - shared::RESTING_HEIGHT).abs() > 0.05 {
         failures.push("resting height is wrong");
     }
 

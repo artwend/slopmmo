@@ -236,7 +236,7 @@ pub struct ServerSnapshot {
     ///
     /// The client files the list under `server_tick`, so the local solve reads
     /// the set that belonged to the tick it predicts rather than "whatever
-    /// arrived last" (`sim::peers::PeerHistory`).
+    /// arrived last".
     pub peers: PeerList,
     /// Set while a resumed session has not yet been seen at the server's
     /// placement: the client must adopt `shadow_position`. Kept set until an

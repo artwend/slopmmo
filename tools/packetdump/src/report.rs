@@ -4,11 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use proto::{PlayerMovementPacket, ServerSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::config::PacketFilter;
-use crate::message::{self, Decoded, Direction, MessageKey};
+use crate::message::{self, Decoded, Direction, MessageKey, PlayerInput};
 use crate::relay::Datagram;
 use crate::wire::{Batch, Body, Fragment, Packet, WireError};
 
@@ -22,12 +21,6 @@ struct Pong {
     id: u16,
     tick_diff: u32,
     overstep: u8,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct UnknownMessage {
-    net_id: Option<u16>,
-    bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -71,6 +64,22 @@ pub struct Reporter {
     totals: Totals,
     ids: HashMap<(Direction, SocketAddr), PacketIdTracker>,
     rate: RateSnapshot,
+    /// Widest line the periodic statistics may print.
+    width: usize,
+}
+
+/// Default width for the periodic statistics when `COLUMNS` is not set.
+const DEFAULT_STATS_WIDTH: usize = 100;
+
+/// The terminal width, from `COLUMNS` when the shell exports it. A very narrow
+/// value is ignored: wrapping every field is harder to read than a slightly
+/// long line.
+fn stats_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.trim().parse::<usize>().ok())
+        .filter(|width| *width >= 40)
+        .unwrap_or(DEFAULT_STATS_WIDTH)
 }
 
 impl Reporter {
@@ -87,6 +96,7 @@ impl Reporter {
             totals: Totals::default(),
             ids: HashMap::new(),
             rate: RateSnapshot::default(),
+            width: stats_width(),
         }
     }
 
@@ -121,14 +131,14 @@ impl Reporter {
         match &parsed {
             Ok(packet) => {
                 ack_only = matches!(packet.body, Body::AckOnly);
-                record_messages(stats, packet, datagram.direction);
+                record_messages(stats, packet);
             }
             Err(_) => stats.malformed += 1,
         }
 
         let visible = self.opts.directions.shows(datagram.direction)
             && (self.opts.show_acks || !ack_only)
-            && packet_allows_filter(&self.opts.filter, &parsed, datagram.direction);
+            && packet_allows_filter(&self.opts.filter, &parsed);
         if visible {
             self.displayed += 1;
             let elapsed = self.start.elapsed();
@@ -177,22 +187,26 @@ impl Reporter {
         println!();
         println!("{}", self.paint("90", &"-".repeat(100)));
         println!(
-            "summary  {elapsed:.3}s  {} datagrams  {}  |  C->S {} pkt {}  S->C {} pkt {}  |  gaps {}  reordered {}  malformed {}",
+            "summary  {elapsed:.3}s  {} datagrams  {}",
             self.observed,
             human_bytes(total_bytes),
+        );
+        println!(
+            "         C->S {} pkt {}   S->C {} pkt {}",
             self.totals.c2s.packets,
             human_bytes(self.totals.c2s.bytes),
             self.totals.s2c.packets,
             human_bytes(self.totals.s2c.bytes),
+        );
+        println!(
+            "         gaps {}  reordered {}  malformed {}",
             self.totals.c2s.gaps + self.totals.s2c.gaps,
             self.totals.c2s.reordered + self.totals.s2c.reordered,
             self.totals.c2s.malformed + self.totals.s2c.malformed,
         );
         let internal = self.totals.internal_messages();
         if internal > 0 {
-            println!(
-                "         {internal} internal lightyear messages were not movement packets and were only counted"
-            );
+            println!("         {internal} messages were not decoded and were only counted");
         }
     }
 
@@ -218,23 +232,23 @@ impl Reporter {
             Direction::ClientToServer => datagram.from.port(),
             Direction::ServerToClient => datagram.to.port(),
         };
-        let body = match parsed {
-            Ok(packet) => self.body_summary(packet, datagram.direction),
-            Err(error) => self.paint("31", &format!("malformed: {error}")),
-        };
         match parsed {
-            Ok(packet) => format!(
-                "#{no:06}  {:>8.3}s  {direction} :{peer:<5}  {:>4} B  pkt={:<5} t={:<8}  {body}",
-                elapsed.as_secs_f64(),
-                packet.len,
-                packet.header.packet_id,
-                packet.header.tick,
-            ),
-            Err(_) => format!(
-                "#{no:06}  {:>8.3}s  {direction} :{peer:<5}  {:>4} B  {:<14}  {body}",
+            Ok(packet) => {
+                let head = format!(
+                    "#{no:06}  {:>8.3}s  {direction} :{peer:<5} {:>4} B  pkt={}  t={}",
+                    elapsed.as_secs_f64(),
+                    packet.len,
+                    packet.header.packet_id,
+                    packet.header.tick,
+                );
+                join_parts(head, self.body_parts(packet))
+            }
+            Err(error) => format!(
+                "#{no:06}  {:>8.3}s  {direction} :{peer:<5} {:>4} B  {:<20}  {}",
                 elapsed.as_secs_f64(),
                 datagram.bytes.len(),
                 "",
+                self.paint("31", &format!("malformed: {error}")),
             ),
         }
     }
@@ -271,7 +285,7 @@ impl Reporter {
                 match &packet.body {
                     Body::Data(batches) => {
                         for batch in batches {
-                            self.print_batch(batch, datagram.direction);
+                            self.print_batch(batch);
                         }
                     }
                     Body::Fragment {
@@ -279,9 +293,9 @@ impl Reporter {
                         fragment,
                         tail,
                     } => {
-                        self.print_fragment(*channel, fragment, datagram.direction);
+                        self.print_fragment(*channel, fragment);
                         for batch in tail {
-                            self.print_batch(batch, datagram.direction);
+                            self.print_batch(batch);
                         }
                     }
                     Body::AckOnly => println!("  (acknowledgement only)"),
@@ -298,25 +312,28 @@ impl Reporter {
         }
     }
 
-    fn body_summary(&self, packet: &Packet<'_>, direction: Direction) -> String {
+    /// One summary per displayed message in the datagram. Several messages can
+    /// share a datagram, and their summaries would overrun a terminal if they
+    /// were joined on one line, so the caller prints each on its own line.
+    fn body_parts(&self, packet: &Packet<'_>) -> Vec<String> {
         match &packet.body {
-            Body::AckOnly => format!(
+            Body::AckOnly => vec![format!(
                 "{}last_ack={} bits=0x{:08x}",
                 self.kind("35", "ACK"),
                 packet.header.last_ack_packet_id,
                 packet.header.ack_bitfield
-            ),
-            Body::Compressed => format!(
+            )],
+            Body::Compressed => vec![format!(
                 "{}({} body, not decoded)",
                 self.kind("33", "COMPRESSED"),
                 packet.header.packet_type.name()
-            ),
+            )],
             Body::Fragment {
                 channel,
                 fragment,
                 tail,
             } => {
-                let mut out = format!(
+                let mut parts = vec![format!(
                     "{}channel={} msg={} {}/{} {} B",
                     self.kind("33", "FRAGMENT"),
                     channel,
@@ -324,21 +341,20 @@ impl Reporter {
                     fragment.index + 1,
                     fragment.count,
                     fragment.payload.len()
-                );
+                )];
                 if fragment.index == 0 && tail.is_empty() {
-                    let decoded = message::decode(*channel, direction, fragment.payload);
+                    let decoded = message::decode(*channel, fragment.payload);
                     if self.opts.filter.allows(decoded.key()) {
-                        out.push_str("  ");
-                        out.push_str(&self.decoded_summary(decoded));
+                        parts.push(self.decoded_summary(decoded));
                     }
                 }
-                out
+                parts
             }
             Body::Data(batches) => {
                 let mut parts = Vec::new();
                 for batch in batches {
                     for message in &batch.messages {
-                        let decoded = message::decode(batch.channel, direction, message.payload);
+                        let decoded = message::decode(batch.channel, message.payload);
                         if !self.opts.filter.allows(decoded.key()) {
                             continue;
                         }
@@ -346,9 +362,9 @@ impl Reporter {
                     }
                 }
                 if parts.is_empty() {
-                    format!("{}(no messages)", self.kind("37", "DATA"))
+                    vec![format!("{}(no messages)", self.kind("37", "DATA"))]
                 } else {
-                    parts.join("  |  ")
+                    parts
                 }
             }
         }
@@ -356,8 +372,23 @@ impl Reporter {
 
     fn decoded_summary(&self, decoded: Decoded) -> String {
         match decoded {
-            Decoded::Input { net_id, packet } => self.input_summary(net_id, &packet),
-            Decoded::Snapshot { net_id, packet } => self.snapshot_summary(net_id, &packet),
+            Decoded::Input { net_id, message } => self.input_summary(net_id, &message),
+            Decoded::ProtocolCheck { net_id, .. } => format!(
+                // The three checksums are 20-digit numbers; the one-line view
+                // keeps them for `--detail` only so the line stays readable.
+                "{}net_id={net_id}  protocol check",
+                self.kind("35", "METADATA")
+            ),
+            Decoded::SenderMetadata { net_id, bytes } => format!(
+                "{}net_id={net_id}  sender metadata, {bytes} B",
+                self.kind("35", "METADATA")
+            ),
+            Decoded::Replication { channel, bytes } => format!(
+                "{}{}  {} B",
+                self.kind("34", "REPLICATION"),
+                channel.name(),
+                bytes
+            ),
             Decoded::Ping { net_id, id } => self.ping_summary(net_id, id),
             Decoded::Pong {
                 net_id,
@@ -365,30 +396,28 @@ impl Reporter {
                 tick_diff,
                 overstep,
             } => self.pong_summary(net_id, id, tick_diff, overstep),
-            Decoded::Unknown { net_id, bytes } => format!(
-                "{}{}",
-                self.kind("90", "INTERNAL"),
-                ron_compact(&UnknownMessage {
-                    net_id,
-                    bytes: bytes as u64,
-                })
-            ),
+            Decoded::Unknown { net_id, bytes } => self.unknown_summary(net_id, bytes),
         }
     }
 
-    fn input_summary(&self, net_id: u16, packet: &PlayerMovementPacket) -> String {
-        format!(
-            "{}net_id={net_id}  {}",
-            self.kind("36", "INPUT"),
-            ron_compact(packet)
-        )
+    fn unknown_summary(&self, net_id: Option<u16>, bytes: usize) -> String {
+        match net_id {
+            Some(net_id) => format!("{}net_id={net_id}  {bytes} B", self.kind("90", "INTERNAL")),
+            None => format!("{}{bytes} B, no message id", self.kind("90", "INTERNAL")),
+        }
     }
 
-    fn snapshot_summary(&self, net_id: u16, packet: &ServerSnapshot) -> String {
+    fn input_summary(&self, net_id: u16, message: &PlayerInput) -> String {
         format!(
-            "{}net_id={net_id}  {}",
-            self.kind("32", "SNAPSHOT"),
-            ron_compact(packet)
+            "{}net_id={net_id}  end_tick={}  targets={}{}",
+            self.kind("36", "INPUT"),
+            message.end_tick.0,
+            message.inputs.len(),
+            if message.rebroadcast {
+                "  rebroadcast"
+            } else {
+                ""
+            }
         )
     }
 
@@ -412,37 +441,47 @@ impl Reporter {
         )
     }
 
-    fn print_batch(&self, batch: &Batch<'_>, direction: Direction) {
-        let name = channel_name(batch, direction);
-        println!("  channel {}{}", batch.channel, name);
+    fn print_batch(&self, batch: &Batch<'_>) {
+        println!("  channel {}{}", batch.channel, channel_name(batch.channel));
         for (index, message) in batch.messages.iter().enumerate() {
-            let decoded = message::decode(batch.channel, direction, message.payload);
+            let decoded = message::decode(batch.channel, message.payload);
             if !self.opts.filter.allows(decoded.key()) {
                 continue;
             }
             let message_id = message
                 .id
                 .map_or_else(String::new, |id| format!("  msg_id={id}"));
+            let size = message.payload.len();
             match decoded {
-                Decoded::Input { net_id, packet } => {
+                Decoded::Input {
+                    net_id,
+                    message: input,
+                } => {
                     println!(
-                        "    msg {index}  PlayerMovementPacket  net_id={net_id}  {} B{message_id}",
-                        message.payload.len()
+                        "    msg {index}  InputMessage  net_id={net_id}  {size} B{message_id}"
                     );
-                    self.print_ron(&packet);
+                    self.print_ron(input.as_ref());
                 }
-                Decoded::Snapshot { net_id, packet } => {
+                Decoded::ProtocolCheck { net_id, hashes } => {
                     println!(
-                        "    msg {index}  ServerSnapshot  net_id={net_id}  {} B{message_id}",
-                        message.payload.len()
+                        "    msg {index}  ProtocolCheck  net_id={net_id}  {size} B{message_id}"
                     );
-                    self.print_ron(&packet);
+                    self.print_ron(&hashes);
+                }
+                Decoded::SenderMetadata { net_id, .. } => {
+                    println!(
+                        "    msg {index}  SenderMetadata  net_id={net_id}  {size} B{message_id}"
+                    );
+                    println!("      (lightyear's ToBytes layout, not interpreted)");
+                }
+                Decoded::Replication { channel, bytes } => {
+                    println!(
+                        "    msg {index}  replicon {}  {bytes} B{message_id}",
+                        channel.name()
+                    );
                 }
                 Decoded::Ping { net_id, id } => {
-                    println!(
-                        "    msg {index}  Ping  net_id={net_id}  {} B{message_id}",
-                        message.payload.len()
-                    );
+                    println!("    msg {index}  Ping  net_id={net_id}  {size} B{message_id}");
                     self.print_ron(&Ping { id });
                 }
                 Decoded::Pong {
@@ -451,10 +490,7 @@ impl Reporter {
                     tick_diff,
                     overstep,
                 } => {
-                    println!(
-                        "    msg {index}  Pong  net_id={net_id}  {} B{message_id}",
-                        message.payload.len()
-                    );
+                    println!("    msg {index}  Pong  net_id={net_id}  {size} B{message_id}");
                     self.print_ron(&Pong {
                         id,
                         tick_diff,
@@ -463,10 +499,7 @@ impl Reporter {
                 }
                 Decoded::Unknown { net_id, bytes } => {
                     println!("    msg {index}  internal  (not decoded)");
-                    self.print_ron(&UnknownMessage {
-                        net_id,
-                        bytes: bytes as u64,
-                    });
+                    println!("      net_id={net_id:?}  {bytes} B");
                 }
             }
         }
@@ -478,9 +511,10 @@ impl Reporter {
         }
     }
 
-    fn print_fragment(&self, channel: u16, fragment: &Fragment<'_>, direction: Direction) {
+    fn print_fragment(&self, channel: u16, fragment: &Fragment<'_>) {
         println!(
-            "  fragment  channel={channel}  message_id={}  {}/{}  compression={}  {} B",
+            "  fragment  channel={channel}{}  message_id={}  {}/{}  compression={}  {} B",
+            channel_name(channel),
             fragment.message_id,
             fragment.index + 1,
             fragment.count,
@@ -493,13 +527,19 @@ impl Reporter {
             fragment.payload.len()
         );
         if fragment.index == 0 {
-            let decoded = message::decode(channel, direction, fragment.payload);
+            let decoded = message::decode(channel, fragment.payload);
             if !self.opts.filter.allows(decoded.key()) {
                 return;
             }
             match decoded {
-                Decoded::Input { packet, .. } => self.print_ron(&packet),
-                Decoded::Snapshot { packet, .. } => self.print_ron(&packet),
+                Decoded::Input { message, .. } => self.print_ron(message.as_ref()),
+                Decoded::ProtocolCheck { hashes, .. } => self.print_ron(&hashes),
+                Decoded::SenderMetadata { .. } => {
+                    println!("    (lightyear's ToBytes layout, not interpreted)")
+                }
+                Decoded::Replication { channel, bytes } => {
+                    println!("    replicon {}  {bytes} B", channel.name())
+                }
                 Decoded::Ping { id, .. } => self.print_ron(&Ping { id }),
                 Decoded::Pong {
                     id,
@@ -533,36 +573,48 @@ impl Reporter {
             .saturating_duration_since(self.last_stats)
             .as_secs_f64()
             .max(1e-9);
-        let c2s = &self.totals.c2s;
-        let s2c = &self.totals.s2c;
-        let c2s_packets = c2s.packets.saturating_sub(self.rate.c2s_packets);
-        let c2s_bytes = c2s.bytes.saturating_sub(self.rate.c2s_bytes);
-        let s2c_packets = s2c.packets.saturating_sub(self.rate.s2c_packets);
-        let s2c_bytes = s2c.bytes.saturating_sub(self.rate.s2c_bytes);
+        for line in self.stats_block(elapsed, self.width) {
+            println!("{line}");
+        }
+    }
 
-        println!(
-            "stats {:>6.2}s  |  C->S {:>5} pkt {:>10}  {:>6.1} pkt/s {:>10}  |  {}  |  gaps {}  reorder {}  bad {}",
-            elapsed,
-            c2s.packets,
-            human_bytes(c2s.bytes),
-            c2s_packets as f64 / elapsed,
-            human_rate(c2s_bytes as f64 / elapsed),
-            messages_summary(c2s),
-            c2s.gaps,
-            c2s.reordered,
-            c2s.malformed
-        );
-        println!(
-            "             |  S->C {:>5} pkt {:>10}  {:>6.1} pkt/s {:>10}  |  {}  |  gaps {}  reorder {}  bad {}",
-            s2c.packets,
-            human_bytes(s2c.bytes),
-            s2c_packets as f64 / elapsed,
-            human_rate(s2c_bytes as f64 / elapsed),
-            messages_summary(s2c),
-            s2c.gaps,
-            s2c.reordered,
-            s2c.malformed
-        );
+    /// One statistics block, laid out in lines no wider than `width`:
+    /// a header, then a rates line and the per-kind breakdown per direction.
+    fn stats_block(&self, elapsed: f64, width: usize) -> Vec<String> {
+        let mut lines = vec![format!("stats {elapsed:>6.2}s")];
+        for (label, stats, packets, bytes) in [
+            (
+                "C->S",
+                &self.totals.c2s,
+                self.totals
+                    .c2s
+                    .packets
+                    .saturating_sub(self.rate.c2s_packets),
+                self.totals.c2s.bytes.saturating_sub(self.rate.c2s_bytes),
+            ),
+            (
+                "S->C",
+                &self.totals.s2c,
+                self.totals
+                    .s2c
+                    .packets
+                    .saturating_sub(self.rate.s2c_packets),
+                self.totals.s2c.bytes.saturating_sub(self.rate.s2c_bytes),
+            ),
+        ] {
+            lines.push(format!(
+                "  {label}  {:>5} pkt  {:>10}  {:>7.1} pkt/s  {:>10}  gaps {}  reorder {}  bad {}",
+                stats.packets,
+                human_bytes(stats.bytes),
+                packets as f64 / elapsed,
+                human_rate(bytes as f64 / elapsed),
+                stats.gaps,
+                stats.reordered,
+                stats.malformed,
+            ));
+            lines.extend(wrap_entries("         ", &message_entries(stats), width));
+        }
+        lines
     }
 
     fn paint_dir(&self, direction: Direction) -> String {
@@ -663,13 +715,13 @@ struct RateSnapshot {
 
 /// Calls `f` once per message whose type this datagram reveals. Fragment
 /// continuations and compressed bodies are not decoded and are skipped.
-fn for_each_message(packet: &Packet<'_>, direction: Direction, mut f: impl FnMut(Decoded, usize)) {
+fn for_each_message(packet: &Packet<'_>, mut f: impl FnMut(Decoded, usize)) {
     match &packet.body {
         Body::Data(batches) => {
             for batch in batches {
                 for message in &batch.messages {
                     f(
-                        message::decode(batch.channel, direction, message.payload),
+                        message::decode(batch.channel, message.payload),
                         message.payload.len(),
                     );
                 }
@@ -682,14 +734,14 @@ fn for_each_message(packet: &Packet<'_>, direction: Direction, mut f: impl FnMut
         } => {
             if fragment.index == 0 {
                 f(
-                    message::decode(*channel, direction, fragment.payload),
+                    message::decode(*channel, fragment.payload),
                     fragment.payload.len(),
                 );
             }
             for batch in tail {
                 for message in &batch.messages {
                     f(
-                        message::decode(batch.channel, direction, message.payload),
+                        message::decode(batch.channel, message.payload),
                         message.payload.len(),
                     );
                 }
@@ -702,11 +754,7 @@ fn for_each_message(packet: &Packet<'_>, direction: Direction, mut f: impl FnMut
 /// A datagram is printed when any message inside it survives the filter.
 /// Messages whose type is not in the datagram (an ACK, a continuation
 /// fragment, a compressed or malformed body) are matched as their own key.
-fn packet_allows_filter(
-    filter: &PacketFilter,
-    parsed: &Result<Packet<'_>, WireError>,
-    direction: Direction,
-) -> bool {
+fn packet_allows_filter(filter: &PacketFilter, parsed: &Result<Packet<'_>, WireError>) -> bool {
     let Ok(packet) = parsed else {
         return filter.allows(MessageKey::internal());
     };
@@ -716,7 +764,7 @@ fn packet_allows_filter(
         Body::Data(_) | Body::Fragment { .. } => {
             let mut seen = false;
             let mut allowed = false;
-            for_each_message(packet, direction, |decoded, _| {
+            for_each_message(packet, |decoded, _| {
                 seen = true;
                 allowed |= filter.allows(decoded.key());
             });
@@ -730,24 +778,25 @@ fn packet_allows_filter(
     }
 }
 
-fn record_messages(stats: &mut DirStats, packet: &Packet<'_>, direction: Direction) {
-    for_each_message(packet, direction, |decoded, bytes| {
+fn record_messages(stats: &mut DirStats, packet: &Packet<'_>) {
+    for_each_message(packet, |decoded, bytes| {
         let stat = stats.messages.entry(decoded.key().kind.name()).or_default();
         stat.count += 1;
         stat.bytes += bytes as u64;
     });
 }
 
-fn channel_name(batch: &Batch<'_>, direction: Direction) -> String {
-    for message in &batch.messages {
-        match message::decode(batch.channel, direction, message.payload) {
-            Decoded::Input { .. } => return "  (InputChannel)".to_string(),
-            Decoded::Snapshot { .. } => return "  (SnapshotChannel)".to_string(),
-            Decoded::Ping { .. } | Decoded::Pong { .. } => return "  (PingChannel)".to_string(),
-            Decoded::Unknown { .. } => {}
-        }
+/// The lightyear channel names, in `ChannelRegistry` order.
+fn channel_name(channel: u16) -> &'static str {
+    match channel {
+        0 => "  (PingChannel)",
+        1 => "  (MetadataChannel)",
+        2 => "  (RepliconUpdatesChannel)",
+        3 => "  (RepliconMutationsChannel)",
+        4 => "  (RepliconMutationAcksChannel)",
+        5 => "  (InputChannel)",
+        _ => "  (unknown)",
     }
-    "  (internal)".to_string()
 }
 
 fn ron_compact<T: ?Sized + Serialize>(value: &T) -> String {
@@ -771,16 +820,56 @@ fn ron_pretty<T: ?Sized + Serialize>(value: &T) -> String {
         .unwrap_or_else(|error| format!("<RON error: {error}>"))
 }
 
-fn messages_summary(stats: &DirStats) -> String {
+/// Joins a packet header with its message summaries: the first stays on the
+/// header line, the rest continue on their own indented lines so a datagram
+/// carrying several messages never overruns the terminal.
+fn join_parts(head: String, parts: Vec<String>) -> String {
+    let mut out = head;
+    for (index, part) in parts.iter().enumerate() {
+        out.push_str(if index == 0 { "  " } else { "\n    " });
+        out.push_str(part);
+    }
+    out
+}
+
+/// One entry per message kind seen in a direction, `KIND count/size`.
+fn message_entries(stats: &DirStats) -> Vec<String> {
     if stats.messages.is_empty() {
-        return "-".to_string();
+        return vec!["-".to_string()];
     }
     stats
         .messages
         .iter()
         .map(|(name, stat)| format!("{name} {}/{}", stat.count, human_bytes(stat.bytes)))
-        .collect::<Vec<_>>()
-        .join("  ")
+        .collect()
+}
+
+/// Packs `entries` into lines no wider than `width`. The first line starts at
+/// column 0; continuation lines are indented with `indent`.
+fn wrap_entries(indent: &str, entries: &[String], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = indent.to_string();
+    let mut has_entry = false;
+    for entry in entries {
+        let extra = if has_entry {
+            entry.len() + 2
+        } else {
+            entry.len()
+        };
+        if has_entry && current.len() + extra > width {
+            lines.push(std::mem::replace(&mut current, indent.to_string()));
+            has_entry = false;
+        }
+        if has_entry {
+            current.push_str("  ");
+        }
+        current.push_str(entry);
+        has_entry = true;
+    }
+    if has_entry {
+        lines.push(current);
+    }
+    lines
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -811,6 +900,116 @@ fn human_rate(bytes_per_second: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ProtocolHashes;
+
+    #[test]
+    fn wrap_entries_keeps_each_line_within_the_width() {
+        let entries: Vec<String> = (0..6).map(|i| format!("KIND{i} 1/2 B")).collect();
+        let lines = wrap_entries("    ", &entries, 30);
+        assert!(lines.len() > 1, "{lines:?}");
+        for line in &lines {
+            assert!(line.len() <= 30, "{} chars: {line}", line.len());
+        }
+        assert!(
+            lines[1].starts_with("    KIND"),
+            "continuation lines are indented: {lines:?}"
+        );
+    }
+
+    fn reporter() -> Reporter {
+        Reporter::new(Options {
+            detail: false,
+            hex: false,
+            show_acks: true,
+            directions: DirectionFilter::Both,
+            color: false,
+            stats_every: None,
+            limit: 0,
+            filter: PacketFilter::default(),
+        })
+    }
+
+    fn stats_reporter() -> Reporter {
+        let mut reporter = reporter();
+        reporter.totals.c2s.packets = 942;
+        reporter.totals.c2s.bytes = 106_803;
+        reporter.totals.c2s.gaps = 1;
+        for (name, count, bytes) in [
+            ("INPUT", 935u64, 89_497u64),
+            ("METADATA", 2, 16),
+            ("PING", 17, 51),
+            ("PONG", 16, 128),
+            ("REPLICATION", 16, 34),
+        ] {
+            reporter
+                .totals
+                .c2s
+                .messages
+                .insert(name, MessageStat { count, bytes });
+        }
+        reporter
+    }
+
+    #[test]
+    fn the_stats_block_wraps_instead_of_overrunning_the_terminal() {
+        let lines = stats_reporter().stats_block(1.0, 100);
+        for line in &lines {
+            assert!(line.len() <= 100, "{} chars: {line}", line.len());
+        }
+        assert!(lines[0].starts_with("stats "), "{:?}", lines[0]);
+        assert!(lines[1].contains("C->S"), "{:?}", lines[1]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("REPLICATION 16/34 B")),
+            "every kind is still reported: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_protocol_check_line_stays_within_the_stats_width() {
+        let payload = [
+            0x02u8, 0x01, 0xed, 0xbd, 0xd2, 0x84, 0xc6, 0x82, 0xb1, 0xc0, 0x03, 0x01, 0xb9, 0xb9,
+            0xbf, 0xab, 0xb2, 0xc8, 0xb2, 0x90, 0xc9, 0x01, 0x01, 0xfa, 0xae, 0x83, 0x96, 0xa0,
+            0xe5, 0x91, 0xc8, 0x38,
+        ];
+        let bytes = data_datagram(&[&payload], 1);
+        let datagram = Datagram {
+            direction: Direction::ServerToClient,
+            from: "127.0.0.1:4000".parse().unwrap(),
+            to: "127.0.0.1:54321".parse().unwrap(),
+            bytes: &bytes,
+        };
+        let parsed = Packet::parse(datagram.bytes);
+        let line = reporter().format_line(2, Duration::from_millis(1594), &datagram, &parsed);
+        assert!(line.contains("protocol check"), "{line}");
+        assert!(line.len() <= 100, "{} chars: {line}", line.len());
+    }
+
+    #[test]
+    fn a_datagram_with_several_messages_puts_each_on_its_own_line() {
+        // Joining both summaries would push the line past the terminal width.
+        let bytes = data_datagram(
+            &[&[0x00, 0x11, 0x22], &[0x04, 0x00, 0xb1, 0x01, 0x00, 0x00]],
+            5,
+        );
+        let datagram = Datagram {
+            direction: Direction::ClientToServer,
+            from: "127.0.0.1:54321".parse().unwrap(),
+            to: "127.0.0.1:4000".parse().unwrap(),
+            bytes: &bytes,
+        };
+        let parsed = Packet::parse(datagram.bytes);
+        let line = reporter().format_line(584, Duration::from_millis(2008), &datagram, &parsed);
+
+        let lines: Vec<&str> = line.lines().collect();
+        assert_eq!(lines.len(), 2, "{line}");
+        for line in &lines {
+            assert!(line.len() <= 100, "{} chars: {line}", line.len());
+        }
+        assert!(lines[1].starts_with("    "), "continuation is indented");
+        assert!(lines[1].contains("INPUT"), "{line}");
+    }
 
     #[test]
     fn packet_id_tracker_counts_gaps_and_reordering_across_wrap() {
@@ -851,106 +1050,35 @@ mod tests {
         assert!(!DirectionFilter::ServerToClient.shows(Direction::ClientToServer));
     }
 
-    fn sample_input() -> PlayerMovementPacket {
-        PlayerMovementPacket {
-            version: proto::PROTOCOL_VERSION,
-            seq: 77,
-            player: 1,
-            report: proto::MovementReport {
-                tick: proto::Tick::new(90),
-                position: [0.0, 0.9, -1.5],
-                linear_velocity: [0.0, 0.0, -5.5],
-                angular_velocity: [0.0, 0.0, 0.0],
-                body_yaw: 0.0,
-                grounded: true,
-                applied_correction_seq: 3,
-            },
-            inputs: vec![proto::InputFrame {
-                tick: proto::Tick::new(90),
-                move_x: 0,
-                move_z: -127,
-                buttons: proto::buttons::JUMP,
-                camera_yaw: proto::quantise_yaw(0.0),
-            }],
-        }
-    }
-
-    fn sample_snapshot() -> ServerSnapshot {
-        ServerSnapshot {
-            server_tick: proto::Tick::new(90),
-            acked_seq: 3,
-            shadow_position: [0.0, 0.9, -1.5],
-            correction: Some(proto::CollisionCorrection {
-                seq: 7,
-                tick: proto::Tick::new(89),
-                epoch: 1,
-                velocity_delta: [0.0, 0.0, -0.5],
-                hard_normal: Some([0.0, 1.0, 0.0]),
-            }),
-            peers: std::iter::once(proto::PeerCollider {
-                player: 2,
-                position: [0.1, 0.2, 0.3],
-                body_yaw: 0.5,
-                mode: proto::peer_mode::SOFT,
-            })
-            .collect(),
-            resync: false,
-        }
-    }
-
     #[test]
-    fn movement_content_roundtrips_as_compact_named_ron() {
-        let input = sample_input();
-        let text = ron_compact(&input);
-        assert!(text.starts_with("PlayerMovementPacket("), "{text}");
-        assert!(text.contains("seq: 77"), "{text}");
-        assert!(text.contains("inputs: [InputFrame("), "{text}");
+    fn protocol_hashes_roundtrip_as_compact_named_ron() {
+        let hashes = ProtocolHashes {
+            messages: Some(1),
+            components: Some(2),
+            channels: Some(3),
+        };
+        let text = ron_compact(&hashes);
+        assert!(text.starts_with("ProtocolHashes("), "{text}");
+        assert!(text.contains("components: Some(2)"), "{text}");
         assert!(!text.contains('\n'), "{text}");
 
-        let decoded: PlayerMovementPacket = ron::from_str(&text).expect("RON roundtrip");
-        assert_eq!(decoded.seq, input.seq);
-        assert_eq!(decoded.player, input.player);
-        assert_eq!(decoded.inputs.len(), 1);
+        let decoded: ProtocolHashes = ron::from_str(&text).expect("RON roundtrip");
+        assert_eq!(decoded, hashes);
     }
 
     #[test]
     fn pretty_ron_is_multiline_and_named() {
-        let text = ron_pretty(&sample_input());
-        assert!(text.contains("PlayerMovementPacket("), "{text}");
-        assert!(text.contains("\n  seq: 77"), "{text}");
+        let text = ron_pretty(&ProtocolHashes {
+            messages: None,
+            components: None,
+            channels: None,
+        });
+        assert!(text.contains("ProtocolHashes("), "{text}");
         assert!(text.lines().count() > 3, "{text}");
     }
 
     #[test]
-    fn snapshot_content_roundtrips_as_ron() {
-        let snapshot = sample_snapshot();
-        let text = ron_compact(&snapshot);
-        assert!(text.starts_with("ServerSnapshot("), "{text}");
-        let decoded: ServerSnapshot = ron::from_str(&text).expect("RON roundtrip");
-        assert_eq!(decoded.server_tick.0, 90);
-        assert_eq!(decoded.peers.len(), 1);
-        assert!(decoded.correction.is_some());
-    }
-
-    #[test]
-    fn control_content_roundtrips_as_ron() {
-        let ping = ron_compact(&Ping { id: 3 });
-        assert!(ping.starts_with("Ping("), "{ping}");
-        let decoded: Ping = ron::from_str(&ping).expect("ping RON");
-        assert_eq!(decoded.id, 3);
-
-        let pong = ron_compact(&Pong {
-            id: 3,
-            tick_diff: 7,
-            overstep: 1,
-        });
-        assert!(pong.starts_with("Pong("), "{pong}");
-        let decoded: Pong = ron::from_str(&pong).expect("pong RON");
-        assert_eq!((decoded.id, decoded.tick_diff, decoded.overstep), (3, 7, 1));
-    }
-
-    #[test]
-    fn one_line_output_embeds_the_ron_payload() {
+    fn one_line_output_summarizes_an_input_message() {
         fn put_varint(out: &mut Vec<u8>, value: u64) {
             if value <= 63 {
                 out.push(value as u8);
@@ -963,15 +1091,16 @@ mod tests {
             }
         }
 
-        let mut payload = vec![2u8]; // PlayerMovementPacket net id
-        payload.extend_from_slice(&postcard::to_allocvec(&sample_input()).unwrap());
+        // An idle input message captured from the client: net id 4, no
+        // interpolation delay, `end_tick` 177, no targets, not a rebroadcast.
+        let payload = [0x04u8, 0x00, 0xb1, 0x01, 0x00, 0x00];
 
         let mut bytes = vec![0u8]; // Data packet
         bytes.extend_from_slice(&9u16.to_be_bytes());
         bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(&0u32.to_be_bytes());
         bytes.extend_from_slice(&5u32.to_be_bytes());
-        put_varint(&mut bytes, 1); // channel
+        put_varint(&mut bytes, 5); // InputChannel
         bytes.push(1); // one message
         bytes.push(0); // no message id
         put_varint(&mut bytes, payload.len() as u64);
@@ -997,9 +1126,11 @@ mod tests {
 
         let line = reporter.format_line(8, Duration::from_millis(1500), &datagram, &parsed);
         assert!(line.contains(":54321"), "{line}");
-        assert!(line.contains("net_id=2"), "{line}");
-        assert!(line.contains("PlayerMovementPacket("), "{line}");
-        assert!(line.contains("seq: 77"), "{line}");
+        assert!(line.contains("INPUT"), "{line}");
+        assert!(line.contains("net_id=4"), "{line}");
+        assert!(line.contains("end_tick=177"), "{line}");
+        assert!(line.contains("targets=0"), "{line}");
+        assert!(line.len() <= 100, "{} chars: {line}", line.len());
     }
 
     #[test]
@@ -1033,6 +1164,7 @@ mod tests {
         assert!(line.contains(":54321"), "{line}");
         assert!(line.contains("pkt=9"), "{line}");
         assert!(line.contains("ACK"), "{line}");
+        assert!(line.len() <= 100, "{} chars: {line}", line.len());
     }
 
     fn filter(entries: &[&str]) -> PacketFilter {
@@ -1062,30 +1194,17 @@ mod tests {
         let parsed = Packet::parse(&ping);
 
         let hide_ping = filter(&["!ping"]);
-        assert!(!packet_allows_filter(
-            &hide_ping,
-            &parsed,
-            Direction::ClientToServer
-        ));
+        assert!(!packet_allows_filter(&hide_ping, &parsed));
         let show_ping = filter(&["ping"]);
-        assert!(packet_allows_filter(
-            &show_ping,
-            &parsed,
-            Direction::ClientToServer
-        ));
+        assert!(packet_allows_filter(&show_ping, &parsed));
 
         // A mixed datagram stays visible while any message matches.
         let mixed = data_datagram(&[&[0x00, 0x12, 0x34], &[4, 0xff, 0x00]], 0);
         let mixed = Packet::parse(&mixed);
-        assert!(packet_allows_filter(
-            &filter(&["!ping"]),
-            &mixed,
-            Direction::ClientToServer
-        ));
+        assert!(packet_allows_filter(&filter(&["!ping"]), &mixed));
         assert!(!packet_allows_filter(
             &filter(&["!ping", "!internal"]),
-            &mixed,
-            Direction::ClientToServer
+            &mixed
         ));
 
         // An ACK carries no messages and only matches the `ack` name.
@@ -1095,15 +1214,7 @@ mod tests {
         ack.extend_from_slice(&0u32.to_be_bytes());
         ack.extend_from_slice(&7u32.to_be_bytes());
         let ack = Packet::parse(&ack);
-        assert!(packet_allows_filter(
-            &hide_ping,
-            &ack,
-            Direction::ClientToServer
-        ));
-        assert!(!packet_allows_filter(
-            &show_ping,
-            &ack,
-            Direction::ClientToServer
-        ));
+        assert!(packet_allows_filter(&hide_ping, &ack));
+        assert!(!packet_allows_filter(&show_ping, &ack));
     }
 }

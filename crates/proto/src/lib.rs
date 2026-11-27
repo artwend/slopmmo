@@ -1,9 +1,10 @@
-//! Legacy wire format, plus the tuning constants shared with `sim`.
+//! Legacy wire format.
 //!
 //! The game no longer speaks this protocol: client and server use Lightyear's
-//! replication through `shared::protocol`. The packet types remain for
-//! `tools/packetdump`, which decodes captures of the previous build, and the
-//! movement constants are still the source of `sim::MoveParams`.
+//! replication through `shared::protocol`. The packet types remain as a record
+//! of the previous build and for tools that decode old captures. The movement
+//! tuning now lives in `shared` (`shared::MoveParams` and the capsule
+//! constants), not here.
 //!
 //! Design constraints taken from the architecture review:
 //!
@@ -84,10 +85,6 @@ pub const NEIGHBOUR_RADIUS: f32 = 2.0;
 /// Maximum accepted collision pairs per player, after pair de-duplication.
 pub const MAX_PAIRS_PER_PLAYER: usize = 8;
 
-pub const PLAYER_RADIUS: f32 = 0.4;
-/// Full capsule height, including both caps.
-pub const PLAYER_HEIGHT: f32 = 1.8;
-
 /// Target gap kept between two touching capsules.
 pub const SOFT_MARGIN: f32 = 0.05;
 /// Maximum total velocity correction a single player may receive per tick.
@@ -103,9 +100,6 @@ pub const REPORT_WINDOW_MS: u32 = 500;
 /// staleness check runs on the server clock, so a fixed count would silently
 /// change the wall-clock window whenever the server tick rate changes.
 pub const REPORT_WINDOW: u32 = SERVER_TICK_HZ * REPORT_WINDOW_MS / 1000;
-
-pub const MAX_SPEED: f32 = 6.0;
-pub const MAX_ACCEL: f32 = 24.0;
 
 /// Fastest yaw rate the shadow accepts, rad/s.
 ///

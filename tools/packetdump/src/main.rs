@@ -1,10 +1,10 @@
-//! Developer-only packet analyzer for the movement protocol.
+//! Developer-only packet analyzer for the lightyear protocol.
 //!
 //! This is a transparent UDP relay, not a pcap tap: the client points at the
 //! relay and the relay forwards every datagram to the real server while
-//! decoding Lightyear framing, the two movement messages and ping/pong. That
-//! makes it usable on loopback without Npcap or administrator rights, and the
-//! server needs no configuration change.
+//! decoding lightyear framing, the input and protocol-metadata messages,
+//! replicon traffic and ping/pong. That makes it usable on loopback without
+//! Npcap or administrator rights, and the server needs no configuration change.
 
 mod cli;
 mod config;

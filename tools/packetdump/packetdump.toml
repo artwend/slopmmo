@@ -9,14 +9,15 @@
 # to hide that packet instead of selecting it.
 #
 # Names (case-insensitive, "_"/"-" ignored):
-#   input (PlayerMovementPacket), snapshot (ServerSnapshot), ping, pong,
+#   input (InputMessage), metadata (ProtocolCheck, SenderMetadata),
+#   replication (the replicon updates/mutations/acks channels), ping, pong,
 #   internal (also unknown, compressed) and ack (an ACK-only datagram).
 #
 # Exclusions win over inclusions, a datagram is printed when any of its
 # messages matches, and statistics still count every datagram.
 #
 # Examples:
-#   filter = ["input", "snapshot"]        # only movement traffic
+#   filter = ["input", "metadata"]        # only the lightyear message channels
 #   filter = ["!ping", "!pong", "!ack"]   # hide control traffic
-#   filter = ["!3"]                       # hide snapshot (net id 3)
+#   filter = ["!replication"]             # hide the replicated world
 filter = ["!ping", "!pong"]

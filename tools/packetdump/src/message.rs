@@ -1,24 +1,54 @@
 //! Decoding of message payloads out of a lightyear packet.
 //!
-//! Lightyear prefixes every serialized message with its registration net id (a
-//! lightyear varint). The movement messages are postcard values; Lightyear 0.31's
-//! `Ping`/`Pong` control messages use their own fixed layout on the dedicated
-//! ping channel. This tool does not build a protocol registry: it identifies a
-//! movement message by decoding it and requiring the whole payload to be
-//! consumed, with the packet's direction as the tie-breaker. Any other internal
-//! message is reported as unparsed instead of being mislabelled.
+//! Lightyear prefixes every registered message with its net id (a lightyear
+//! varint) and follows it with the message body, serialized with postcard. Both
+//! the message ids and the channel ids are handed out in registration order, so
+//! they depend on the plugin set: the constants below are the ids this
+//! repository's client and server agree on, and the tests decode real captures
+//! so a protocol change shows up as a failure instead of silent nonsense.
+//!
+//! The three replicon channels do not carry registered messages at all: their
+//! payloads are `bevy_replicon`'s own replication framing, so they are reported
+//! by channel instead of being misread as a message id.
 
-use proto::{PlayerMovementPacket, ServerSnapshot};
+use lightyear::input::bei::prelude::BEIStateSequence;
+use lightyear::input::input_message::InputMessage;
 use serde::de::DeserializeOwned;
 
 use crate::wire;
 
-/// Lightyear 0.31 registers `Ping` and `Pong` before the game protocol, so they
-/// own net ids 0 and 1 on channel 0. Everything in this analyzer is pinned to
-/// that version by `wire.rs` as well.
-const PING_CHANNEL: u16 = 0;
-const PING_NET_ID: u16 = 0;
-const PONG_NET_ID: u16 = 1;
+// `ChannelRegistry` ids, in registration order.
+pub const PING_CHANNEL: u16 = 0;
+pub const METADATA_CHANNEL: u16 = 1;
+pub const UPDATES_CHANNEL: u16 = 2;
+pub const MUTATIONS_CHANNEL: u16 = 3;
+pub const MUTATION_ACKS_CHANNEL: u16 = 4;
+pub const INPUT_CHANNEL: u16 = 5;
+
+// `MessageRegistry` ids, in registration order.
+pub const PING_NET_ID: u16 = 0;
+pub const PONG_NET_ID: u16 = 1;
+pub const PROTOCOL_CHECK_NET_ID: u16 = 2;
+pub const SENDER_METADATA_NET_ID: u16 = 3;
+pub const INPUT_NET_ID: u16 = 4;
+
+/// Stands in for `shared::protocol::Player` in the message's `PhantomData`.
+/// The type is never constructed, so only its `serde` impls matter.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PlayerActions;
+
+/// The input message this game sends; the one message whose body is worth
+/// decoding in full.
+pub type PlayerInput = InputMessage<BEIStateSequence<PlayerActions>>;
+
+/// Mirror of lightyear's `ProtocolCheck` event, which lives in a private
+/// module. It carries the three protocol checksums exchanged on connect.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+pub struct ProtocolHashes {
+    pub messages: Option<u64>,
+    pub components: Option<u64>,
+    pub channels: Option<u64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Direction {
@@ -35,15 +65,54 @@ impl Direction {
     }
 }
 
+/// One of the three `bevy_replicon` channels, which carry replication updates
+/// rather than registered messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReplicationChannel {
+    Updates,
+    Mutations,
+    MutationAcks,
+}
+
+impl ReplicationChannel {
+    fn from_id(channel: u16) -> Option<Self> {
+        match channel {
+            UPDATES_CHANNEL => Some(Self::Updates),
+            MUTATIONS_CHANNEL => Some(Self::Mutations),
+            MUTATION_ACKS_CHANNEL => Some(Self::MutationAcks),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Updates => "updates",
+            Self::Mutations => "mutations",
+            Self::MutationAcks => "mutation-acks",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Decoded {
     Input {
         net_id: u16,
-        packet: PlayerMovementPacket,
+        message: Box<PlayerInput>,
     },
-    Snapshot {
+    ProtocolCheck {
         net_id: u16,
-        packet: Box<ServerSnapshot>,
+        hashes: ProtocolHashes,
+    },
+    /// `SenderMetadata` is serialized with lightyear's `ToBytes` layout; it is
+    /// recognized but not interpreted. `bytes` is the whole message length.
+    SenderMetadata {
+        net_id: u16,
+        bytes: usize,
+    },
+    /// A replicon payload: entity updates, mutations or mutation acks.
+    Replication {
+        channel: ReplicationChannel,
+        bytes: usize,
     },
     Ping {
         net_id: u16,
@@ -56,8 +125,8 @@ pub enum Decoded {
         tick_diff: u32,
         overstep: u8,
     },
-    /// A registered lightyear message that is not part of the movement protocol
-    /// (or a payload that does not decode cleanly).
+    /// A registered message this tool does not know, or a payload that is not a
+    /// message at all.
     Unknown {
         net_id: Option<u16>,
         bytes: usize,
@@ -65,13 +134,17 @@ pub enum Decoded {
 }
 
 /// The packet kinds a display filter can name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
+    /// A client input message.
     Input,
-    Snapshot,
+    /// A lightyear protocol message (checksum or sender metadata).
+    Metadata,
+    /// A replicon update, mutation or mutation acknowledgement payload.
+    Replication,
     Ping,
     Pong,
-    /// A lightyear-internal message, a compressed body or a malformed datagram.
+    /// A compressed body, a malformed datagram or an unknown message.
     Internal,
     /// A datagram that carries only acknowledgements.
     Ack,
@@ -82,7 +155,8 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Input => "INPUT",
-            Self::Snapshot => "SNAPSHOT",
+            Self::Metadata => "METADATA",
+            Self::Replication => "REPLICATION",
             Self::Ping => "PING",
             Self::Pong => "PONG",
             Self::Internal => "INTERNAL",
@@ -119,7 +193,10 @@ impl Decoded {
     pub fn key(&self) -> MessageKey {
         let (kind, net_id) = match self {
             Self::Input { net_id, .. } => (Kind::Input, Some(*net_id)),
-            Self::Snapshot { net_id, .. } => (Kind::Snapshot, Some(*net_id)),
+            Self::ProtocolCheck { net_id, .. } | Self::SenderMetadata { net_id, .. } => {
+                (Kind::Metadata, Some(*net_id))
+            }
+            Self::Replication { .. } => (Kind::Replication, None),
             Self::Ping { net_id, .. } => (Kind::Ping, Some(*net_id)),
             Self::Pong { net_id, .. } => (Kind::Pong, Some(*net_id)),
             Self::Unknown { net_id, .. } => (Kind::Internal, *net_id),
@@ -128,7 +205,14 @@ impl Decoded {
     }
 }
 
-pub fn decode(channel: u16, direction: Direction, payload: &[u8]) -> Decoded {
+pub fn decode(channel: u16, payload: &[u8]) -> Decoded {
+    if let Some(channel) = ReplicationChannel::from_id(channel) {
+        return Decoded::Replication {
+            channel,
+            bytes: payload.len(),
+        };
+    }
+
     let Some((net_id, body)) = read_net_id(payload) else {
         return Decoded::Unknown {
             net_id: None,
@@ -136,34 +220,25 @@ pub fn decode(channel: u16, direction: Direction, payload: &[u8]) -> Decoded {
         };
     };
 
-    if let Some(control) = decode_control(channel, net_id, body) {
-        return control;
-    }
+    let decoded = match channel {
+        PING_CHANNEL => decode_control(net_id, body),
+        METADATA_CHANNEL => decode_metadata(net_id, body, payload.len()),
+        INPUT_CHANNEL if net_id == INPUT_NET_ID => {
+            decode_complete::<PlayerInput>(body).map(|message| Decoded::Input {
+                net_id,
+                message: Box::new(message),
+            })
+        }
+        _ => None,
+    };
 
-    let input = decode_complete::<PlayerMovementPacket>(body);
-    let snapshot = decode_complete::<ServerSnapshot>(body);
-    match (input, snapshot, direction) {
-        (Some(packet), None, _) => Decoded::Input { net_id, packet },
-        (None, Some(packet), _) => Decoded::Snapshot {
-            net_id,
-            packet: Box::new(packet),
-        },
-        (Some(packet), Some(_), Direction::ClientToServer) => Decoded::Input { net_id, packet },
-        (Some(_), Some(packet), Direction::ServerToClient) => Decoded::Snapshot {
-            net_id,
-            packet: Box::new(packet),
-        },
-        (None, None, _) => Decoded::Unknown {
-            net_id: Some(net_id),
-            bytes: body.len(),
-        },
-    }
+    decoded.unwrap_or(Decoded::Unknown {
+        net_id: Some(net_id),
+        bytes: body.len(),
+    })
 }
 
-fn decode_control(channel: u16, net_id: u16, body: &[u8]) -> Option<Decoded> {
-    if channel != PING_CHANNEL {
-        return None;
-    }
+fn decode_control(net_id: u16, body: &[u8]) -> Option<Decoded> {
     match (net_id, body.len()) {
         (PING_NET_ID, 2) => Some(Decoded::Ping {
             net_id,
@@ -179,6 +254,18 @@ fn decode_control(channel: u16, net_id: u16, body: &[u8]) -> Option<Decoded> {
     }
 }
 
+fn decode_metadata(net_id: u16, body: &[u8], payload_len: usize) -> Option<Decoded> {
+    match net_id {
+        PROTOCOL_CHECK_NET_ID => decode_complete::<ProtocolHashes>(body)
+            .map(|hashes| Decoded::ProtocolCheck { net_id, hashes }),
+        SENDER_METADATA_NET_ID => Some(Decoded::SenderMetadata {
+            net_id,
+            bytes: payload_len,
+        }),
+        _ => None,
+    }
+}
+
 fn read_net_id(payload: &[u8]) -> Option<(u16, &[u8])> {
     let (raw, body) = wire::read_varint(payload)?;
     Some((u16::try_from(raw).ok()?, body))
@@ -186,8 +273,8 @@ fn read_net_id(payload: &[u8]) -> Option<(u16, &[u8])> {
 
 fn decode_complete<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     match postcard::take_from_bytes::<T>(bytes) {
-        // A registry message can share a prefix with a movement message; only a
-        // decode that consumes the whole payload is accepted.
+        // Only a decode that consumes the whole payload is accepted: another
+        // message can share a prefix with the one we are looking for.
         Ok((value, [])) => Some(value),
         _ => None,
     }
@@ -196,181 +283,153 @@ fn decode_complete<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::{InputFrame, MovementReport, PeerCollider, Tick, peer_mode};
 
-    fn message_bytes(net_id: u16, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        if net_id <= 63 {
-            out.push(net_id as u8);
-        } else {
-            out.extend_from_slice(&(net_id | 0x4000).to_be_bytes());
-        }
-        out.extend_from_slice(payload);
-        out
-    }
+    /// The input-channel payload of a 22-byte datagram captured from the client
+    /// while it stood still: the message carries no inputs at all.
+    const IDLE_INPUT: &[u8] = &[0x04, 0x00, 0xb1, 0x01, 0x00, 0x00];
 
-    fn sample_input() -> PlayerMovementPacket {
-        PlayerMovementPacket {
-            version: proto::PROTOCOL_VERSION,
-            seq: 77,
-            player: 0xDEAD_BEEF,
-            report: MovementReport {
-                tick: Tick::new(1234),
-                position: [12.345, 1.5, -7.25],
-                linear_velocity: [3.5, -0.5, 0.0],
-                angular_velocity: [0.0, 1.5, 0.0],
-                body_yaw: 2.0,
-                grounded: true,
-                applied_correction_seq: 9,
-            },
-            inputs: vec![InputFrame {
-                tick: Tick::new(1234),
-                move_x: 100,
-                move_z: -40,
-                buttons: proto::buttons::JUMP | proto::buttons::SPRINT,
-                camera_yaw: proto::quantise_yaw(1.25),
-            }],
-        }
-    }
+    /// The input-channel payload of a 103-byte datagram captured while the
+    /// scripted client was moving: three targets with a full action snapshot.
+    const MOVING_INPUT: &[u8] = &[
+        0x04, 0x00, 0xb2, 0x01, 0x03, 0x00, 0xe5, 0xfc, 0xff, 0xff, 0x8f, 0x80, 0x80, 0x80, 0x80,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xe4, 0xfc, 0xff, 0xff, 0x8f, 0x80, 0x80, 0x80, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe6, 0xfc, 0xff, 0xff, 0x8f, 0x80,
+        0x80, 0x80, 0x80, 0x01, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+    ];
 
-    fn sample_snapshot() -> ServerSnapshot {
-        ServerSnapshot {
-            server_tick: Tick::new(9),
-            acked_seq: 3,
-            shadow_position: [1.0, 0.0, 2.0],
-            correction: None,
-            peers: core::iter::once(PeerCollider {
-                player: 1,
-                position: [0.1, 0.2, 0.3],
-                body_yaw: 0.5,
-                mode: peer_mode::SOFT,
-            })
-            .collect(),
-            resync: true,
-        }
+    #[test]
+    fn an_idle_input_message_decodes() {
+        let Decoded::Input { net_id, message } = decode(INPUT_CHANNEL, IDLE_INPUT) else {
+            panic!("not decoded as an input message");
+        };
+        assert_eq!(net_id, INPUT_NET_ID);
+        assert_eq!(message.end_tick.0, 177);
+        assert!(message.inputs.is_empty(), "an idle tick sends no targets");
+        assert!(!message.rebroadcast);
     }
 
     #[test]
-    fn an_input_packet_decodes_in_both_directions() {
-        let payload = message_bytes(2, &postcard::to_allocvec(&sample_input()).unwrap());
-        for direction in [Direction::ClientToServer, Direction::ServerToClient] {
-            let Decoded::Input { net_id, packet } = decode(1, direction, &payload) else {
-                panic!("not decoded as input");
+    fn a_moving_input_message_decodes() {
+        let Decoded::Input { message, .. } = decode(INPUT_CHANNEL, MOVING_INPUT) else {
+            panic!("not decoded as an input message");
+        };
+        assert_eq!(message.end_tick.0, 178);
+        assert_eq!(message.inputs.len(), 3, "one target per predicted player");
+        assert!(!message.rebroadcast);
+    }
+
+    #[test]
+    fn a_protocol_check_decodes_to_its_checksums() {
+        // Captured from the server's first packet after the handshake.
+        let payload = [
+            0x02, 0x01, 0xed, 0xbd, 0xd2, 0x84, 0xc6, 0x82, 0xb1, 0xc0, 0x03, 0x01, 0xb9, 0xb9,
+            0xbf, 0xab, 0xb2, 0xc8, 0xb2, 0x90, 0xc9, 0x01, 0x01, 0xfa, 0xae, 0x83, 0x96, 0xa0,
+            0xe5, 0x91, 0xc8, 0x38,
+        ];
+        let Decoded::ProtocolCheck { net_id, hashes } = decode(METADATA_CHANNEL, &payload) else {
+            panic!("not decoded as a protocol check");
+        };
+        assert_eq!(net_id, PROTOCOL_CHECK_NET_ID);
+        assert!(hashes.messages.is_some());
+        assert!(hashes.components.is_some());
+        assert!(hashes.channels.is_some());
+    }
+
+    #[test]
+    fn replicon_channels_are_reported_by_channel() {
+        for channel in [UPDATES_CHANNEL, MUTATIONS_CHANNEL, MUTATION_ACKS_CHANNEL] {
+            let Decoded::Replication {
+                channel: replication,
+                bytes,
+            } = decode(channel, &[0x11, 0x22, 0x33])
+            else {
+                panic!("channel {channel} was decoded as a message");
             };
-            assert_eq!(net_id, 2);
-            assert_eq!(packet.seq, 77);
-            assert_eq!(packet.player, 0xDEAD_BEEF);
-            assert!(packet.report.grounded);
-            assert_eq!(packet.inputs.len(), 1);
-            assert!((packet.report.position[0] - 12.345).abs() < 1e-4);
+            assert_eq!(Some(replication), ReplicationChannel::from_id(channel));
+            assert_eq!(bytes, 3);
         }
     }
 
     #[test]
-    fn a_snapshot_decodes_in_both_directions() {
-        let payload = message_bytes(3, &postcard::to_allocvec(&sample_snapshot()).unwrap());
-        for direction in [Direction::ClientToServer, Direction::ServerToClient] {
-            let Decoded::Snapshot { net_id, packet } = decode(2, direction, &payload) else {
-                panic!("not decoded as snapshot");
-            };
-            assert_eq!(net_id, 3);
-            assert_eq!(packet.server_tick.0, 9);
-            assert_eq!(packet.peers.len(), 1);
-            assert!(packet.resync);
-        }
-    }
+    fn ping_and_pong_use_the_ping_channel_layout() {
+        let ping = [0x00, 0x12, 0x34];
+        let Decoded::Ping { net_id, id } = decode(PING_CHANNEL, &ping) else {
+            panic!("not a ping");
+        };
+        assert_eq!((net_id, id), (PING_NET_ID, 0x1234));
 
-    #[test]
-    fn a_payload_with_trailing_bytes_is_not_a_movement_message() {
-        let mut payload = message_bytes(2, &postcard::to_allocvec(&sample_input()).unwrap());
-        payload.push(0);
+        let mut pong_body = 0x1234u16.to_be_bytes().to_vec();
+        pong_body.extend_from_slice(&7u32.to_be_bytes());
+        pong_body.push(0x80);
+        let mut pong = vec![PONG_NET_ID as u8];
+        pong.extend_from_slice(&pong_body);
+        let Decoded::Pong {
+            net_id,
+            id,
+            tick_diff,
+            overstep,
+        } = decode(PING_CHANNEL, &pong)
+        else {
+            panic!("not a pong");
+        };
+        assert_eq!(
+            (net_id, id, tick_diff, overstep),
+            (PONG_NET_ID, 0x1234, 7, 0x80)
+        );
+
+        // The same bytes on another channel are not control messages.
         assert!(matches!(
-            decode(1, Direction::ClientToServer, &payload),
+            decode(INPUT_CHANNEL, &ping),
             Decoded::Unknown {
-                net_id: Some(2),
+                net_id: Some(0),
                 ..
             }
         ));
     }
 
     #[test]
-    fn internal_payloads_are_reported_as_unknown() {
-        // A plausible lightyear internal message: net id plus opaque bytes.
-        let payload = message_bytes(4, &[0xff, 0x00, 0x12, 0x34, 0x56]);
-        let Decoded::Unknown { net_id, bytes } = decode(0, Direction::ServerToClient, &payload)
-        else {
-            panic!("misdecoded an internal message");
-        };
-        assert_eq!(net_id, Some(4));
-        assert_eq!(bytes, 5);
-    }
-
-    #[test]
-    fn decoded_messages_expose_the_key_a_display_filter_matches() {
-        let ping = message_bytes(0, &0x1234u16.to_be_bytes());
-        assert_eq!(
-            decode(0, Direction::ClientToServer, &ping).key(),
-            MessageKey {
-                kind: Kind::Ping,
-                net_id: Some(0)
-            }
-        );
-
-        let input = message_bytes(2, &postcard::to_allocvec(&sample_input()).unwrap());
-        assert_eq!(
-            decode(1, Direction::ClientToServer, &input).key(),
-            MessageKey {
-                kind: Kind::Input,
-                net_id: Some(2)
-            }
-        );
-
-        let unknown = message_bytes(4, &[0xff, 0x00, 0x12, 0x34, 0x56]);
-        assert_eq!(
-            decode(0, Direction::ServerToClient, &unknown).key(),
-            MessageKey {
-                kind: Kind::Internal,
-                net_id: Some(4)
-            }
-        );
-    }
-
-    #[test]
-    fn a_payload_without_a_net_id_is_unknown() {
-        let Decoded::Unknown { net_id, bytes } = decode(1, Direction::ClientToServer, &[]) else {
+    fn a_payload_that_is_not_a_message_is_unknown() {
+        let Decoded::Unknown { net_id, bytes } = decode(INPUT_CHANNEL, &[]) else {
             panic!("not unknown");
         };
         assert_eq!(net_id, None);
         assert_eq!(bytes, 0);
+
+        // A known net id whose body does not decode is not guessed at.
+        let Decoded::Unknown { net_id, bytes } = decode(INPUT_CHANNEL, &[0x04, 0xff, 0xff]) else {
+            panic!("misdecoded a broken input message");
+        };
+        assert_eq!((net_id, bytes), (Some(INPUT_NET_ID), 2));
     }
 
     #[test]
-    fn ping_and_pong_use_the_ping_channel_layout() {
-        let ping = message_bytes(0, &0x1234u16.to_be_bytes());
-        let Decoded::Ping { net_id, id } = decode(0, Direction::ClientToServer, &ping) else {
-            panic!("not a ping");
-        };
-        assert_eq!((net_id, id), (0, 0x1234));
-
-        let mut pong_body = 0x1234u16.to_be_bytes().to_vec();
-        pong_body.extend_from_slice(&7u32.to_be_bytes());
-        pong_body.push(0x80);
-        let pong = message_bytes(1, &pong_body);
-        let Decoded::Pong {
-            net_id,
-            id,
-            tick_diff,
-            overstep,
-        } = decode(0, Direction::ServerToClient, &pong)
-        else {
-            panic!("not a pong");
-        };
-        assert_eq!((net_id, id, tick_diff, overstep), (1, 0x1234, 7, 0x80));
-
-        // The same bytes on a game channel are not control messages.
-        assert!(matches!(
-            decode(1, Direction::ClientToServer, &ping),
-            Decoded::Unknown { .. }
-        ));
+    fn decoded_messages_expose_the_key_a_display_filter_matches() {
+        assert_eq!(
+            decode(INPUT_CHANNEL, IDLE_INPUT).key(),
+            MessageKey {
+                kind: Kind::Input,
+                net_id: Some(INPUT_NET_ID),
+            }
+        );
+        assert_eq!(
+            decode(UPDATES_CHANNEL, &[0xff]).key(),
+            MessageKey {
+                kind: Kind::Replication,
+                net_id: None,
+            }
+        );
+        assert_eq!(
+            decode(
+                METADATA_CHANNEL,
+                &[0x03, 0x00, 0x00, 0x00, 0x06, 0x00, 0x46, 0x5d]
+            )
+            .key(),
+            MessageKey {
+                kind: Kind::Metadata,
+                net_id: Some(SENDER_METADATA_NET_ID),
+            }
+        );
     }
 }
