@@ -18,7 +18,7 @@ use crate::{PLAYER_HEIGHT, PLAYER_RADIUS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct KccParams {
-    pub capsule: Capsule,
+    pub capsule: Collider,
     pub skin: f32,
     /// How far below the feet a support surface may be and still count.
     pub ground_probe: f32,
@@ -34,7 +34,7 @@ pub struct KccParams {
 impl Default for KccParams {
     fn default() -> Self {
         Self {
-            capsule: Collider::capsule(PLAYER_RADIUS, CAPSULE_LENGTH),
+            capsule: Collider::cylinder(PLAYER_RADIUS, PLAYER_HEIGHT),
             skin: 0.001,
             ground_probe: 0.15,
             max_slope_cos: 0.6,

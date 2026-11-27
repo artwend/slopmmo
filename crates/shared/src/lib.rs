@@ -37,7 +37,7 @@ use lightyear::prelude::*;
 
 use crate::protocol::*;
 
-pub use crate::kcc::{Capsule, KccParams, MoveOutput, move_and_slide};
+pub use crate::kcc::{KccParams, MoveOutput, move_and_slide};
 pub use ::kcc::avian3d::prelude::{Collider, LinearVelocity, Position, Rotation};
 pub use ::kcc::prelude::Grounded;
 pub use bevy_shape::Aabb3d;
