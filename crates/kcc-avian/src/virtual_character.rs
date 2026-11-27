@@ -258,7 +258,7 @@ impl Default for UpDirection {
 /// the [`UpDirection`] is less than
 /// [`SlopeHandling::max_ground_angle`], or when [`GroundSnapping`] found ground
 /// within its snap distance.
-#[derive(Component, Default)]
+#[derive(Component, Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[component(storage = "SparseSet")]
 pub struct Grounded;
 

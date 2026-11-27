@@ -1,7 +1,9 @@
 # ADR 006 — Netcode library: Lightyear with its built-in transport
 
-- **Status:** **Partial.** The transport half is implemented (Lightyear 0.31 owns the wire);
-  prediction/reconciliation/interpolation are still hand-rolled and moved over deliberately.
+- **Status:** **Implemented.** Lightyear 0.31 owns the wire and the prediction stack:
+  replication, rollback/reconciliation, interpolation, visual correction and input buffering all
+  come from the library. The earlier hand-rolled `net`/`proto` movement path was removed; the
+  sections below describe that intermediate state and are kept as history.
 
 - **Decided by:** project owner, first dialogue, turns 7 and 8.
 - **Verbatim:** *«Для соединения клиент<-> game server я хочу использовать это
@@ -43,8 +45,30 @@ Non-goals that were made explicit in the dialogue:
 
 ## Implementation status
 
-**Done — Lightyear owns the wire.** The raw UDP path (`crates/server/src/net.rs`,
-`crates/client/src/net.rs`) is deleted.
+**Implemented — Lightyear owns the wire and the prediction stack.** This supersedes the notes
+below.
+
+- `crates/shared` holds the whole protocol: the `Player` input context, the `Movement`/`Jump`/
+  `Sprint` enhanced-input actions, `PlayerId`, and `LightyearAvianPlugin` plus the custom
+  registration of `Position`, `Rotation`, `LinearVelocity` and `Grounded` for the
+  controller-driven (non-rigid-body) character. `SharedPlugin` is added by both binaries.
+- The player is a `VirtualCharacter` (Avian `MoveAndSlide`), not a rigid body. Both sides run
+  `shared::apply_player_input` in `FixedUpdate` and the same physics pipeline, so the predicted
+  result and the authoritative result come from identical code.
+- The server spawns one player per connected client with `Replicate`, `PredictionTarget`,
+  `InterpolationTarget` and `ControlledBy` (session-scoped: it despawns on disconnect). The
+  server owns the action entities; the owning client attaches local bindings once the player is
+  `Controlled`. Inputs are rebroadcast so every client predicts every player.
+- Everything runs at `shared::TICK_HZ` (60 Hz): the Bevy fixed clock, Lightyear's tick duration
+  and the headless script.
+- Verified live: `cargo run -p server -- --listen 127.0.0.1:5888` plus
+  `cargo run -p client -- --headless --connect 127.0.0.1:5888` completes the full script and ends
+  at the same pose as the offline run.
+
+### Historical: the intermediate hand-rolled path
+
+The notes below describe the state before the migration above. They are kept because they record
+why the split moved in steps, but they no longer describe the code.
 
 - `crates/net` declares the protocol: `InputChannel` (client → server, `UnorderedUnreliable`,
   flushed every frame — the client owns the report cadence, so a channel-level

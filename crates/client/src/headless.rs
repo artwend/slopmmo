@@ -1,30 +1,38 @@
 //! Scripted, deterministic client run. This is what CI executes.
 //!
-//! Exits non-zero when a movement invariant breaks, so it is usable as a smoke
-//! test rather than a print-and-hope binary. Offline runs add no networking at
-//! all, so the invariants never depend on the transport.
+//! Offline mode runs the same Avian character controller and the same movement
+//! math as the networked client, without any sockets, so it can assert on
+//! determinism and on the controller's invariants. With `--connect` the script is
+//! replayed against a live server through the same bindings the windowed client
+//! uses.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use kcc_avian::prelude::{MoveAndSlidePlugin, PhysicsPlugins};
+use kcc_avian::prelude::{
+    Grounded, IslandPlugin, IslandSleepingPlugin, LinearVelocity, MoveAndSlidePlugin,
+    PhysicsInterpolationPlugin, PhysicsPlugins, Position, VirtualCharacter,
+};
+use lightyear::input::bei::prelude::EnhancedInputSystems;
+use lightyear::prelude::client::*;
+use lightyear::prelude::*;
 
-use crate::character;
-use crate::transport::{ClientNetPlugin, NetStats};
-use crate::{Args, Local};
+use shared::protocol::*;
+use shared::*;
 
-const FORWARD: i8 = -127;
-const RIGHT: i8 = 127;
+use crate::transport::ClientNetPlugin;
+use crate::{Args, bindings};
 
+/// One scripted phase: a wish direction in world space plus modifiers.
 #[derive(Clone, Copy)]
 struct Phase {
     name: &'static str,
     ticks: u32,
-    move_x: i8,
-    move_z: i8,
-    buttons: u8,
+    wish: Vec3,
+    sprint: bool,
+    jump: bool,
 }
 
 fn phases() -> Vec<Phase> {
@@ -32,44 +40,44 @@ fn phases() -> Vec<Phase> {
         Phase {
             name: "walk_forward",
             ticks: 90,
-            move_x: 0,
-            move_z: FORWARD,
-            buttons: 0,
+            wish: Vec3::NEG_Z,
+            sprint: false,
+            jump: false,
         },
         Phase {
             name: "sprint_forward",
             ticks: 90,
-            move_x: 0,
-            move_z: FORWARD,
-            buttons: proto::buttons::SPRINT,
+            wish: Vec3::NEG_Z,
+            sprint: true,
+            jump: false,
         },
         Phase {
             name: "strafe_into_wall",
             ticks: 600,
-            move_x: RIGHT,
-            move_z: 0,
-            buttons: proto::buttons::SPRINT,
+            wish: Vec3::X,
+            sprint: true,
+            jump: false,
         },
         Phase {
             name: "diagonal_slide",
             ticks: 300,
-            move_x: RIGHT,
-            move_z: FORWARD,
-            buttons: proto::buttons::SPRINT,
+            wish: Vec3::new(1.0, 0.0, -1.0).normalize(),
+            sprint: true,
+            jump: false,
         },
         Phase {
             name: "jump",
             ticks: 1,
-            move_x: 0,
-            move_z: 0,
-            buttons: proto::buttons::JUMP,
+            wish: Vec3::ZERO,
+            sprint: false,
+            jump: true,
         },
         Phase {
             name: "settle",
             ticks: 120,
-            move_x: 0,
-            move_z: 0,
-            buttons: 0,
+            wish: Vec3::ZERO,
+            sprint: false,
+            jump: false,
         },
     ]
 }
@@ -89,6 +97,7 @@ struct Script {
     peak_y: f32,
     max_abs_x: f32,
     max_abs_z: f32,
+    saw_controlled_player: bool,
     finished: bool,
 }
 
@@ -97,54 +106,34 @@ impl Script {
         let phases = phases();
         Self {
             left: phases[0].ticks,
-            peak_y: 0.9,
-            budget,
+            peak_y: sim::RESTING_HEIGHT,
             phases,
             index: 0,
+            budget,
             ticks: 0,
             max_abs_x: 0.0,
             max_abs_z: 0.0,
+            saw_controlled_player: false,
             finished: false,
         }
     }
-}
 
-/// One script tick per fixed step, so the wire systems keep their normal place.
-fn script_tick(mut local: ResMut<Local>, mut script: ResMut<Script>) {
-    if script.finished {
-        return;
-    }
-    if script.ticks >= script.budget || script.index >= script.phases.len() {
-        script.finished = true;
-        return;
+    fn phase(&self) -> Option<Phase> {
+        self.phases.get(self.index).copied()
     }
 
-    let phase = script.phases[script.index];
-    local.step(proto::InputFrame {
-        move_x: phase.move_x,
-        move_z: phase.move_z,
-        buttons: phase.buttons,
-        ..default()
-    });
-    script.ticks += 1;
-
-    script.left -= 1;
-    if script.left == 0 {
-        script.index += 1;
-        if let Some(next) = script.phases.get(script.index) {
-            script.left = next.ticks;
+    fn advance(&mut self) {
+        self.ticks += 1;
+        self.left = self.left.saturating_sub(1);
+        if self.left == 0 {
+            self.index += 1;
+            self.left = self.phases.get(self.index).map_or(0, |p| p.ticks);
         }
     }
-}
 
-/// Records the extremes the invariants need, after the step's pose is final.
-fn track_extremes(local: Res<Local>, mut script: ResMut<Script>) {
-    if script.ticks == 0 {
-        return;
+    fn exhausted(&self) -> bool {
+        self.ticks >= self.budget || self.index >= self.phases.len()
     }
-    script.peak_y = script.peak_y.max(local.player.pos.y);
-    script.max_abs_x = script.max_abs_x.max(local.player.pos.x.abs());
-    script.max_abs_z = script.max_abs_z.max(local.player.pos.z.abs());
 }
 
 struct Report {
@@ -155,97 +144,264 @@ struct Report {
     max_abs_x: f32,
     max_abs_z: f32,
     ticks: u32,
-    sent: u64,
-    received: u64,
-    corrections: u64,
-    resyncs: u64,
-    unacked: u16,
-    disconnects: u64,
-    peer_contacts: u64,
 }
 
-fn run_script(seconds: f32, connect: Option<SocketAddr>, player_id: u64) -> Report {
-    let budget = ((seconds * proto::CLIENT_TICK_HZ as f32) as u32).max(1);
+/// One script tick per fixed step, feeding the shared velocity model directly.
+fn apply_script(
+    time: Res<Time>,
+    params: Res<MovementParams>,
+    mut script: ResMut<Script>,
+    mut players: Query<(&mut LinearVelocity, Has<Grounded>), With<VirtualCharacter>>,
+) {
+    if script.finished {
+        return;
+    }
+    if script.exhausted() {
+        script.finished = true;
+        return;
+    }
+    let Some(phase) = script.phase() else {
+        script.finished = true;
+        return;
+    };
+    let dt = time.delta_secs();
+    if let Ok((mut velocity, grounded)) = players.single_mut() {
+        velocity.0 = sim::step_velocity_raw(
+            &params.0,
+            phase.wish,
+            phase.sprint,
+            phase.jump,
+            velocity.0,
+            grounded,
+            dt,
+        );
+    }
+    script.advance();
+}
 
-    let terrain = sim::StaticWorld::test_room();
+/// Records the extremes the invariants need, after the physics step.
+fn track_extremes(script: ResMut<Script>, players: Query<&Position, With<VirtualCharacter>>) {
+    if script.ticks == 0 {
+        return;
+    }
+    if let Ok(position) = players.single() {
+        let pos = position.0;
+        let mut script = script;
+        script.peak_y = script.peak_y.max(pos.y);
+        script.max_abs_x = script.max_abs_x.max(pos.x.abs());
+        script.max_abs_z = script.max_abs_z.max(pos.z.abs());
+    }
+}
+
+fn physics_plugins() -> bevy::app::PluginGroupBuilder {
+    PhysicsPlugins::default()
+        .build()
+        .disable::<PhysicsInterpolationPlugin>()
+        .disable::<IslandPlugin>()
+        .disable::<IslandSleepingPlugin>()
+}
+
+fn spawn_room(app: &mut App) {
+    for b in shared::test_room().boxes() {
+        app.world_mut().spawn(shared::terrain_bundle(b));
+    }
+}
+
+fn run_offline(seconds: f32) -> Report {
+    let budget = ((seconds * TICK_HZ as f32) as u32).max(1);
+
     let mut app = App::new();
-    app.add_plugins((
-        MinimalPlugins,
-        PhysicsPlugins::new(FixedPostUpdate),
-        MoveAndSlidePlugin::default(),
-    ))
-    .insert_resource(Time::<Fixed>::from_hz(proto::CLIENT_TICK_HZ as f64))
-    .init_resource::<Local>()
-    .init_resource::<NetStats>()
-    .insert_resource(Script::new(budget))
-    .add_systems(FixedUpdate, (script_tick, character::apply_local).chain())
-    .add_systems(FixedLast, (character::read_back, track_extremes).chain());
+    app.add_plugins(MinimalPlugins)
+        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
+        .add_plugins(physics_plugins())
+        .add_plugins(MoveAndSlidePlugin::default())
+        .init_resource::<MovementParams>()
+        .insert_resource(Script::new(budget))
+        .add_systems(FixedUpdate, apply_script)
+        .add_systems(FixedLast, track_extremes);
 
-    character::spawn_terrain(app.world_mut(), &terrain);
-    character::spawn_player(app.world_mut());
+    spawn_room(&mut app);
+    let player_id = app
+        .world_mut()
+        .spawn(shared::player_physics_bundle(Vec3::new(
+            0.0,
+            sim::RESTING_HEIGHT,
+            0.0,
+        )))
+        .id();
 
-    if let Some(addr) = connect {
-        // A live run has to be debuggable; the offline run stays quiet so its
-        // report is the only output.
-        app.add_plugins(bevy::log::LogPlugin::default())
-            .add_plugins(ClientNetPlugin {
-                server: addr,
-                player_id,
-            });
+    // `App::run` would do this for us, but the fixed steps are driven by hand.
+    app.finish();
+    app.cleanup();
+    app.world_mut().resource_mut::<Time<Virtual>>().pause();
+
+    while !app.world().resource::<Script>().finished {
+        let step = app.world().resource::<Time<Fixed>>().timestep();
+        app.world_mut()
+            .resource_mut::<Time<Fixed>>()
+            .accumulate_overstep(step);
+        app.update();
     }
 
-    // `App::run` would do this for us, but we drive `update` by hand. Lightyear
-    // registers her message send/receive systems in `Plugin::finish`, so skipping
-    // these two calls silently drops every packet in both directions.
+    let (peak_y, max_abs_x, max_abs_z, ticks) = {
+        let script = app.world().resource::<Script>();
+        (
+            script.peak_y,
+            script.max_abs_x,
+            script.max_abs_z,
+            script.ticks,
+        )
+    };
+    let (pos, vel, grounded) = {
+        let world = app.world();
+        let pos = world.get::<Position>(player_id).map_or(Vec3::ZERO, |p| p.0);
+        let vel = world
+            .get::<LinearVelocity>(player_id)
+            .map_or(Vec3::ZERO, |v| v.0);
+        (pos, vel, world.get::<Grounded>(player_id).is_some())
+    };
+    Report {
+        pos,
+        vel,
+        grounded,
+        peak_y,
+        max_abs_x,
+        max_abs_z,
+        ticks,
+    }
+}
+
+/// Headless client that replays the script against a live server.
+///
+/// The script waits for the server to replicate the controlled player, then
+/// presses the same keys a windowed player would. That exercises the whole
+/// chain: bindings -> BEI evaluation -> lightyear input buffer -> server.
+fn run_live(seconds: f32, server: SocketAddr) -> (Script, Option<Vec3>) {
+    let budget = ((seconds * TICK_HZ as f32) as u32).max(1);
+
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins((
+            TransformPlugin,
+            bevy::input::InputPlugin,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+            bevy::log::LogPlugin::default(),
+            bevy::state::app::StatesPlugin,
+        ))
+        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
+        .add_plugins(ClientPlugins {
+            tick_duration: TICK_DURATION,
+        })
+        .add_plugins(SharedPlugin)
+        .insert_resource(PredictionManager::default())
+        .add_plugins(ClientNetPlugin { server })
+        .insert_resource(Script::new(budget))
+        .add_observer(spawn_predicted_physics)
+        .add_systems(
+            FixedPreUpdate,
+            drive_script.before(EnhancedInputSystems::Update),
+        );
+    bindings::register(&mut app);
+
+    spawn_room(&mut app);
+
+    // `App::run` would do this, but the loop below drives `update` by hand.
+    // Lightyear registers part of the send/receive plumbing in `finish`.
     app.finish();
     app.cleanup();
 
-    let live = connect.is_some();
-    if !live {
-        // Offline is driven one fixed step per update: the wall clock must not
-        // decide how many steps a run takes, or two runs cannot be compared.
-        app.world_mut().resource_mut::<Time<Virtual>>().pause();
+    // Leave time for the handshake and for the script to run.
+    let deadline = Instant::now() + Duration::from_secs_f32(seconds.max(1.0) + 5.0);
+    while !app.world().resource::<Script>().finished && Instant::now() < deadline {
+        app.update();
+        std::thread::sleep(Duration::from_millis(1));
     }
 
-    while !app.world().resource::<Script>().finished {
-        if live {
-            // The fixed clock follows real time, so the script advances at 60 Hz
-            // and a round trip has time to complete.
-            app.update();
-            std::thread::sleep(Duration::from_millis(1));
-        } else {
-            let step = app.world().resource::<Time<Fixed>>().timestep();
-            app.world_mut()
-                .resource_mut::<Time<Fixed>>()
-                .accumulate_overstep(step);
-            app.update();
-        }
-    }
-
-    let local = app.world().resource::<Local>();
     let script = app.world().resource::<Script>();
-    let stats = app.world().resource::<NetStats>();
-    Report {
-        pos: local.player.pos,
-        vel: local.player.vel,
-        grounded: local.player.grounded,
+    let text = Script {
+        phases: script.phases.clone(),
+        index: script.index,
+        left: script.left,
+        budget: script.budget,
+        ticks: script.ticks,
         peak_y: script.peak_y,
         max_abs_x: script.max_abs_x,
         max_abs_z: script.max_abs_z,
-        ticks: script.ticks,
-        sent: stats.sent,
-        received: stats.received,
-        corrections: stats.corrections,
-        resyncs: stats.resyncs,
-        unacked: stats.unacked,
-        disconnects: stats.disconnects,
-        peer_contacts: local.peer_contacts,
+        saw_controlled_player: script.saw_controlled_player,
+        finished: script.finished,
+    };
+    let pos = app
+        .world_mut()
+        .query_filtered::<&Position, (With<Player>, With<Controlled>)>()
+        .single(app.world())
+        .ok()
+        .map(|p| p.0);
+    (text, pos)
+}
+
+fn spawn_predicted_physics(trigger: On<Add<(Player, Predicted)>>, mut commands: Commands) {
+    commands
+        .entity(trigger.entity)
+        .insert_if_new(shared::player_physics_bundle(Vec3::ZERO));
+}
+
+const SCRIPT_KEYS: [KeyCode; 6] = [
+    KeyCode::KeyW,
+    KeyCode::KeyA,
+    KeyCode::KeyS,
+    KeyCode::KeyD,
+    KeyCode::ShiftLeft,
+    KeyCode::Space,
+];
+
+/// Presses the keys the current phase asks for. One fixed tick of Space is a
+/// full jump, because the action uses a `Press` condition.
+fn drive_script(
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut script: ResMut<Script>,
+    players: Query<(), (With<Player>, With<Controlled>)>,
+) {
+    for key in SCRIPT_KEYS {
+        keys.release(key);
     }
+    if script.finished {
+        return;
+    }
+    if players.is_empty() {
+        return;
+    }
+    script.saw_controlled_player = true;
+    if script.exhausted() {
+        script.finished = true;
+        return;
+    }
+    let Some(phase) = script.phase() else {
+        script.finished = true;
+        return;
+    };
+    if phase.wish.x > 0.5 {
+        keys.press(KeyCode::KeyD);
+    } else if phase.wish.x < -0.5 {
+        keys.press(KeyCode::KeyA);
+    }
+    if phase.wish.z < -0.5 {
+        keys.press(KeyCode::KeyW);
+    } else if phase.wish.z > 0.5 {
+        keys.press(KeyCode::KeyS);
+    }
+    if phase.sprint {
+        keys.press(KeyCode::ShiftLeft);
+    }
+    if phase.jump {
+        keys.press(KeyCode::Space);
+    }
+    script.advance();
 }
 
 pub fn run(args: &Args) -> ExitCode {
-    let a = run_script(args.seconds, None, args.player_id);
-    let b = run_script(args.seconds, None, args.player_id);
+    let a = run_offline(args.seconds);
+    let b = run_offline(args.seconds);
 
     println!("script:");
     for p in phases() {
@@ -261,30 +417,30 @@ pub fn run(args: &Args) -> ExitCode {
     println!("peak_y          {:.4}", a.peak_y);
     println!("max_abs_x       {:.4}", a.max_abs_x);
     println!("max_abs_z       {:.4}", a.max_abs_z);
-    println!("peer_contacts   {}", a.peer_contacts);
 
     let deterministic = a.pos == b.pos && a.vel == b.vel && a.ticks == b.ticks;
     println!("deterministic   {deterministic}");
 
     let mut failures = Vec::new();
 
-    // Optional live round-trip: the script is replayed against a real server so
-    // the encode/decode path and correction idempotency are exercised.
     if let Some(addr) = args.connect {
         println!("net_server      {addr}");
-        let r = run_script(args.seconds, Some(addr), args.player_id);
-        println!("net_sent        {}", r.sent);
-        println!("net_snaps       {}", r.received);
-        println!("net_corrections {}", r.corrections);
-        println!("net_resyncs     {}", r.resyncs);
-        println!("net_unacked     {}", r.unacked);
-        println!("net_disconnects {}", r.disconnects);
-        println!("net_peer_hits   {}", r.peer_contacts);
-        if r.received == 0 {
-            failures.push("no snapshots from the server");
+        let (script, pos) = run_live(args.seconds, addr);
+        println!("net_ticks       {}", script.ticks);
+        println!(
+            "net_completed   {}",
+            script.finished && script.ticks >= total_ticks()
+        );
+        if let Some(pos) = pos {
+            println!("net_x           {:.4}", pos.x);
+            println!("net_y           {:.4}", pos.y);
+            println!("net_z           {:.4}", pos.z);
         }
-        if r.disconnects > 0 {
-            failures.push("the live link closed");
+        if !script.saw_controlled_player {
+            failures.push("the server never replicated a controlled player");
+        }
+        if script.ticks == 0 {
+            failures.push("the live script never ran");
         }
     }
 
@@ -303,7 +459,7 @@ pub fn run(args: &Args) -> ExitCode {
     if !a.grounded {
         failures.push("did not settle back to the floor");
     }
-    if (a.pos.y - 0.9).abs() > 0.05 {
+    if (a.pos.y - sim::RESTING_HEIGHT).abs() > 0.05 {
         failures.push("resting height is wrong");
     }
 
@@ -315,84 +471,5 @@ pub fn run(args: &Args) -> ExitCode {
             println!("failure         {f}");
         }
         ExitCode::FAILURE
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::CorrectionLog;
-
-    #[test]
-    fn corrections_are_idempotent() {
-        let mut log = CorrectionLog::default();
-        let c = proto::CollisionCorrection {
-            seq: 4,
-            tick: proto::Tick::new(10),
-            epoch: 1,
-            velocity_delta: [0.5, 0.0, 0.0],
-            hard_normal: None,
-        };
-        assert!(log.accept(&c));
-        assert!(!log.accept(&c), "duplicate applied twice");
-        assert_eq!(log.dropped, 1);
-
-        let newer = proto::CollisionCorrection { seq: 5, ..c };
-        assert!(log.accept(&newer));
-
-        // A new epoch resets the ordering: reconnect/handover.
-        let other_epoch = proto::CollisionCorrection {
-            seq: 1,
-            epoch: 2,
-            ..c
-        };
-        assert!(log.accept(&other_epoch));
-    }
-
-    #[test]
-    fn a_resent_snapshot_is_applied_once() {
-        let mut local = Local::default();
-        let snapshot = proto::ServerSnapshot {
-            correction: Some(proto::CollisionCorrection {
-                seq: 4,
-                tick: proto::Tick::new(10),
-                epoch: 1,
-                velocity_delta: [0.5, 0.0, 0.0],
-                hard_normal: None,
-            }),
-            ..default()
-        };
-        assert!(local.accept_snapshot(&snapshot, 0));
-        let after_first = local.player.vel;
-        assert!(
-            !local.accept_snapshot(&snapshot, 0),
-            "duplicate applied twice"
-        );
-        assert_eq!(local.player.vel, after_first);
-    }
-
-    #[test]
-    fn hard_normal_removes_velocity_into_the_wall() {
-        let mut local = Local::default();
-        local.player.vel = Vec3::new(-4.0, 0.0, 0.0);
-        let applied = local.accept_snapshot(
-            &proto::ServerSnapshot {
-                correction: Some(proto::CollisionCorrection {
-                    seq: 1,
-                    tick: proto::Tick::new(1),
-                    epoch: 1,
-                    velocity_delta: [0.0, 0.0, 0.0],
-                    hard_normal: Some([1.0, 0.0, 0.0]),
-                }),
-                ..default()
-            },
-            0,
-        );
-        assert!(applied);
-        assert!(
-            local.player.vel.x >= -1e-4,
-            "velocity into the wall survived: {}",
-            local.player.vel.x
-        );
     }
 }

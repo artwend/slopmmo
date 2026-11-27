@@ -10,17 +10,19 @@ bevy = { version = "0.20", default-features = false, features = [
   "default_app",
   "bevy_curve",
 ] }
-lightyear = { "workspace" = true, features = [
-  "interpolation",
-  "prediction",
-  "replication",
-  "input_bei",
-] }
+kcc-avian.workspace = true
+sim.workspace = true
 serde.workspace = true
+lightyear = { version = "0.31", default-features = false, features = [
+  "std",
+  "client",
+  "server",
+  "replication",
+  "prediction",
+  "interpolation",
+  "input_bei",
+  "avian3d",
+] }
 bevy_enhanced_input = { version = "0.27", default-features = false, features = [
   "serialize",
 ] }
-
-[dev-dependencies]
-postcard = { version = "1", features = ["alloc"] }
-

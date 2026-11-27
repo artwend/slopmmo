@@ -1,51 +1,189 @@
+//! Gameplay shared by the client and the server.
+//!
+//! The protocol ([`protocol`]) is registered identically on both ends, and the
+//! physics pipeline is installed once here so both sides simulate the character
+//! with the same plugins, the same fixed timestep and the same movement model.
+
 pub mod protocol;
 
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 
-use crate::protocol::*;
 use bevy::prelude::*;
-use lightyear::prelude::PeerId;
+use kcc_avian::avian3d::prelude::{
+    IslandPlugin, IslandSleepingPlugin, PhysicsInterpolationPlugin, PhysicsPlugins,
+    PhysicsTransformPlugin, RigidBody,
+};
+use kcc_avian::prelude::{
+    AutoMoveAndSlide, GroundSnapping, MoveAndSlidePlugin, SlopeHandling, StairStepping,
+    UpDirection, VirtualCharacter,
+};
+use lightyear::avian3d::plugin::{AvianReplicationMode, LightyearAvianPlugin};
+use lightyear::input::bei::prelude::{Action, Actions};
+use lightyear::prelude::*;
+use sim::{MoveParams, StaticWorld};
 
+use crate::protocol::*;
+
+pub use kcc_avian::avian3d::prelude::{Collider, LinearVelocity, Position, Rotation};
+pub use kcc_avian::prelude::Grounded;
+
+/// The movement model's tunables, stored as a Bevy resource.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct MovementParams(pub MoveParams);
+
+/// Fixed simulation rate. The Bevy fixed clock, Lightyear's timeline and the
+/// server tick all use it, so a rollback replays exactly one tick.
+pub const TICK_HZ: f64 = 60.0;
+/// Duration of one tick.
+pub const TICK_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
+/// How often replication is flushed to clients.
+pub const SEND_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Registers the protocol and the physics/character pipeline.
+#[derive(Clone)]
 pub struct SharedPlugin;
 
 impl Plugin for SharedPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ProtocolPlugin);
+        app.add_plugins(protocol::ProtocolPlugin);
+
+        // Avian integration first: it installs the position/transform sync and
+        // must be finished before the physics schedule exists.
+        app.add_plugins(LightyearAvianPlugin {
+            replication_mode: AvianReplicationMode::Position {
+                sync_to_transform: false,
+            },
+            // The character is not a rigid body, so the default registration
+            // (filtered on `With<RigidBody>`) would never match it.
+            register_physics_components: false,
+            // A replay has to restore Avian's collider trees, not just the pose.
+            rollback_resources: true,
+            ..default()
+        });
+
+        // Islands and sleeping break rollback; the transform sync is owned by
+        // `LightyearAvianPlugin`.
+        app.add_plugins(
+            PhysicsPlugins::default()
+                .build()
+                .disable::<PhysicsTransformPlugin>()
+                .disable::<PhysicsInterpolationPlugin>()
+                .disable::<IslandPlugin>()
+                .disable::<IslandSleepingPlugin>(),
+        );
+        // Must come after `PhysicsPlugins`: it orders itself inside the physics step.
+        app.add_plugins(MoveAndSlidePlugin::default());
+
+        // Custom rules for the controller-driven character.
+        app.component::<Position>()
+            .replicate()
+            .predict()
+            .add_linear_interpolation()
+            .add_correction();
+        app.component::<Rotation>()
+            .replicate()
+            .predict()
+            .add_linear_interpolation()
+            .add_correction();
+        app.component::<LinearVelocity>().replicate().predict();
+        // Derived by the controller every physics step, but the first replayed
+        // tick must see the grounded state of the tick it replays.
+        app.component::<Grounded>().local_rollback();
+
+        app.init_resource::<MovementParams>()
+            .add_systems(FixedUpdate, apply_player_input);
     }
 }
 
-pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
-pub const SERVER_PORT: u16 = 5888;
-/// 0 means that the OS will assign any available port
-pub const CLIENT_PORT: u16 = 0;
-pub const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SERVER_PORT);
-pub const SHARED_SETTINGS: SharedSettings = SharedSettings {
-    protocol_id: 0,
-    private_key: [0; 32],
-};
-
-pub const SEND_INTERVAL: Duration = Duration::from_millis(100);
-
-pub const STEAM_APP_ID: u32 = 480; // Steamworks App ID for Spacewar, used for testing
-
-#[derive(Copy, Clone, Debug)]
-pub struct SharedSettings {
-    /// An id to identify the protocol version
-    pub protocol_id: u64,
-
-    /// a 32-byte array to authenticate via the Netcode.io protocol
-    pub private_key: [u8; 32],
+/// Physics bundle shared by server-spawned players and client-side predicted
+/// copies. Only the networked components are replicated; the rest is rebuilt
+/// locally on the client.
+pub fn player_physics_bundle(position: Vec3) -> impl Bundle {
+    (
+        VirtualCharacter,
+        AutoMoveAndSlide::default(),
+        SlopeHandling::default(),
+        GroundSnapping::default(),
+        StairStepping::default(),
+        UpDirection::default(),
+        Collider::capsule(sim::PLAYER_RADIUS, sim::CAPSULE_LENGTH),
+        Position::from(position),
+        Rotation::default(),
+        LinearVelocity::default(),
+        // The controller writes this every physics step so the rendered capsule
+        // follows the predicted/authoritative pose.
+        Transform::from_translation(position),
+    )
 }
 
-pub fn initial_player_position(peer_id: PeerId) -> Vec3 {
+/// Collider-only bundle for one static terrain box.
+pub fn terrain_bundle(b: &sim::Aabb3d) -> impl Bundle {
+    let size = b.max - b.min;
+    let centre = Vec3::from((b.max + b.min) * 0.5);
+    (
+        RigidBody::Static,
+        Collider::cuboid(size.x, size.y, size.z),
+        Position::from(centre),
+        Rotation::default(),
+    )
+}
+
+/// The static room both sides collide against.
+pub fn test_room() -> StaticWorld {
+    StaticWorld::test_room()
+}
+
+/// Spawn a player slot for a peer.
+pub fn initial_position(peer_id: PeerId) -> Vec3 {
     let slot = (peer_id.to_bits() % 6) as f32;
-    Vec3::new((slot - 2.5) * 90.0, 0.9, 0.0)
+    Vec3::new((slot - 2.5) * 6.0, sim::RESTING_HEIGHT, 0.0)
 }
 
-// Applies movement input to a player position.
-pub fn shared_movement_behaviour(mut position: Mut<ReplicablePosition>, input: Vec2) {
-    const MOVE_SPEED: f32 = 10.0;
-    position.0.y += input.y * MOVE_SPEED;
-    position.0.x += input.x * MOVE_SPEED;
+/// Feeds the player's BEI action values into the shared velocity model.
+///
+/// Runs on both sides: the client applies it to its predicted entity, the
+/// server to the authoritative one, so a replay produces the same velocity.
+#[allow(clippy::type_complexity)]
+fn apply_player_input(
+    time: Res<Time>,
+    params: Res<MovementParams>,
+    mut players: Query<
+        (&Actions<Player>, Has<Grounded>, &mut LinearVelocity),
+        With<VirtualCharacter>,
+    >,
+    movement: Query<&Action<Movement>>,
+    jump: Query<&Action<Jump>>,
+    sprint: Query<&Action<Sprint>>,
+) {
+    let dt = time.delta_secs();
+    let params = params.0;
+    for (player_actions, grounded, mut velocity) in &mut players {
+        let mut wish = Vec3::ZERO;
+        let mut pressed_jump = false;
+        let mut pressed_sprint = false;
+        for action in player_actions.iter() {
+            if let Ok(value) = movement.get(action) {
+                // Camera space to world space: forward is `-Z`.
+                wish = Vec3::new(value.x, 0.0, -value.y);
+            }
+            if let Ok(value) = jump.get(action) {
+                pressed_jump = **value;
+            }
+            if let Ok(value) = sprint.get(action) {
+                pressed_sprint = **value;
+            }
+        }
+        if wish.length_squared() > 1.0 {
+            wish = wish.normalize();
+        }
+        velocity.0 = sim::step_velocity_raw(
+            &params,
+            wish,
+            pressed_sprint,
+            pressed_jump,
+            velocity.0,
+            grounded,
+            dt,
+        );
+    }
 }

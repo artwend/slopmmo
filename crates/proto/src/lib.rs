@@ -1,4 +1,9 @@
-//! Wire protocol shared by client and server.
+//! Legacy wire format, plus the tuning constants shared with `sim`.
+//!
+//! The game no longer speaks this protocol: client and server use Lightyear's
+//! replication through `shared::protocol`. The packet types remain for
+//! `tools/packetdump`, which decodes captures of the previous build, and the
+//! movement constants are still the source of `sim::MoveParams`.
 //!
 //! Design constraints taken from the architecture review:
 //!

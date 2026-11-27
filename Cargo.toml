@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/shared",
     "crates/proto",
-    "crates/net",
     "crates/sim",
     "crates/kcc-avian",
     "crates/server",
@@ -19,19 +18,12 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 proto = { path = "crates/proto" }
-net = { path = "crates/net" }
 sim = { path = "crates/sim" }
 kcc-avian = { path = "crates/kcc-avian" }
 shared = { path = "crates/shared" }
 serde = { version = "1", default-features = false, features = [
   "alloc",
   "derive",
-] }
-lightyear = { version = "0.31", features = [
-  "interpolation",
-  "prediction",
-  "replication",
-  "input_native",
 ] }
 
 [profile.dev]

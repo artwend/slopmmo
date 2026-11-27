@@ -2703,7 +2703,6 @@ dependencies = [
  "clap",
  "kcc-avian",
  "lightyear",
- "net",
  "shared",
  "sim",
 ]
@@ -5694,16 +5693,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "net"
-version = "0.1.0"
-dependencies = [
- "bevy_app",
- "lightyear",
- "postcard",
- "proto",
-]
-
-[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6868,7 +6857,6 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "proto"
 version = "0.1.0"
 dependencies = [
- "bevy_math",
  "postcard",
  "serde",
 ]
@@ -7608,13 +7596,9 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "bevy_enhanced_input",
- "bevy_math",
  "clap",
  "lightyear",
- "net",
  "shared",
- "sim",
 ]
 
 [[package]]
@@ -7654,9 +7638,10 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_enhanced_input",
+ "kcc-avian",
  "lightyear",
- "postcard",
  "serde",
+ "sim",
 ]
 
 [[package]]

@@ -7,16 +7,30 @@ publish = false
 
 [dependencies]
 shared.workspace = true
-net.workspace = true
-bevy_math = "0.20"
 clap = { version = "4", features = ["derive"] }
-sim.workspace = true
 
-# Headless only: no render, no window, no asset pipeline.
-bevy = { version = "0.20", default-features = false, features = ["std", "multi_threaded", "async_executor", "bevy_log"] }
+# Headless only: no render, no window, no asset pipeline. The input, state and
+# transform plugins are what lightyear's replication and the physics pipeline
+# expect to find in the app.
+bevy = { version = "0.20", default-features = false, features = [
+  "std",
+  "multi_threaded",
+  "async_executor",
+  "bevy_log",
+  "bevy_state",
+] }
 
-lightyear = { version = "0.31", default-features = false, features = ["std", "client", "server", "udp", "raw_connection"] }
-
-bevy_enhanced_input = { version = "0.27", default-features = false, features = [
-  "serialize",
+# The server half of the raw connection imports client-side lifecycle types, so
+# `client` is required together with `server`.
+lightyear = { version = "0.31", default-features = false, features = [
+  "std",
+  "client",
+  "server",
+  "udp",
+  "raw_connection",
+  "replication",
+  "prediction",
+  "interpolation",
+  "input_bei",
+  "avian3d",
 ] }
