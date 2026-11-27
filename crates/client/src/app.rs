@@ -38,8 +38,6 @@ pub fn run(args: &Args) {
         PhysicsPlugins::new(FixedPostUpdate),
         MoveAndSlidePlugin::default(),
     ))
-    .insert_resource(Time::<Fixed>::from_hz(proto::CLIENT_TICK_HZ as f64))
-    .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
     .insert_resource(WorldRes(world))
     .init_resource::<Local>()
     .init_resource::<PlayerRes>()
