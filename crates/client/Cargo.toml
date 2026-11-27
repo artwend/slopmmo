@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 shared.workspace = true
-kcc-avian.workspace = true
+kcc.workspace = true
 bevy = "0.20"
 clap = { version = "4", features = ["derive"] }
 

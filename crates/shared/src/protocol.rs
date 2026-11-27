@@ -2,7 +2,7 @@
 //!
 //! Everything here is registered identically on both ends by [`ProtocolPlugin`].
 //! The pose and velocity components are Avian's, registered with custom rules in
-//! `lib.rs`: a [`VirtualCharacter`](kcc_avian::VirtualCharacter) is moved by the
+//! `lib.rs`: a [`VirtualCharacter`](kcc::VirtualCharacter) is moved by the
 //! character controller, not by a rigid body, so the default rigid-body
 //! replication filter would never match it.
 

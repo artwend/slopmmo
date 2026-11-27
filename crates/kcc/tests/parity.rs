@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use bevy::prelude::*;
-use kcc_avian::prelude::*;
+use kcc::prelude::*;
 use shared::{Aabb3d, StaticWorld};
 
 const GRAVITY: f32 = -24.0;

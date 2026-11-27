@@ -21,11 +21,13 @@ pub mod world;
 use core::time::Duration;
 
 use bevy::prelude::*;
-use kcc_avian::avian3d::prelude::{
+// `::kcc` is the Avian controller crate; the bare `kcc` in this crate root is
+// the engine-free reference solver (see [`kcc`]).
+use ::kcc::avian3d::prelude::{
     IslandPlugin, IslandSleepingPlugin, PhysicsInterpolationPlugin, PhysicsPlugins,
     PhysicsTransformPlugin, RigidBody,
 };
-use kcc_avian::prelude::{
+use ::kcc::prelude::{
     AutoMoveAndSlide, GroundSnapping, MoveAndSlidePlugin, SlopeHandling, StairStepping,
     UpDirection, VirtualCharacter,
 };
@@ -35,10 +37,10 @@ use lightyear::prelude::*;
 
 use crate::protocol::*;
 
+pub use crate::kcc::{Capsule, KccParams, MoveOutput, move_and_slide};
+pub use ::kcc::avian3d::prelude::{Collider, LinearVelocity, Position, Rotation};
+pub use ::kcc::prelude::Grounded;
 pub use bevy_shape::Aabb3d;
-pub use kcc::{Capsule, KccParams, MoveOutput, move_and_slide};
-pub use kcc_avian::avian3d::prelude::{Collider, LinearVelocity, Position, Rotation};
-pub use kcc_avian::prelude::Grounded;
 pub use movement::{MAX_ACCEL, MAX_SPEED, MoveParams, step_velocity_raw};
 pub use world::{Aabb3dExt, StaticWorld};
 

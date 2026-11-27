@@ -1,6 +1,6 @@
 # ADR 008 — Hybrid physics: kinematic character controller, geometry solved on the client
 
-- **Status:** Implemented. The client's controller is Avian's `MoveAndSlide` (`crates/kcc-avian`);
+- **Status:** Implemented. The client's controller is Avian's `MoveAndSlide` (`crates/kcc`);
   `sim::kcc` remains the engine-free reference solver.
 - **Decided by:** project owner, second dialogue, turn 1 and the radio pick.
 - **Verbatim:** *«гибридная модель физики»*, then *«да, используем
@@ -49,7 +49,7 @@ the geometry layer and explicitly **not** `AutoMoveAndSlide`.
 
 ## What this repository does
 
-`crates/kcc-avian` ports the `virtual-character` branch's API to released `avian3d` 0.8 instead of
+`crates/kcc` ports the `virtual-character` branch's API to released `avian3d` 0.8 instead of
 forking the branch:
 
 - `VirtualCharacter` + `AutoMoveAndSlide` are the entity-side API; `MoveAndSlidePlugin` runs the

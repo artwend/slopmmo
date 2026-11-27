@@ -1,7 +1,7 @@
 //! Capsule vs static geometry, moved in substeps with depenetration.
 //!
 //! This is the engine-free *reference* solver. The client uses
-//! `crates/kcc-avian` instead, which runs Avian's `MoveAndSlide` over the same
+//! `crates/kcc` instead, which runs Avian's `MoveAndSlide` over the same
 //! terrain; keeping this one pure is what lets the collider math be reasoned
 //! about (and unit-tested) without a physics engine.
 //!
@@ -11,42 +11,10 @@
 
 use bevy_math::Vec3;
 use bevy_shape::Aabb3d;
+use kcc::avian3d::prelude::*;
 
 use crate::world::{Aabb3dExt, StaticWorld};
 use crate::{PLAYER_HEIGHT, PLAYER_RADIUS};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Capsule {
-    pub radius: f32,
-    /// Half length of the cylindrical section, excluding both caps.
-    pub half_height: f32,
-}
-
-impl Capsule {
-    pub fn from_height(radius: f32, height: f32) -> Self {
-        Self {
-            radius,
-            half_height: (height * 0.5 - radius).max(0.0),
-        }
-    }
-
-    /// The two ends of the capsule axis; `center` is the capsule midpoint.
-    pub fn segment(&self, center: Vec3) -> (Vec3, Vec3) {
-        (
-            Vec3::new(center.x, center.y - self.half_height, center.z),
-            Vec3::new(center.x, center.y + self.half_height, center.z),
-        )
-    }
-
-    /// Lowest point of the capsule.
-    pub fn foot(&self, center: Vec3) -> f32 {
-        center.y - self.half_height - self.radius
-    }
-
-    pub fn height(&self) -> f32 {
-        (self.half_height + self.radius) * 2.0
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct KccParams {
@@ -66,7 +34,7 @@ pub struct KccParams {
 impl Default for KccParams {
     fn default() -> Self {
         Self {
-            capsule: Capsule::from_height(PLAYER_RADIUS, PLAYER_HEIGHT),
+            capsule: Collider::capsule(PLAYER_RADIUS, CAPSULE_LENGTH),
             skin: 0.001,
             ground_probe: 0.15,
             max_slope_cos: 0.6,

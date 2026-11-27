@@ -2701,7 +2701,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "clap",
- "kcc-avian",
+ "kcc",
  "lightyear",
  "shared",
 ]
@@ -4499,7 +4499,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcc-avian"
+name = "kcc"
 version = "0.1.0"
 dependencies = [
  "avian3d",
@@ -7638,7 +7638,7 @@ dependencies = [
  "bevy_enhanced_input",
  "bevy_math",
  "bevy_shape",
- "kcc-avian",
+ "kcc",
  "lightyear",
  "serde",
 ]

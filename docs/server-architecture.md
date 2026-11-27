@@ -311,7 +311,7 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 | Area | Status |
 | --- | --- |
 | Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
-| Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc-avian`) |
+| Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc`) |
 | Client-side peer-collider solve | Implemented — `sim::peers::LocalPeerSolve` samples the tick-keyed collider history and solves before the terrain step; `SimConfig::replicate_peers` is on |
 | Peer-collider history | Implemented — `sim::peers::PeerHistory`, 32 tick-keyed samples, monotonic, interpolated, held (not extrapolated) at the ends |
 | Server shadow + validation | Implemented |

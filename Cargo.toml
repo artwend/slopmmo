@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/shared",
     "crates/proto",
-    "crates/kcc-avian",
+    "crates/kcc",
     "crates/server",
     "crates/client",
     "tools/packetdump",
@@ -16,7 +16,7 @@ rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-kcc-avian = { path = "crates/kcc-avian" }
+kcc = { path = "crates/kcc" }
 shared = { path = "crates/shared" }
 serde = { version = "1", default-features = false, features = [
   "alloc",

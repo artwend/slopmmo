@@ -10,11 +10,11 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use bevy::prelude::*;
-use kcc_avian::prelude::{
+use ::kcc::prelude::{
     Grounded, IslandPlugin, IslandSleepingPlugin, LinearVelocity, MoveAndSlidePlugin,
     PhysicsInterpolationPlugin, PhysicsPlugins, Position, VirtualCharacter,
 };
+use bevy::prelude::*;
 use lightyear::input::bei::prelude::EnhancedInputSystems;
 use lightyear::prelude::client::*;
 use lightyear::prelude::*;

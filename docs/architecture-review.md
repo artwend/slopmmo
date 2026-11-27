@@ -38,7 +38,7 @@ not move.
 | §2.7 Validation from the self-declared velocity | The displacement check (`\|Δpos\| ≤ v_max · Δt · k`) is the primary rule; the velocity field is only sanity-checked for finiteness and magnitude. |
 | §3.3 Idempotency of corrections | Monotonic `seq` + `epoch`, client `CorrectionLog`, `acked_seq` echoed in the snapshot. Sequence-keyed rather than tick-keyed replay, because there is no rewind to replay. |
 | §3.5 Tick mapping 60/30 | `proto::map_client_tick` scales elapsed client ticks and is shared by server ingest and the client's peer-history lookup; corrections are stamped with the server tick. Only the combat hit-tick is left, and that is §3.6. |
-| §3.7 Bevy/Avian API risk | Closed by implementation: `crates/kcc-avian` uses released `avian3d` 0.8's `MoveAndSlide` through the `virtual-character` component/plugin API, and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
+| §3.7 Bevy/Avian API risk | Closed by implementation: `crates/kcc` uses released `avian3d` 0.8's `MoveAndSlide` through the `virtual-character` component/plugin API, and the transport is Lightyear 0.31 over a raw UDP endpoint with no `PredictionHistory`/`ConfirmedHistory`. |
 | §4.1 Client-side collider solve | `sim::peers::LocalPeerSolve` samples the replicated collider set at the predicted server tick and runs the same `contact_pair` / `solve_into` path as the server, before the terrain step consumes the velocity. `SimConfig::replicate_peers` is on by default now that the consumer exists. |
 | §5 Correction budget and teleport threshold | `CORRECTION_BUDGET` and the displacement validator set both. The numbers exist; playtest tuning does not. |
 | §5 Peer-collider history | `sim::peers::PeerHistory`: bounded at 32 samples, keyed by server tick, monotonic inserts (a late datagram is refused), interpolated between samples and held — never extrapolated — at the ends. |
@@ -70,7 +70,7 @@ not move.
 | Replication | Snapshot state replication + message protocol hybrid |
 | Transport | UDP, unreliable + sequenced where applicable, Protobuf-like binary |
 | Engine | Bevy 0.20, fixed 60 Hz server tick |
-| KCC | Avian's virtual character (`VirtualCharacter` + `MoveAndSlidePlugin`) in `crates/kcc-avian`; `shared::kcc` is the engine-free reference solver. |
+| KCC | Avian's virtual character (`VirtualCharacter` + `MoveAndSlidePlugin`) in `crates/kcc`; `shared::kcc` is the engine-free reference solver. |
 | Terrain collision | **Client only.** Server holds no landscape data at all |
 | Entity collision | **Server only** (players in PvP, bosses), custom capsule solver, no Avian |
 | Anti-cheat | Deliberately deprioritised. Cheap checks only; "don't make cheating trivial" |
@@ -222,7 +222,7 @@ dead zone around the contact distance.
    Lightyear 0.30 `PredictionHistory` / `ConfirmedHistory` / `VisualCorrection` were asserted
    without verification against the docs. The transport is Lightyear 0.31 over a raw UDP endpoint,
    and the controller uses the branch's `VirtualCharacter` / `AutoMoveAndSlide` /
-   `MoveAndSlidePlugin` API ported onto released `avian3d` 0.8 (`crates/kcc-avian`).
+   `MoveAndSlidePlugin` API ported onto released `avian3d` 0.8 (`crates/kcc`).
 
 ---
 

@@ -11,7 +11,7 @@ running code instead of arguing about them.
 - **Rust** 1.100.0 (pinned in `rust-toolchain.toml`)
 - **Bevy** 0.20 (`MinimalPlugins` on the server, `DefaultPlugins` in the client window)
 - **Lightyear** 0.31 for replication, prediction, interpolation, inputs and the UDP transport
-- **Avian 0.8** character controller (`kcc-avian`) driven by **bevy_enhanced_input** actions
+- **Avian 0.8** character controller (`kcc`) driven by **bevy_enhanced_input** actions
 - 60 Hz fixed tick shared by the Bevy fixed clock and Lightyear's timeline
 
 ## Layout
@@ -19,7 +19,7 @@ running code instead of arguing about them.
 | Crate | Role |
 | --- | --- |
 | `crates/shared` | Everything both sides share: the network protocol (components, inputs, `ProtocolPlugin`), the physics/character pipeline, the one movement system, and the pure simulation math (velocity model, reference capsule solver, static test room) |
-| `crates/kcc-avian` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`) |
+| `crates/kcc` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`) |
 | `crates/server` | Headless Bevy app: UDP endpoint, one replicated player per connected client |
 | `crates/client` | Bevy window with the predicted character, plus a headless scripted CI mode |
 | `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes the live Lightyear protocol: input messages, protocol metadata, replicon traffic and ping/pong |
