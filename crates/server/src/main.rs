@@ -15,9 +15,15 @@ mod transport;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use shared::protocol::*;
+use shared::*;
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
+use bevy_enhanced_input::prelude::{Action, ActionOf, Fire};
 use clap::Parser;
+use lightyear::connection::client::Connected;
+use lightyear::prelude::server::*;
+use lightyear::prelude::*;
 
 use sim::authority::{SimConfig, Simulation};
 use sim::movement::MoveParams;
@@ -31,125 +37,6 @@ pub enum SimSet {
     Dispatch,
 }
 
-pub struct Game {
-    pub sim: Simulation,
-    pub world: StaticWorld,
-    pub move_params: MoveParams,
-    pub accumulator: f32,
-    /// Snapshots produced since the last dispatch, merged per player. A frame can
-    /// advance several ticks, and the simulation's own buffer only keeps the
-    /// latest one, so the queue is what preserves the earlier ticks' corrections.
-    pending: Vec<(u64, proto::ServerSnapshot)>,
-}
-
-impl Default for Game {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Game {
-    pub fn new() -> Self {
-        Self {
-            sim: Simulation::new(SimConfig::default()),
-            world: StaticWorld::test_room(),
-            move_params: MoveParams::default(),
-            accumulator: 0.0,
-            pending: Vec::new(),
-        }
-    }
-
-    /// Snapshots waiting to go out, one per player, in the simulation's order.
-    pub fn pending(&self) -> &[(u64, proto::ServerSnapshot)] {
-        &self.pending
-    }
-
-    /// Drops the dispatched snapshots without freeing the buffer.
-    pub fn clear_pending(&mut self) {
-        self.pending.clear();
-    }
-
-    /// Advances at most `max_ticks` fixed steps for `delta` seconds of wall time.
-    pub fn advance(&mut self, delta: f32, max_ticks: u32) -> u32 {
-        self.accumulator += delta;
-        let step = proto::SERVER_TICK_DT;
-        let mut ran = 0;
-        while self.accumulator >= step && ran < max_ticks {
-            self.tick_once();
-            self.accumulator -= step;
-            ran += 1;
-        }
-        if ran == max_ticks && self.accumulator >= step {
-            // Shed the backlog instead of spiralling into a slow-motion world.
-            self.accumulator = 0.0;
-        }
-        ran
-    }
-
-    fn tick_once(&mut self) {
-        // `Simulation::step` owns the tick counter and writes the snapshots into
-        // its own buffer, so this is the whole fixed step.
-        self.sim.step(&self.world);
-        self.collect_snapshots();
-    }
-
-    /// Folds this tick's snapshots into the pending queue.
-    ///
-    /// Players keep their order in the simulation's dense array, so the queue is
-    /// merged positionally; when the order changed (a player left mid-frame) the
-    /// queue restarts from this tick rather than matching the wrong bodies.
-    fn collect_snapshots(&mut self) {
-        let fresh = self.sim.snapshots();
-        let aligned = self.pending.len() == fresh.len()
-            && self
-                .pending
-                .iter()
-                .zip(fresh)
-                .all(|((a, _), (b, _))| a == b);
-        if !aligned {
-            self.pending.clear();
-            self.pending.extend_from_slice(fresh);
-            return;
-        }
-        for ((_, merged), (_, next)) in self.pending.iter_mut().zip(fresh) {
-            merge_snapshot(merged, next);
-        }
-    }
-}
-
-/// Folds `next`'s correction into `merged`, keeping the newer informational fields.
-///
-/// Both ticks' corrections describe velocity changes the client has not seen, so
-/// they are summed instead of the older one being dropped; the newest normal and
-/// sequence number win, because the client dedupes by sequence.
-fn merge_snapshot(merged: &mut proto::ServerSnapshot, next: &proto::ServerSnapshot) {
-    match (&mut merged.correction, next.correction) {
-        (Some(into), Some(from)) => {
-            let a = Vec3::from_array(into.velocity_delta);
-            let b = Vec3::from_array(from.velocity_delta);
-            into.velocity_delta = (a + b).to_array();
-            into.seq = from.seq;
-            into.tick = from.tick;
-            into.epoch = from.epoch;
-            if from.hard_normal.is_some() {
-                into.hard_normal = from.hard_normal;
-            }
-        }
-        (slot @ None, from) => *slot = from,
-        // `merged` carries a correction `next` no longer does: keep it, it has
-        // not been sent yet.
-        (Some(_), None) => {}
-    }
-    merged.server_tick = next.server_tick;
-    merged.acked_seq = next.acked_seq;
-    merged.shadow_position = next.shadow_position;
-    merged.resync = next.resync;
-    merged.peers = next.peers;
-}
-
-#[derive(Resource)]
-pub struct GameRes(pub Game);
-
 fn main() {
     let args = Args::parse();
 
@@ -161,14 +48,12 @@ fn main() {
     let addr = args.listen;
 
     let mut app = App::new();
-    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))))
-        .add_plugins(bevy::log::LogPlugin::default())
-        .configure_sets(
-            Update,
-            (SimSet::Ingest, SimSet::Drive, SimSet::Dispatch).chain(),
-        )
-        .insert_resource(GameRes(Game::new()))
-        .add_systems(Update, drive.in_set(SimSet::Drive));
+    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))));
+    app.insert_resource(ReplicationMetadata::new(SEND_INTERVAL));
+    // the physics/FixedUpdates systems that consume inputs should be run in this set.
+    app.add_observer(movement);
+    app.add_observer(handle_new_client);
+    app.add_observer(handle_connected);
 
     // Probe the address ourselves so a bad `--listen` is still a clean
     // exit instead of a logged error from inside a lightyear observer.
@@ -184,11 +69,75 @@ fn main() {
     app.run();
 }
 
-fn drive(time: Res<Time>, mut game: ResMut<GameRes>) {
-    // No sleeping in here: the schedule runner owns the frame pacing (see
-    // `ScheduleRunnerPlugin::run_loop` in `main`), so this system either does
-    // work or returns immediately.
-    game.0.advance(time.delta_secs(), 8);
+/// When a new client tries to connect to a server, an entity is created for it with the `LinkOf` component.
+/// This entity represents the link between the server and that client.
+///
+/// You can add additional components to update the link. In this case we will add a `ReplicationSender` that
+/// will enable us to replicate local entities to that client.
+pub(crate) fn handle_new_client(trigger: On<Add<LinkOf>>, mut commands: Commands) {
+    commands
+        .entity(trigger.entity)
+        .insert((ReplicationSender, Name::from("Client")));
+}
+
+/// If the new client connects to the server, we want to spawn a new player entity for it.
+///
+/// We have to react specifically on `Connected` because there is no guarantee that the connection request we
+/// received was valid. The server could reject the connection attempt for many reasons (server is full, packet is invalid,
+/// DDoS attempt, etc.). We want to start the replication only when the client is confirmed as connected.
+pub(crate) fn handle_connected(
+    trigger: On<Add<Connected>>,
+    query: Query<&RemoteId, With<ClientOf>>,
+    mut commands: Commands,
+) {
+    let Ok(client_id) = query.get(trigger.entity) else {
+        return;
+    };
+    let client_id = client_id.0;
+    let player_entity = commands
+        .spawn((
+            // Add the context component on the server; it will be replicated to the client
+            Player,
+            PlayerId(client_id),
+            ReplicablePosition(shared::initial_player_position(client_id)),
+            // we replicate the Player entity to all clients that are connected to this server
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id();
+    info!(
+        "Create player entity {:?} for client {:?}",
+        player_entity, client_id
+    );
+    spawn_action_entities(&mut commands, player_entity);
+}
+
+/// Spawn the BEI action entities for a player.
+///
+/// The server owns and replicates action entities so the owning client can
+/// target them in input messages and remote clients can receive rebroadcasted
+/// input for prediction.
+///
+/// `InputPlugin<C>` installs `HierarchySendPlugin<ActionOf<C>>`, which makes
+/// each action entity replicate like its context entity. The action therefore
+/// does not need its own `Replicate` component.
+fn spawn_action_entities(commands: &mut Commands, player_entity: Entity) {
+    commands.spawn((
+        ActionOf::<Player>::new(player_entity),
+        Action::<Movement>::new(),
+    ));
+}
+
+/// Applies received client inputs on the server so other clients can observe the result.
+fn movement(trigger: On<Fire<Movement>>, mut position_query: Query<&mut ReplicablePosition>) {
+    if let Ok(position) = position_query.get_mut(trigger.context) {
+        shared::shared_movement_behaviour(position, trigger.value);
+    }
 }
 
 /// Deterministic N-bot soak test. Prints a machine-readable summary.

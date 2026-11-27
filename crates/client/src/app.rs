@@ -2,7 +2,12 @@
 
 use bevy::prelude::*;
 use kcc_avian::prelude::{MoveAndSlidePlugin, PhysicsPlugins};
+use lightyear::input::bei::prelude::{preset, Action, ActionOf, Actions, Bindings, Fire};
+use lightyear::prediction::rollback::DeterministicPredicted;
+use lightyear::prelude::client::{InputDelayConfig, InputTimelineConfig};
+use lightyear::prelude::*;
 
+use shared::protocol::*;
 use crate::character::{self, Character};
 use crate::transport::{ClientNetPlugin, NetSet};
 use crate::{Args, Local, WorldRes};
@@ -13,7 +18,6 @@ const TURN_RATE: f32 = 2.5;
 
 #[derive(Resource, Default)]
 struct PlayerRes {
-    input: proto::InputFrame,
 }
 
 pub fn run(args: &Args) {
@@ -39,12 +43,10 @@ pub fn run(args: &Args) {
     .insert_resource(WorldRes(world))
     .init_resource::<Local>()
     .init_resource::<PlayerRes>()
-    .add_systems(Startup, setup)
-    .add_systems(
-        FixedUpdate,
-        (sample_input, tick_local, character::apply_local).chain(),
-    )
-    .add_systems(FixedLast, character::read_back)
+    .add_systems(Startup, (setup, configure_input_delay))
+    .add_observer(add_bindings_to_controlled_action)
+    .add_observer(add_bindings_to_controlled_player_actions)
+    .add_observer(player_movement)
     .add_systems(Update, follow.after(NetSet::Receive));
 
     if let Some(addr) = args.connect {
@@ -55,6 +57,12 @@ pub fn run(args: &Args) {
     }
 
     app.run();
+}
+
+fn configure_input_delay(mut commands: Commands) {
+    commands.insert_resource(
+        InputTimelineConfig::default().with_input_delay(InputDelayConfig::balanced()),
+    );
 }
 
 fn setup(
@@ -128,43 +136,76 @@ fn setup(
     commands.insert_resource(Character(player));
 }
 
-fn sample_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut res: ResMut<PlayerRes>,
-    mut local: ResMut<Local>,
-    time: Res<Time>,
+/// Applies local movement only to predicted entities owned by this client.
+/// In host-server mode the server observer runs in the same app, so the client
+/// observer is disabled.
+fn player_movement(
+    trigger: On<Fire<Movement>>,
+    _input_timeline: SyncedLocalTimeline,
+    mut position_query: Query<
+        &mut ReplicablePosition,
+        Or<(With<Predicted>, With<DeterministicPredicted>)>,
+    >,
 ) {
-    let axis = |pos: KeyCode, neg: KeyCode| -> f32 {
-        let p = keys.pressed(pos) as i32;
-        let n = keys.pressed(neg) as i32;
-        (p - n) as f32
-    };
-    let x = axis(KeyCode::KeyD, KeyCode::KeyA);
-    let z = axis(KeyCode::KeyS, KeyCode::KeyW);
-
-    let mut buttons = 0u8;
-    if keys.pressed(KeyCode::Space) {
-        buttons |= proto::buttons::JUMP;
+    if let Ok(position) = position_query.get_mut(trigger.context) {
+        // Pass Mut<ReplicablePosition> directly so change detection only fires when movement changes it.
+        shared::shared_movement_behaviour(position, trigger.value);
     }
-    if keys.pressed(KeyCode::ShiftLeft) {
-        buttons |= proto::buttons::SPRINT;
-    }
-
-    let turn = (keys.pressed(KeyCode::KeyE) as i32 - keys.pressed(KeyCode::KeyQ) as i32) as f32;
-    local.player.angular_velocity = Vec3::new(0.0, -turn * TURN_RATE, 0.0);
-    local.player.yaw += local.player.angular_velocity.y * time.delta_secs();
-
-    res.input = proto::InputFrame {
-        move_x: (x * 127.0).clamp(-127.0, 127.0) as i8,
-        move_z: (z * 127.0).clamp(-127.0, 127.0) as i8,
-        buttons,
-        camera_yaw: proto::quantise_yaw(local.player.yaw),
-        ..default()
-    };
 }
 
-fn tick_local(mut local: ResMut<Local>, res: Res<PlayerRes>) {
-    local.step(res.input);
+/// Local WASD bindings for a movement action entity.
+fn key_bindings() -> impl Scene {
+    bsn! {
+        Action::<Movement>::new()
+        Bindings [ 
+            {preset::cardinal::wasd_keys()}
+            --
+            {preset::axial::left_stick()}
+        ]
+        --
+        Action::<Jump>::new()
+        Bindings [
+            Binding(KeyCode::Space)
+            --
+            Binding(GamepadButton::South)
+        ]
+    }
+}
+
+/// Add local movement bindings once the replicated action entity is fully
+/// ready for a player that we control.
+fn add_bindings_to_controlled_action(
+    trigger: On<Insert<(Action<Movement>, ActionOf<Player>)>>,
+    actions: Query<&ActionOf<Player>, (With<Action<Movement>>, Without<Bindings>)>,
+    controlled_players: Query<(), (With<Player>, With<Controlled>)>,
+    mut commands: Commands,
+) {
+    let Ok(action_of) = actions.get(trigger.entity) else {
+        return;
+    };
+    if controlled_players.get(action_of.get()).is_err() {
+        return;
+    }
+    commands.entity(trigger.entity).apply_scene(key_bindings());
+}
+
+/// Add local movement bindings if the controlled player becomes ready after
+/// its action entities.
+fn add_bindings_to_controlled_player_actions(
+    trigger: On<Add<(Player, Controlled, Actions<Player>)>>,
+    players: Query<&Actions<Player>, (With<Player>, With<Controlled>)>,
+    actions: Query<(), (With<Action<Movement>>, Without<Bindings>)>,
+    mut commands: Commands,
+) {
+    let Ok(player_actions) = players.get(trigger.entity) else {
+        return;
+    };
+    for action in player_actions.iter() {
+        if actions.get(action).is_err() {
+            continue;
+        }
+        commands.entity(action).apply_scene(key_bindings());
+    }
 }
 
 fn follow(local: Res<Local>, mut q: Query<&mut Transform, With<Camera3d>>) {

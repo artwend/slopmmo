@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-proto.workspace = true
+shared.workspace = true
 net.workspace = true
 sim.workspace = true
 kcc-avian.workspace = true

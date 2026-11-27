@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-proto.workspace = true
+shared.workspace = true
 net.workspace = true
 bevy_math = "0.20"
 clap = { version = "4", features = ["derive"] }
@@ -15,12 +15,8 @@ sim.workspace = true
 # Headless only: no render, no window, no asset pipeline.
 bevy = { version = "0.20", default-features = false, features = ["std", "multi_threaded", "async_executor", "bevy_log"] }
 
-# `raw_connection`: lightyear's thin connection layer over a bare UDP endpoint.
-# Admission is ours (no netcode handshake yet), so there is nothing to negotiate.
-#
-# `client` is required even though this is a server: lightyear 0.31's
-# `lightyear_raw_connection` server module imports the client-side lifecycle
-# types (`Connected`, `Disconnecting`, ...) from `lightyear_connection`, and only
-# the `client` feature of that crate exports them. Building with `server` alone
-# fails inside the dependency, so the pair is not optional here.
 lightyear = { version = "0.31", default-features = false, features = ["std", "client", "server", "udp", "raw_connection"] }
+
+bevy_enhanced_input = { version = "0.27", default-features = false, features = [
+  "serialize",
+] }

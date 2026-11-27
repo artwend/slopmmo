@@ -6,11 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Lightyear serialises these types with postcard; the layout is defined by the
-# derives in `src/packet.rs`.
+bevy_math = "0.20"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
-# The round-trip tests use the same codec Lightyear does.
 postcard = { version = "1", features = ["alloc"] }
 

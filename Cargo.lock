@@ -2704,7 +2704,7 @@ dependencies = [
  "kcc-avian",
  "lightyear",
  "net",
- "proto",
+ "shared",
  "sim",
 ]
 
@@ -4915,6 +4915,7 @@ dependencies = [
  "bevy_utils",
  "lightyear_connection",
  "lightyear_core",
+ "lightyear_interpolation",
  "lightyear_link",
  "lightyear_messages",
  "lightyear_prediction",
@@ -5296,6 +5297,7 @@ dependencies = [
  "lightyear_core",
  "lightyear_link",
  "lightyear_metrics",
+ "lightyear_replication",
  "metrics",
  "metrics-util",
  "serde",
@@ -6866,6 +6868,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "proto"
 version = "0.1.0"
 dependencies = [
+ "bevy_math",
  "postcard",
  "serde",
 ]
@@ -7605,11 +7608,12 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_enhanced_input",
  "bevy_math",
  "clap",
  "lightyear",
  "net",
- "proto",
+ "shared",
  "sim",
 ]
 
@@ -7642,6 +7646,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_enhanced_input",
+ "lightyear",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
