@@ -5,7 +5,7 @@ members = [
     "crates/kcc",
     "crates/server",
     "crates/client",
-    "tools/packetdump",
+    "crates/protocol-inspector",
 ]
 
 [workspace.package]

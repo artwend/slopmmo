@@ -1,5 +1,5 @@
 [package]
-name = "packetdump"
+name = "protocol-inspector"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 # Developer tool: it is in the workspace so `cargo test --workspace` covers it,
 # but it is never published and no shipped crate depends on it.
 publish = false
-description = "Developer-only CLI packet analyzer for the lightyear movement protocol"
+description = "Developer-only CLI protocol inspector for the lightyear movement protocol"
 
 [dependencies]
 # Command line parsing and `--help`.
@@ -29,7 +29,7 @@ postcard = { version = "1", features = ["alloc"] }
 # RON is the console representation of decoded packet content.
 ron = "0.12"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
-# Reads the display filter from `packetdump.toml`.
+# Reads the display filter from `protocol-inspector.toml`.
 toml = "1"
 
 [dev-dependencies]

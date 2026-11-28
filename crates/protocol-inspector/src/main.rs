@@ -1,4 +1,4 @@
-//! Developer-only packet analyzer for the lightyear protocol.
+//! Developer-only protocol inspector for the lightyear protocol.
 //!
 //! This is a transparent UDP relay, not a pcap tap: the client points at the
 //! relay and the relay forwards every datagram to the real server while
@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     let config = match config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("packetdump: {error}");
+            eprintln!("protocol-inspector: {error}");
             return ExitCode::from(2);
         }
     };
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
     let mut relay = match relay::Relay::bind(listen, server) {
         Ok(relay) => relay,
         Err(error) => {
-            eprintln!("packetdump: cannot bind {listen}: {error}");
+            eprintln!("protocol-inspector: cannot bind {listen}: {error}");
             return ExitCode::from(2);
         }
     };
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
     let color =
         !args.no_color && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
-    println!("packetdump  parsed Lightyear packets (dev tool)");
+    println!("protocol-inspector  parsed Lightyear packets (dev tool)");
     println!("  relay   {bound} -> {server}");
     println!("  client  --connect {connect}");
     if !config.filter.is_empty() {
@@ -81,7 +81,7 @@ fn main() -> ExitCode {
         if let Err(error) = relay.poll(POLL_INTERVAL, &mut |datagram| {
             reporter.on_datagram(datagram);
         }) {
-            eprintln!("packetdump: relay error: {error}");
+            eprintln!("protocol-inspector: relay error: {error}");
         }
         reporter.tick(Instant::now());
         if reporter.limit_reached() {

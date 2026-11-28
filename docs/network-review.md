@@ -50,7 +50,7 @@ tests; 1 ignored by design — `corrections_are_integrated_once_per_tick`, §7.7
 | N7 | Low-Med | No connection-state observability: link loss is silent, `MessageSender` then grows unbounded | Fixed |
 | N8 | Low | `DATAGRAM_BUDGET = 1200` is the MTU, not a payload budget; the test does not prove "never fragments" | Fixed |
 | N9 | Low | Two dead wire fields (`applied_correction_seq`, `acked_seq`) that look like the ack path | Fixed |
-| N10 | Low | `packetdump` hand-decodes lightyear framing with no test tying it to the library | Fixed |
+| N10 | Low | `protocol-inspector` hand-decodes lightyear framing with no test tying it to the library | Fixed |
 | N11 | Low | `net` enables both `client` and `server` features, so each binary links the other role | Fixed |
 | N12 | Info | Lightyear's `LocalTimeline`/`Tick` is unused; two tick domains exist, one of them dead | Documented |
 
@@ -215,9 +215,9 @@ reader.
 
 ---
 
-### N10 — `packetdump` reimplements lightyear framing unguarded (Low)
+### N10 — `protocol-inspector` reimplements lightyear framing unguarded (Low)
 
-`tools/packetdump/src/wire.rs` restates the 0.31 wire format by hand. The layout was verified
+`crates/protocol-inspector/src/wire.rs` restates the 0.31 wire format by hand. The layout was verified
 correct for 0.31.0 against the real sources (13-byte header: `type:u8`, `packet_id:u16be`,
 `last_ack:u16be`, `ack_bits:u32be`, `tick:u32be`, plus the packet-type discriminants). But the crate
 does not depend on `lightyear`, so nothing fails when 0.32 changes the format — the tool will simply
@@ -293,7 +293,7 @@ All twelve findings were implemented in one pass. The tests named here fail with
 | N7 | Send paths are gated on `Connected` (client and server), and both binaries log `Disconnected`/`Unlinked` reasons instead of staying silent. Disconnects are counted and surfaced in the headless report. | `client/src/transport.rs`, `server/src/transport.rs`: `report_disconnects` | headless report fails on `net_disconnects > 0` |
 | N8 | `MESSAGE_BUDGET = lightyear::link::DEFAULT_MTU - HEADER_BYTES`, and the size test asserts against it. | `net/src/lib.rs` | `worst_case_packets_fit_one_datagram` |
 | N9 | `applied_correction_seq` is now the ack for a bounded in-flight correction set: the newest unacknowledged correction repeats on the send cadence (max `CORRECTION_RESEND_LIMIT`, `CORRECTION_INFLIGHT_TTL`) and stops when the client echoes it. `acked_seq` is read by the client to report reports-in-flight. | `server/src/transport.rs`: `ack_correction`, `correction_to_send`, `track_correction`; `client/src/transport.rs` | `an_unacknowledged_correction_is_repeated_then_dropped`, `the_resend_budget_bounds_an_unacknowledged_correction` |
-| N10 | A dev-dependency test pushes a payload through the real lightyear transport and parses the resulting datagram with `wire.rs`. | `tools/packetdump/src/wire.rs`, `Cargo.toml` | `decodes_a_packet_produced_by_lightyear` |
+| N10 | A dev-dependency test pushes a payload through the real lightyear transport and parses the resulting datagram with `wire.rs`. | `crates/protocol-inspector/src/wire.rs`, `Cargo.toml` | `decodes_a_packet_produced_by_lightyear` |
 | N11 | `net` depends on lightyear with `std` only; the binaries supply their role. The client binary is now `client`-only. The server still needs `client` + `server` because lightyear 0.31's `lightyear_raw_connection` server module imports client-side lifecycle types — an upstream packaging constraint, documented in `crates/server/Cargo.toml`. | `net/Cargo.toml`, `server/Cargo.toml` | compiles per-target; `cargo build -p server` / `-p client` |
 | N12 | The tick-domain constraint is recorded in ADR 006. | `decisions/006-netcode-lightyear.md` | — |
 

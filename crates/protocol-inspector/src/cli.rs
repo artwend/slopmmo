@@ -1,4 +1,4 @@
-//! Command line for the packet analyzer.
+//! Command line for the protocol inspector.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,10 +13,10 @@ use crate::report::DirectionFilter;
 /// Point the client at the relay instead of the server:
 ///
 ///   cargo run -p server -- --listen 127.0.0.1:4000
-///   cargo run -p packetdump -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
+///   cargo run -p protocol-inspector -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
 ///   cargo run -p client -- --headless --connect 127.0.0.1:4001
 #[derive(Clone, Debug, Parser)]
-#[command(name = "packetdump", verbatim_doc_comment)]
+#[command(name = "protocol-inspector", verbatim_doc_comment)]
 pub struct Args {
     /// relay bind address
     #[arg(
@@ -67,7 +67,7 @@ pub struct Args {
     /// disable ANSI colors
     #[arg(long)]
     pub no_color: bool,
-    /// TOML config with the packet filter (default: ./packetdump.toml)
+    /// TOML config with the packet filter (default: ./protocol-inspector.toml)
     #[arg(short = 'c', long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 }
@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     fn parse(parts: &[&str]) -> Args {
-        Args::parse_from(std::iter::once("packetdump").chain(parts.iter().copied()))
+        Args::parse_from(std::iter::once("protocol-inspector").chain(parts.iter().copied()))
     }
 
     #[test]
@@ -137,8 +137,8 @@ mod tests {
 
     #[test]
     fn out_of_range_stats_interval_is_rejected() {
-        assert!(Args::try_parse_from(["packetdump", "-t", "90000"]).is_err());
-        assert!(Args::try_parse_from(["packetdump", "-t", "slow"]).is_err());
+        assert!(Args::try_parse_from(["protocol-inspector", "-t", "90000"]).is_err());
+        assert!(Args::try_parse_from(["protocol-inspector", "-t", "slow"]).is_err());
         assert_eq!(parse(&["-t", "0"]).stats_every, 0.0);
     }
 

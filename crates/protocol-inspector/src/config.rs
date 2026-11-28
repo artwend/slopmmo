@@ -1,6 +1,6 @@
 //! On-disk configuration: which packets the analyzer prints.
 //!
-//! The file is `packetdump.toml` in the working directory, or the copy shipped
+//! The file is `protocol-inspector.toml` in the working directory, or the copy shipped
 //! in this crate when it is run through cargo. Every `filter` entry is a packet
 //! name or a lightyear message net id; prefixing it with `!` hides that packet
 //! instead of selecting it. Exclusions win over inclusions, and a datagram is
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::message::{Kind, MessageKey};
 
 /// Config file name looked up when `--config` is not given.
-pub const FILE_NAME: &str = "packetdump.toml";
+pub const FILE_NAME: &str = "protocol-inspector.toml";
 
 const KNOWN_NAMES: &str = "input, metadata, replication, ping, pong, internal or ack";
 
@@ -64,7 +64,7 @@ fn find_default() -> Option<PathBuf> {
     if local.is_file() {
         return Some(local);
     }
-    // `cargo run -p packetdump` normally starts in the repository root, so also
+    // `cargo run -p protocol-inspector` normally starts in the repository root, so also
     // honour the file that ships with the tool.
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE_NAME);
     shipped.is_file().then_some(shipped)
@@ -304,8 +304,10 @@ mod tests {
 
     #[test]
     fn an_explicit_config_file_is_loaded() {
-        let path =
-            std::env::temp_dir().join(format!("packetdump-{}-explicit.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "protocol-inspector-{}-explicit.toml",
+            std::process::id()
+        ));
         fs::write(&path, "filter = [\"!ping\"]\n").expect("write config");
         let loaded = load(Some(&path));
         fs::remove_file(&path).ok();
@@ -321,7 +323,8 @@ mod tests {
 
     #[test]
     fn a_missing_explicit_config_is_an_error() {
-        let error = load(Some(Path::new("missing-packetdump.toml"))).expect_err("must fail");
-        assert!(error.contains("missing-packetdump.toml"), "{error}");
+        let error =
+            load(Some(Path::new("missing-protocol-inspector.toml"))).expect_err("must fail");
+        assert!(error.contains("missing-protocol-inspector.toml"), "{error}");
     }
 }

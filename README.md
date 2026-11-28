@@ -24,7 +24,7 @@ the ADRs is still design only; the status table in
 | `crates/kcc` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`) |
 | `crates/server` | Headless Bevy app: UDP endpoint, one replicated player per connected client |
 | `crates/client` | Bevy window with the predicted character, plus a headless scripted CI mode |
-| `tools/packetdump` | **Dev only.** UDP relay + CLI that decodes the live Lightyear protocol: input messages, protocol metadata, replicon traffic and ping/pong |
+| `crates/protocol-inspector` | **Dev only.** UDP relay + CLI that inspects the live Lightyear protocol: input messages, protocol metadata, replicon traffic and ping/pong |
 
 ## Design in one page
 
@@ -130,7 +130,7 @@ player.
 
 ### Parsed packet view (dev tool)
 
-`tools/packetdump` is a transparent UDP relay: point a client at it and it forwards every datagram
+`crates/protocol-inspector` is a transparent UDP relay: point a client at it and it forwards every datagram
 to the server while printing what it contains. It decodes the live protocol — the client's
 `InputMessage` (end tick, target entities and their action states), the `ProtocolCheck` and
 `SenderMetadata` metadata messages, and ping/pong. The three replicon channels carry
@@ -138,12 +138,12 @@ to the server while printing what it contains. It decodes the live protocol — 
 and size:
 
 ```sh
-cargo run -p packetdump -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
+cargo run -p protocol-inspector -- --listen 127.0.0.1:4001 --server 127.0.0.1:4000
 cargo run -p client -- --connect 127.0.0.1:4001
 ```
 
 `--detail` prints the decoded message as RON, `--hex` appends a datagram dump, and
-`tools/packetdump/packetdump.toml` holds the display filter.
+`crates/protocol-inspector/protocol-inspector.toml` holds the display filter.
 
 ## What is not here
 

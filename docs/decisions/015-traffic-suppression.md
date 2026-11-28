@@ -107,7 +107,7 @@ The measurements below describe the removed protocol; they are kept as the desig
 - **Steady client:** a constant velocity is already described by `pos + vel × age`, so 30 reports/s
   (~2.4 KB/s) drops to ~10 anchors/s (~0.8 KB/s) while walking and 4/s (~0.2 KB/s) while stationary.
   Changes and turns still leave at 30 Hz with their input frames. Measured over a 20 s scripted run
-  through the packetdump relay: 564 → 147 reports; client→server 63 → 32 packets/s and server→client
+  through the protocol-inspector relay: 564 → 147 reports; client→server 63 → 32 packets/s and server→client
   66 → 40 packets/s, because the server also sends fewer ACK-only datagrams for fewer client packets.
 - **Idle server:** 60 snapshots/s → at most 10/s per client (the 100 ms floor on a fast path), and
   less on a high-RTT link as the heartbeat stretches to 1 s. For a stationary player in an empty
@@ -138,6 +138,6 @@ correction-repetition logic of our own.
 
 - Does Lightyear's change detection plus the 100 ms send interval give the quiet-wire property this
   ADR wanted, or does a stationary player still cost a fixed replication stream? Measure it with
-  `tools/packetdump` before adding a suppression layer back.
+  `crates/protocol-inspector` before adding a suppression layer back.
 - If a custom protocol returns, which of the three rules (input-change gate, anchor cadence,
   snapshot comparison) is worth rebuilding first?

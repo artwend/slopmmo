@@ -1,7 +1,7 @@
-# packetdump options.
+# protocol-inspector options.
 #
-# `packetdump` reads this file from the working directory, or from this
-# directory when it is started with `cargo run -p packetdump`. Use
+# `protocol-inspector` reads this file from the working directory, or from this
+# directory when it is started with `cargo run -p protocol-inspector`. Use
 # `--config PATH` to load a different file.
 #
 # `filter` selects which datagrams are printed. Each entry is a packet name or

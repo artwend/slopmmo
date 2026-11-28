@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs a local MMO server, one or more clients, and optionally packetdump.
+    Runs a local MMO server, one or more clients, and optionally the protocol inspector.
 
 .DESCRIPTION
     Builds the binaries (unless -NoBuild), starts the server on loopback, starts
@@ -11,7 +11,7 @@
     Use -Headless to run the fixed scripted client instead (about 20 seconds of
     simulated time).
 
-    With -Capture the clients connect through tools/packetdump, which forwards
+    With -Capture the clients connect through crates/protocol-inspector, which forwards
     the traffic to the server and prints each parsed packet. Without -Capture
     the clients connect straight to the server.
 
@@ -32,7 +32,7 @@
 
 .EXAMPLE
     .\tools\run-local.ps1 -Headless -Capture -Clients 2
-    Two scripted clients, both routed through packetdump.
+    Two scripted clients, both routed through the protocol inspector.
 
 .EXAMPLE
     .\tools\run-local.ps1 -Headless -Capture -Detail -Duration 45
@@ -40,7 +40,7 @@
 
 .EXAMPLE
     .\tools\run-local.ps1 -Clients 0 -Capture
-    Server and packetdump only; connect a client yourself.
+    Server and protocol-inspector only; connect a client yourself.
 .EXAMPLE
     .\tools\run-local.ps1 -c -hl -n 2 -t 45 -d
     Short flags: capture, headless, two clients, 45 s cap, detail.
@@ -98,10 +98,10 @@ if ($Capture -and $ServerPort -eq $CapturePort) {
     throw "-ServerPort and -CapturePort must be different."
 }
 if ($Detail -and -not $Capture) {
-    Write-Warning "-Detail only affects packetdump; add -Capture to use it."
+    Write-Warning "-Detail only affects protocol-inspector; add -Capture to use it."
 }
 if ($NoAcks -and -not $Capture) {
-    Write-Warning "-NoAcks only affects packetdump; add -Capture to use it."
+    Write-Warning "-NoAcks only affects protocol-inspector; add -Capture to use it."
 }
 if ($PSBoundParameters.ContainsKey('Duration') -and -not $Headless) {
     Write-Warning "-Duration only applies to -Headless clients."
@@ -118,7 +118,7 @@ $isWindowsHost = $env:OS -eq 'Windows_NT'
 $exeSuffix = if ($isWindowsHost) { '.exe' } else { '' }
 $serverExe = Join-Path $binDir "server$exeSuffix"
 $clientExe = Join-Path $binDir "client$exeSuffix"
-$packetdumpExe = Join-Path $binDir "packetdump$exeSuffix"
+$inspectorExe = Join-Path $binDir "protocol-inspector$exeSuffix"
 
 $LogDir = Join-Path (Join-Path $RepoRoot 'target') 'local-run'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -130,7 +130,7 @@ if (-not $NoBuild) {
     }
     $cargoArgs += @('-p', 'server', '-p', 'client')
     if ($Capture) {
-        $cargoArgs += @('-p', 'packetdump')
+        $cargoArgs += @('-p', 'protocol-inspector')
     }
     Write-Host "building: cargo $($cargoArgs -join ' ')" -ForegroundColor DarkGray
     Push-Location $RepoRoot
@@ -146,7 +146,7 @@ if (-not $NoBuild) {
 
 $required = @($serverExe, $clientExe)
 if ($Capture) {
-    $required += $packetdumpExe
+    $required += $inspectorExe
 }
 foreach ($path in $required) {
     if (-not (Test-Path -LiteralPath $path)) {
@@ -238,13 +238,13 @@ try {
         if ($NoAcks) {
             $captureArgs += '--no-acks'
         }
-        $relay = Start-Process -FilePath $packetdumpExe `
+        $relay = Start-Process -FilePath $inspectorExe `
             -ArgumentList $captureArgs `
             -WorkingDirectory $RepoRoot `
             -PassThru -NoNewWindow
         Write-Host "capture  127.0.0.1:$CapturePort -> 127.0.0.1:$ServerPort (pid $($relay.Id))"
         if (-not (Wait-UdpReady -Port $CapturePort -Process $relay)) {
-            throw "packetdump did not bind 127.0.0.1:$CapturePort"
+            throw "protocol-inspector did not bind 127.0.0.1:$CapturePort"
         }
     }
 
@@ -305,14 +305,14 @@ try {
                 break
             }
             if ($null -ne $relay -and $relay.HasExited) {
-                Write-Warning "packetdump exited with code $($relay.ExitCode)"
+                Write-Warning "protocol-inspector exited with code $($relay.ExitCode)"
                 break
             }
             Start-Sleep -Milliseconds 250
         }
     }
 
-    # If the server or packetdump died mid-run, stop clients that are still
+    # If the server or protocol-inspector died mid-run, stop clients that are still
     # sending so their logs can be collected and the run can finish cleanly.
     foreach ($run in $clientRuns) {
         if (-not $run.Process.HasExited) {
@@ -354,7 +354,7 @@ try {
     }
     if ($null -ne $relay -and $relay.HasExited -and $relay.ExitCode -ne 0) {
         $failed = $true
-        Write-Warning "packetdump exited with code $($relay.ExitCode)"
+        Write-Warning "protocol-inspector exited with code $($relay.ExitCode)"
     }
 } catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
@@ -363,7 +363,7 @@ try {
     foreach ($run in $clientRuns) {
         Stop-Child -Process $run.Process -Label "client $($run.Slot)"
     }
-    Stop-Child -Process $relay -Label 'packetdump'
+    Stop-Child -Process $relay -Label 'protocol-inspector'
     Stop-Child -Process $server -Label 'server'
 }
 
