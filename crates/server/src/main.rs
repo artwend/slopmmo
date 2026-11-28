@@ -41,7 +41,6 @@ fn main() {
             bevy::log::LogPlugin::default(),
             bevy::state::app::StatesPlugin,
         ))
-        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .insert_resource(ReplicationMetadata::new(SEND_INTERVAL))
         .add_plugins(ServerPlugins {
             tick_duration: TICK_DURATION,

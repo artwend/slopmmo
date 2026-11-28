@@ -208,11 +208,10 @@ fn spawn_room(app: &mut App) {
 }
 
 fn run_offline(seconds: f32) -> Report {
-    let budget = ((seconds * TICK_HZ as f32) as u32).max(1);
+    let budget = ((seconds * FIXED_TIMESTEP_HZ as f32) as u32).max(1);
 
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
-        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .add_plugins(physics_plugins())
         .add_plugins(MoveAndSlidePlugin::default())
         .init_resource::<MovementParams>()
@@ -277,7 +276,7 @@ fn run_offline(seconds: f32) -> Report {
 /// presses the same keys a windowed player would. That exercises the whole
 /// chain: bindings -> BEI evaluation -> lightyear input buffer -> server.
 fn run_live(seconds: f32, server: SocketAddr) -> (Script, Option<Vec3>) {
-    let budget = ((seconds * TICK_HZ as f32) as u32).max(1);
+    let budget = ((seconds * FIXED_TIMESTEP_HZ as f32) as u32).max(1);
 
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
@@ -289,7 +288,6 @@ fn run_live(seconds: f32, server: SocketAddr) -> (Script, Option<Vec3>) {
             bevy::log::LogPlugin::default(),
             bevy::state::app::StatesPlugin,
         ))
-        .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .add_plugins(ClientPlugins {
             tick_duration: TICK_DURATION,
         })

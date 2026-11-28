@@ -57,11 +57,9 @@ pub const RESTING_HEIGHT: f32 = CAPSULE_LENGTH * 0.5 + PLAYER_RADIUS;
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct MovementParams(pub MoveParams);
 
-/// Fixed simulation rate. The Bevy fixed clock, Lightyear's timeline and the
-/// server tick all use it, so a rollback replays exactly one tick.
-pub const TICK_HZ: f64 = 60.0;
+pub const FIXED_TIMESTEP_HZ: f64 = 64.0;
 /// Duration of one tick.
-pub const TICK_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
+pub const TICK_DURATION: Duration = Duration::from_nanos(1_000_000_000 / FIXED_TIMESTEP_HZ as u64);
 /// How often replication is flushed to clients.
 pub const SEND_INTERVAL: Duration = Duration::from_millis(100);
 

@@ -14,6 +14,7 @@ use crate::{Args, bindings};
 
 pub fn run(args: &Args) {
     let mut app = App::new();
+    let fixed_time = app.world().resource::<Time<Fixed>>();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "mmo — client".into(),
@@ -22,7 +23,6 @@ pub fn run(args: &Args) {
         }),
         ..default()
     }))
-    .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
     .add_plugins(ClientPlugins {
         tick_duration: TICK_DURATION,
     })
