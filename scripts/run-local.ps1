@@ -23,26 +23,26 @@
     client slots in console output and headless log names.
 
 .EXAMPLE
-    .\tools\run-local.ps1
+    .\scripts\run-local.ps1
     Server plus one windowed client, no capture.
 
 .EXAMPLE
-    .\tools\run-local.ps1 -Capture
+    .\scripts\run-local.ps1 -Capture
     Same, with the parsed packet stream in this console.
 
 .EXAMPLE
-    .\tools\run-local.ps1 -Headless -Capture -Clients 2
+    .\scripts\run-local.ps1 -Headless -Capture -Clients 2
     Two scripted clients, both routed through the protocol inspector.
 
 .EXAMPLE
-    .\tools\run-local.ps1 -Headless -Capture -Detail -Duration 45
+    .\scripts\run-local.ps1 -Headless -Capture -Detail -Duration 45
     One scripted client with expanded packets and a longer safety cap.
 
 .EXAMPLE
-    .\tools\run-local.ps1 -Clients 0 -Capture
+    .\scripts\run-local.ps1 -Clients 0 -Capture
     Server and protocol-inspector only; connect a client yourself.
 .EXAMPLE
-    .\tools\run-local.ps1 -c -hl -n 2 -t 45 -d
+    .\scripts\run-local.ps1 -c -hl -n 2 -t 45 -d
     Short flags: capture, headless, two clients, 45 s cap, detail.
 
 .NOTES
