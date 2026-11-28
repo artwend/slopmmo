@@ -2,9 +2,10 @@
 //!
 //! Offline mode runs the same Avian character controller and the same movement
 //! math as the networked client, without any sockets, so it can assert on
-//! determinism and on the controller's invariants. With `--connect` the script is
-//! replayed against a live server through the same bindings the windowed client
-//! uses.
+//! determinism and on the controller's invariants. It keeps the synthetic test
+//! room, whose walls the scripted invariants are written against; the live mode
+//! predicts against the real level. With `--connect` the script is replayed
+//! against a live server through the same bindings the windowed client uses.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -207,6 +208,19 @@ fn spawn_room(app: &mut App) {
     }
 }
 
+/// The live path predicts against the level the server simulates on.
+fn spawn_level(app: &mut App) {
+    match shared::level::LevelGeometry::load(shared::level::DEFAULT_LEVEL) {
+        Ok(level) => {
+            for collider in level.colliders() {
+                app.world_mut()
+                    .spawn(shared::level::level_collider_bundle(collider.clone()));
+            }
+        }
+        Err(e) => eprintln!("cannot load level {}: {e}", shared::level::DEFAULT_LEVEL),
+    }
+}
+
 fn run_offline(seconds: f32) -> Report {
     let budget = ((seconds * FIXED_TIMESTEP_HZ as f32) as u32).max(1);
 
@@ -302,7 +316,7 @@ fn run_live(seconds: f32, server: SocketAddr) -> (Script, Option<Vec3>) {
         );
     bindings::register(&mut app);
 
-    spawn_room(&mut app);
+    spawn_level(&mut app);
 
     // `App::run` would do this, but the loop below drives `update` by hand.
     // Lightyear registers part of the send/receive plumbing in `finish`.

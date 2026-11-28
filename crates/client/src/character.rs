@@ -1,4 +1,4 @@
-//! Rendering side of the player entities and of the test room.
+//! Rendering side of the player entities and of the level.
 //!
 //! The simulated components are inserted for the predicted player only; remote
 //! players are interpolated copies whose [`Position`] is written by lightyear,
@@ -21,6 +21,7 @@ pub fn setup_scene(mut commands: Commands, mut materials: ResMut<Assets<Standard
         ..default()
     })));
 
+    let spawn = shared::level::spawn_point(0);
     commands.spawn((
         Camera3d::default(),
         AmbientLight {
@@ -28,7 +29,8 @@ pub fn setup_scene(mut commands: Commands, mut materials: ResMut<Assets<Standard
             brightness: 320.0,
             ..default()
         },
-        Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 0.9, 0.0), Vec3::Y),
+        Transform::from_translation(spawn + Vec3::new(0.0, 6.0, 12.0))
+            .looking_at(spawn + Vec3::Y * 0.9, Vec3::Y),
     ));
 
     commands.spawn((
@@ -41,35 +43,18 @@ pub fn setup_scene(mut commands: Commands, mut materials: ResMut<Assets<Standard
     ));
 }
 
-/// Terrain: the colliders come from the shared room so both sides agree.
-pub fn spawn_terrain(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let room = shared::test_room();
-    let stone = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.32, 0.34, 0.38),
-        perceptual_roughness: 0.85,
-        ..default()
-    });
-    let pillar = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.55, 0.42, 0.30),
-        ..default()
-    });
-
-    for (i, b) in room.boxes().iter().enumerate() {
-        let size = b.max - b.min;
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-            MeshMaterial3d(if i == room.len() - 1 {
-                pillar.clone()
-            } else {
-                stone.clone()
-            }),
-            Transform::from_translation(Vec3::from((b.max + b.min) * 0.5)),
-            shared::terrain_bundle(b),
-        ));
+/// The default level: the map is drawn from the same file its colliders are
+/// baked from, so what is on screen is what the capsule hits. The server takes
+/// the same colliders through [`shared::level`].
+pub fn spawn_level(mut commands: Commands, assets: Res<AssetServer>) {
+    let level = shared::level::DEFAULT_LEVEL;
+    commands.spawn((
+        Name::new("level"),
+        WorldAssetRoot(assets.load(GltfAssetLabel::Scene(0).from_asset(level))),
+    ));
+    match shared::level::spawn_colliders(&mut commands, level) {
+        Ok(count) => info!("level {level}: {count} static colliders"),
+        Err(e) => error!("cannot load level {level}: {e}"),
     }
 }
 

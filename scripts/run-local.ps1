@@ -123,6 +123,49 @@ $inspectorExe = Join-Path $binDir "protocol-inspector$exeSuffix"
 $LogDir = Join-Path (Join-Path $RepoRoot 'target') 'local-run'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
+# Bevy is built with `dynamic_linking` (see the workspace Cargo.toml), so the
+# binaries load bevy_dylib.dll and, because a Rust `dylib` crate always links the
+# standard library dynamically, the toolchain's std-<hash>.dll. `cargo run` puts
+# those directories on the child's library path; Start-Process does not, and the
+# process then dies with STATUS_DLL_NOT_FOUND before it can bind a port.
+$runtimeDllDirs = @(
+    (Join-Path $binDir 'deps')
+    $binDir
+)
+Push-Location $RepoRoot
+try {
+    $targetLibDir = @(& rustc --print target-libdir 2>$null) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+        Select-Object -First 1
+    if ($targetLibDir) {
+        $runtimeDllDirs += $targetLibDir
+    }
+    else {
+        Write-Warning "cannot locate the Rust target lib dir; direct launches may fail to load std-<hash>.dll."
+    }
+}
+catch {
+    Write-Warning "rustc not found; direct launches may fail to load std-<hash>.dll."
+}
+finally {
+    Pop-Location
+}
+
+$dllPath = @($runtimeDllDirs | Where-Object { Test-Path -LiteralPath $_ }) -join [IO.Path]::PathSeparator
+if ($dllPath) {
+    if ($isWindowsHost) {
+        $env:PATH = $dllPath + [IO.Path]::PathSeparator + $env:PATH
+    }
+    else {
+        $env:LD_LIBRARY_PATH = if ($env:LD_LIBRARY_PATH) {
+            $dllPath + [IO.Path]::PathSeparator + $env:LD_LIBRARY_PATH
+        }
+        else {
+            $dllPath
+        }
+    }
+}
+
 if (-not $NoBuild) {
     $cargoArgs = @('build')
     if ($Release) {
@@ -197,6 +240,21 @@ function Show-LogTail {
     }
 }
 
+function Format-ProcessExit {
+    param(
+        [System.Diagnostics.Process]$Process
+    )
+    if ($null -eq $Process -or -not $Process.HasExited) {
+        return 'still running'
+    }
+    $code = $Process.ExitCode
+    $hex = '0x{0:X8}' -f ($code -band 0xFFFFFFFFL)
+    if ($code -eq -1073741515) {
+        return "exit $code ($hex, STATUS_DLL_NOT_FOUND: a dll the binary needs is missing)"
+    }
+    return "exit $code ($hex)"
+}
+
 function Stop-Child {
     param(
         [System.Diagnostics.Process]$Process,
@@ -227,7 +285,8 @@ try {
     Write-Host "server   127.0.0.1:$ServerPort (pid $($server.Id), log $serverErr)"
     if (-not (Wait-UdpReady -Port $ServerPort -Process $server)) {
         Show-LogTail -Path $serverErr -Lines 30
-        throw "server did not bind 127.0.0.1:$ServerPort"
+        $reason = if ($server.HasExited) { " ($(Format-ProcessExit $server))" } else { '' }
+        throw "server did not bind 127.0.0.1:$ServerPort$reason"
     }
 
     if ($Capture) {
@@ -244,7 +303,8 @@ try {
             -PassThru -NoNewWindow
         Write-Host "capture  127.0.0.1:$CapturePort -> 127.0.0.1:$ServerPort (pid $($relay.Id))"
         if (-not (Wait-UdpReady -Port $CapturePort -Process $relay)) {
-            throw "protocol-inspector did not bind 127.0.0.1:$CapturePort"
+            $reason = if ($relay.HasExited) { " ($(Format-ProcessExit $relay))" } else { '' }
+            throw "protocol-inspector did not bind 127.0.0.1:$CapturePort$reason"
         }
     }
 
@@ -300,12 +360,12 @@ try {
                 break
             }
             if ($server.HasExited) {
-                Write-Warning "server exited with code $($server.ExitCode)"
+                Write-Warning "server $(Format-ProcessExit $server)"
                 Show-LogTail -Path $serverErr -Lines 30
                 break
             }
             if ($null -ne $relay -and $relay.HasExited) {
-                Write-Warning "protocol-inspector exited with code $($relay.ExitCode)"
+                Write-Warning "protocol-inspector $(Format-ProcessExit $relay)"
                 break
             }
             Start-Sleep -Milliseconds 250
@@ -350,11 +410,11 @@ try {
 
     if ($server.HasExited -and $server.ExitCode -ne 0) {
         $failed = $true
-        Write-Warning "server exited with code $($server.ExitCode)"
+        Write-Warning "server $(Format-ProcessExit $server)"
     }
     if ($null -ne $relay -and $relay.HasExited -and $relay.ExitCode -ne 0) {
         $failed = $true
-        Write-Warning "protocol-inspector exited with code $($relay.ExitCode)"
+        Write-Warning "protocol-inspector $(Format-ProcessExit $relay)"
     }
 } catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red

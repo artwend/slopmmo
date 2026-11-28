@@ -49,7 +49,7 @@ fn main() {
         .add_plugins(transport::NetPlugin { addr: args.listen })
         .add_observer(handle_new_client)
         .add_observer(handle_connected)
-        .add_systems(Startup, spawn_terrain);
+        .add_systems(Startup, spawn_level);
 
     app.run();
 }
@@ -104,9 +104,16 @@ fn spawn_action_entities(commands: &mut Commands, player: Entity) {
 
 /// Both sides collide against identical geometry, or the server would disagree
 /// with every predicted move.
-fn spawn_terrain(mut commands: Commands) {
-    for b in shared::test_room().boxes() {
-        commands.spawn(shared::terrain_bundle(b));
+fn spawn_level(mut commands: Commands) {
+    match shared::level::spawn_colliders(&mut commands, shared::level::DEFAULT_LEVEL) {
+        Ok(count) => info!(
+            "level {}: {count} static colliders",
+            shared::level::DEFAULT_LEVEL
+        ),
+        Err(e) => {
+            error!("cannot load level {}: {e}", shared::level::DEFAULT_LEVEL);
+            std::process::exit(2);
+        }
     }
 }
 

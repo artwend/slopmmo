@@ -9,14 +9,10 @@ publish = false
 shared.workspace = true
 clap = { version = "4", features = ["derive"] }
 
-# Headless only: no render, no window, no asset pipeline. The input, state and
-# transform plugins are what lightyear's replication and the physics pipeline
-# expect to find in the app.
-bevy = { version = "0.20", default-features = false, features = [
-  "std",
-  "multi_threaded",
-  "async_executor",
-  "bevy_log",
+# Headless only: no render, no window, no asset pipeline. Only `bevy_state` is
+# added on top of the workspace baseline: lightyear's replication expects
+# `StatesPlugin` in the app.
+bevy = { workspace = true, features = [
   "bevy_state",
 ] }
 

@@ -8,7 +8,13 @@ publish = false
 [dependencies]
 shared.workspace = true
 kcc.workspace = true
-bevy = "0.20"
+# The windowed client is the only crate that renders, so it is the only one that
+# pulls in the render stack. `3d` bundles the PBR/camera pipeline, the windowing
+# platform (winit, gamepad) and the scene/asset plugins the headless mode also
+# registers.
+bevy = { workspace = true, features = [
+  "3d",
+] }
 clap = { version = "4", features = ["derive"] }
 
 # No `udp` feature on a wasm target: lightyear's UDP backend is std-only.

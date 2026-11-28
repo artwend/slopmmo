@@ -20,7 +20,7 @@ the ADRs is still design only; the status table in
 
 | Crate | Role |
 | --- | --- |
-| `crates/shared` | Everything both sides share: the network protocol (components, inputs, `ProtocolPlugin`), the physics/character pipeline, the one movement system, and the pure simulation math (velocity model, reference capsule solver, static test room) |
+| `crates/shared` | Everything both sides share: the network protocol (components, inputs, `ProtocolPlugin`), the physics/character pipeline, the one movement system, the level loader, and the pure simulation math (velocity model, reference capsule solver, test room for its parity tests) |
 | `crates/kcc` | Avian's virtual character API (`VirtualCharacter`, `AutoMoveAndSlide`, `MoveAndSlidePlugin`) |
 | `crates/server` | Headless Bevy app: UDP endpoint, one replicated player per connected client |
 | `crates/client` | Bevy window with the predicted character, plus a headless scripted CI mode |
@@ -53,10 +53,13 @@ The details that matter:
   attaches local `Bindings` once the player is `Controlled`, which marks them for lightyear's
   input pipeline. Inputs are rebroadcast, so every client predicts every player. `Jump` uses a
   `Press` condition, which makes its value the press edge and therefore replayable.
-- **Both sides collide with the same terrain.** `shared::test_room()` and
-  `shared::terrain_bundle()` are used by the server (colliders only) and the client (colliders +
-  meshes). A prediction that disagrees with the server becomes a rollback, which is the signal we
-  want.
+- **Both sides collide with the same level.** `shared::level` reads the default map,
+  `assets/maps/playground.glb`, straight out of the file and bakes one static trimesh per glTF
+  primitive, so the server (colliders only) and the client (the same colliders plus the scene for
+  rendering) collide against identical geometry without the server needing an asset or render
+  pipeline. A prediction that disagrees with the server becomes a rollback, which is the signal we
+  want. `shared::test_room()` and `shared::terrain_bundle()` remain as the synthetic room the
+  scripted CI run asserts against.
 - **Fixed 60 Hz everywhere.** The Bevy fixed timestep, Lightyear's tick duration and the headless
   script all use `shared::TICK_HZ`, so one replay step is exactly one tick.
 - **No rewind.** Corrections come from Lightyear's prediction machinery; the server does not
@@ -84,6 +87,9 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
 
+Level maps (`assets/maps/*.glb`) live in Git LFS: run `git lfs install` once per machine, and
+`git lfs pull` if a clone was made without LFS, or the client and server will fail to find the map.
+
 ### Headless client (CI target)
 
 ```sh
@@ -102,7 +108,9 @@ result          ok
 ```
 
 Invariants: determinism, room bounds, jump clears 1.1 m, settles back to 0.9 m, grounded at the
-end, and the script was not truncated by `--seconds` (default 30, a safety cap).
+end, and the script was not truncated by `--seconds` (default 30, a safety cap). The script runs in
+the synthetic `shared::test_room()`, whose walls the bounds invariant is written against; the level
+itself is what the live round trip below exercises.
 
 ### Live round trip
 
@@ -113,9 +121,9 @@ cargo run -p client -- --headless --connect 127.0.0.1:5888
 
 The headless client connects through the same Lightyear path as the windowed one, waits for the
 server to replicate the controlled player, then drives the scripted inputs through the action
-mocks and settles at the same pose as the offline run. It fails if the server never replicates a
-controlled player or the script never runs. The scripted session is about 20 s, so `--seconds`
-must be larger than that.
+mocks, predicting against the same level the server simulates. It fails if the server never
+replicates a controlled player or the script never runs. The scripted session is about 20 s, so
+`--seconds` must be larger than that.
 
 The server binds `0.0.0.0:5888` by default; pass `--listen 127.0.0.1:5888` to keep it on loopback.
 
@@ -125,8 +133,9 @@ The server binds `0.0.0.0:5888` by default; pass `--listen 127.0.0.1:5888` to ke
 cargo run -p client -- --connect 127.0.0.1:5888
 ```
 
-Controls: **WASD** move, **Space** jump, **Shift** sprint. The camera follows the predicted
-player.
+The window loads the default level, `assets/maps/playground.glb` (`shared::level::DEFAULT_LEVEL`),
+so it renders even without a server; `--connect` adds the predicted player. Controls: **WASD**
+move, **Space** jump, **Shift** sprint. The camera follows the predicted player.
 
 ### Parsed packet view (dev tool)
 

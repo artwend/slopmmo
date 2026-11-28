@@ -6,13 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bevy = { version = "0.20", default-features = false, features = [
-  "default_app",
+# `default_app` gives the plugin sets shared code registers (`bevy_state` for
+# lightyear, `bevy_asset`, auto-registered reflection). `bevy_curve` is used by
+# the lightyear/prediction types this crate exposes. No render code.
+bevy = { workspace = true, features = [
   "bevy_curve",
 ] }
 bevy_math = "0.20"
 # `Aabb3d` moved out of `bevy_math` in 0.20. Default features would only add `rand`.
 bevy_shape = { version = "0.20", default-features = false, features = ["std"] }
+# Reads the level `.glb` directly, so the headless server can build the same
+# colliders the client collides against without an asset or render pipeline.
+# `utils` is the primitive reader; no `import`, so no image decoders.
+gltf = { version = "1.4", default-features = false, features = ["utils"] }
 kcc.workspace = true
 serde.workspace = true
 lightyear = { version = "0.31", default-features = false, features = [

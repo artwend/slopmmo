@@ -10,10 +10,12 @@
 //! * [`movement`] — the input→velocity model. This is the single movement
 //!   implementation: the networked client and server both feed it the
 //!   enhanced-input action values every fixed tick.
-//! * [`world`] — the static test room, shared by both sides so they collide
-//!   against identical geometry.
+//! * [`world`] — the static test room the reference solver tests are built on.
+//! * [`level`] — the `.glb` map the game loads, read by both sides so they
+//!   collide against identical geometry.
 
 pub mod kcc;
+pub mod level;
 pub mod movement;
 pub mod protocol;
 pub mod world;
@@ -160,15 +162,14 @@ pub fn terrain_bundle(b: &Aabb3d) -> impl Bundle {
     )
 }
 
-/// The static room both sides collide against.
+/// The static room the reference solver tests are built on.
 pub fn test_room() -> StaticWorld {
     StaticWorld::test_room()
 }
 
-/// Spawn a player slot for a peer.
+/// Spawn position for a peer's character, on the default level.
 pub fn initial_position(peer_id: PeerId) -> Vec3 {
-    let slot = (peer_id.to_bits() % 6) as f32;
-    Vec3::new((slot - 2.5) * 6.0, RESTING_HEIGHT, 0.0)
+    level::spawn_point(peer_id.to_bits() as u32)
 }
 
 /// Feeds the player's BEI action values into the shared velocity model.

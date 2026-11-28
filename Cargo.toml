@@ -15,6 +15,20 @@ rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+# Baseline for every crate: no default feature bundle, then everything the whole
+# workspace needs. No crate pulls in render, window or asset code through this.
+#
+# `dynamic_linking` makes Bevy link its own dylib instead of the static rlibs,
+# which turns the multi-minute Bevy rebuild after a Bevy-source change into a
+# relink. It is set here rather than per crate so every crate links the same
+# dylib.
+bevy = { version = "0.20", default-features = false, features = [
+  "std",
+  "multi_threaded",
+  "async_executor",
+  "bevy_log",
+  "dynamic_linking",
+] }
 kcc = { path = "crates/kcc" }
 shared = { path = "crates/shared" }
 serde = { version = "1", default-features = false, features = [

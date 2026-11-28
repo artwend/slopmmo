@@ -1,6 +1,7 @@
 //! Rendered client. WASD + Space + Shift; the Avian character controller is the
 //! predicted simulation, so windowed play and the server run the same code.
 
+use bevy::asset::AssetPlugin;
 use bevy::prelude::*;
 use lightyear::prelude::client::*;
 use lightyear::prelude::client::{InputDelayConfig, InputTimelineConfig};
@@ -14,15 +15,23 @@ use crate::{Args, bindings};
 
 pub fn run(args: &Args) {
     let mut app = App::new();
-    let fixed_time = app.world().resource::<Time<Fixed>>();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "mmo — client".into(),
-            resolution: (1280u32, 720u32).into(),
-            ..default()
-        }),
-        ..default()
-    }))
+    // let fixed_time = app.world().resource::<Time<Fixed>>();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "mmo — client".into(),
+                    resolution: (1280u32, 720u32).into(),
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(AssetPlugin {
+                // `assets/` sits at the workspace root, not next to this crate.
+                file_path: shared::level::asset_root().display().to_string(),
+                ..default()
+            }),
+    )
     .add_plugins(ClientPlugins {
         tick_duration: TICK_DURATION,
     })
@@ -32,7 +41,7 @@ pub fn run(args: &Args) {
         Startup,
         (
             character::setup_scene,
-            character::spawn_terrain,
+            character::spawn_level,
             configure_input_delay,
         ),
     )

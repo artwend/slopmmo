@@ -8,13 +8,9 @@ license.workspace = true
 [dependencies]
 
 # Headless on purpose: the controller owns Avian's schedule and components, so
-# no render, window or asset pipeline is pulled in.
-bevy = { version = "0.20", default-features = false, features = [
-    "std",
-    "multi_threaded",
-    "async_executor",
-    "bevy_log",
-] }
+# no render, window or asset pipeline is pulled in. The workspace baseline is
+# already all a headless crate needs.
+bevy.workspace = true
 
 # `parallel` stays off: the character solve must not depend on task ordering.
 avian3d = { version = "0.8", default-features = false, features = ["3d", "parry-f32"] }
