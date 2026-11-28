@@ -71,7 +71,7 @@ The details that matter:
 
 [ADR 006](docs/decisions/006-netcode-lightyear.md) is now **implemented**: the wire, the input
 buffering, prediction/rollback, interpolation and visual correction all come from Lightyear. The
-older hand-rolled `net` path was removed; `proto` survives only for the legacy packet types.
+older hand-rolled `net` path was removed, and the legacy `proto` packet crate is gone too.
 
 ## Build, test, run
 

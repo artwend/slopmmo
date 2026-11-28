@@ -1,71 +1,56 @@
-//! Capsule/cylinder vs static geometry, moved in substeps with depenetration.
+//! Capsule vs static geometry, moved in substeps with depenetration.
 //!
-//! This is the *reference* solver. It resolves the same Avian collider the
-//! character carries against static boxes, using plain math instead of a
-//! physics schedule, so the contact resolution can be reasoned about and
-//! unit-tested on its own. The client runs Avian's `MoveAndSlide` (in
-//! `crates/kcc`) over the same terrain.
+//! This is the engine-free *reference* solver. The client uses
+//! `crates/kcc` instead, which runs Avian's `MoveAndSlide` over the same
+//! terrain; keeping this one pure is what lets `sim`'s tests and the server's
+//! bot benchmark run without a physics engine.
 //!
 //! No step-up yet — see the `TODO` on [`move_and_slide`]. Without a step height
 //! the controller cannot climb a 0.3 m ledge, which is fine while the test room
 //! is flat.
 
-use ::kcc::avian3d::prelude::Collider;
 use bevy_math::Vec3;
 use bevy_shape::Aabb3d;
 
 use crate::world::{Aabb3dExt, StaticWorld};
+use crate::{PLAYER_HEIGHT, PLAYER_RADIUS};
 
-/// The vertical, round body the solver works with, read out of the collider.
-///
-/// The solver models the collider as the segment `center ± half_height` with
-/// `radius` around it. That is exact for [`Collider::capsule`] and the
-/// circumscribing capsule for [`Collider::cylinder`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct RoundDims {
-    radius: f32,
-    /// Half length of the axis.
-    half_height: f32,
+pub struct Capsule {
+    pub radius: f32,
+    /// Half length of the cylindrical section, excluding both caps.
+    pub half_height: f32,
 }
 
-impl RoundDims {
-    /// Reads the `y`-aligned body out of an Avian collider.
-    ///
-    /// Any other shape returns `None`: the solver only models round,
-    /// `y`-aligned bodies against boxes.
-    fn from_collider(collider: &Collider) -> Option<Self> {
-        let shape = collider.shape();
-        if let Some(capsule) = shape.as_capsule() {
-            return Some(Self {
-                radius: capsule.radius,
-                half_height: capsule.half_height(),
-            });
+impl Capsule {
+    pub fn from_height(radius: f32, height: f32) -> Self {
+        Self {
+            radius,
+            half_height: (height * 0.5 - radius).max(0.0),
         }
-        let cylinder = shape.as_cylinder()?;
-        Some(Self {
-            radius: cylinder.radius,
-            half_height: cylinder.half_height,
-        })
     }
 
-    /// The two ends of the axis; `center` is the body midpoint.
-    fn segment(&self, center: Vec3) -> (Vec3, Vec3) {
+    /// The two ends of the capsule axis; `center` is the capsule midpoint.
+    pub fn segment(&self, center: Vec3) -> (Vec3, Vec3) {
         (
             Vec3::new(center.x, center.y - self.half_height, center.z),
             Vec3::new(center.x, center.y + self.half_height, center.z),
         )
     }
 
-    /// Lowest point of the body.
-    fn foot(&self, center: Vec3) -> f32 {
+    /// Lowest point of the capsule.
+    pub fn foot(&self, center: Vec3) -> f32 {
         center.y - self.half_height - self.radius
+    }
+
+    pub fn height(&self) -> f32 {
+        (self.half_height + self.radius) * 2.0
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct KccParams {
-    /// Round body the solver moves: [`Collider::capsule`] or [`Collider::cylinder`].
-    pub collider: Collider,
+    pub capsule: Capsule,
     pub skin: f32,
     /// How far below the feet a support surface may be and still count.
     pub ground_probe: f32,
@@ -81,7 +66,7 @@ pub struct KccParams {
 impl Default for KccParams {
     fn default() -> Self {
         Self {
-            collider: crate::player_collider(),
+            capsule: Capsule::from_height(PLAYER_RADIUS, PLAYER_HEIGHT),
             skin: 0.001,
             ground_probe: 0.15,
             max_slope_cos: 0.6,
@@ -102,7 +87,7 @@ pub struct MoveOutput {
 
 /// Moves `start` by `velocity * dt`, sliding along static geometry.
 ///
-/// `start` and the returned position are the body *centre*, not the feet.
+/// `start` and the returned position are the capsule *centre*, not the feet.
 ///
 /// TODO: step-up. A ledge within `step_height` should be climbed rather than
 /// blocked; that needs a retry from `start + up * step_height` when the
@@ -114,21 +99,6 @@ pub fn move_and_slide(
     velocity: Vec3,
     dt: f32,
 ) -> MoveOutput {
-    let body = RoundDims::from_collider(&params.collider);
-    debug_assert!(
-        body.is_some(),
-        "KccParams::collider must be a capsule or a cylinder"
-    );
-    let Some(body) = body else {
-        // Nothing sensible to solve against, so leave the pose alone.
-        return MoveOutput {
-            position: start,
-            velocity,
-            grounded: false,
-            contacts: 0,
-        };
-    };
-
     let mut pos = start;
     let mut vel = velocity;
     let substeps = params.substeps.max(1);
@@ -141,7 +111,7 @@ pub fn move_and_slide(
         for _ in 0..params.iterations {
             let mut deepest: Option<(Vec3, f32)> = None;
             for b in world.boxes() {
-                if let Some((n, depth)) = contact(&params.collider, b, pos)
+                if let Some((n, depth)) = contact(&params.capsule, b, pos)
                     && deepest.is_none_or(|(_, d)| depth > d)
                 {
                     deepest = Some((n, depth));
@@ -176,7 +146,7 @@ pub fn move_and_slide(
         }
     }
 
-    let support = ground_probe(world, &params.collider, pos, params.ground_probe);
+    let support = ground_probe(world, &params.capsule, pos, params.ground_probe);
     let grounded = support.is_some();
     if grounded {
         if vel.y < 0.0 {
@@ -186,7 +156,7 @@ pub fn move_and_slide(
         if velocity.y <= 0.0
             && let Some(top) = support
         {
-            pos.y = top + body.half_height + body.radius;
+            pos.y = top + params.capsule.half_height + params.capsule.radius;
         }
     }
 
@@ -198,17 +168,14 @@ pub fn move_and_slide(
     }
 }
 
-/// Overlap between the body and one box, as `(outward normal, depth)`.
+/// Overlap between the capsule and one box, as `(outward normal, depth)`.
 ///
 /// One contact per box: at a box corner the normal is the corner-to-axis
-/// direction, so a body driven exactly along that diagonal is stopped rather
+/// direction, so a capsule driven exactly along that diagonal is stopped rather
 /// than deflected. That is correct for a sharp corner; content that wants
 /// rounded corners should bevel the collision geometry.
-///
-/// Returns `None` if the collider is not round or they do not overlap.
-pub fn contact(collider: &Collider, aabb: &Aabb3d, pos: Vec3) -> Option<(Vec3, f32)> {
-    let body = RoundDims::from_collider(collider)?;
-    let (a, b) = body.segment(pos);
+pub fn contact(capsule: &Capsule, aabb: &Aabb3d, pos: Vec3) -> Option<(Vec3, f32)> {
+    let (a, b) = capsule.segment(pos);
     let on_box = aabb.closest_to_vertical_segment(pos.x, pos.z, a.y, b.y);
     let sy = on_box.y.clamp(a.y, b.y);
     let on_seg = Vec3::new(pos.x, sy, pos.z);
@@ -216,19 +183,19 @@ pub fn contact(collider: &Collider, aabb: &Aabb3d, pos: Vec3) -> Option<(Vec3, f
     let delta = on_box - on_seg;
     let dist = delta.length();
     if dist > 1e-5 {
-        return (dist < body.radius).then(|| (-delta / dist, body.radius - dist));
+        return (dist < capsule.radius).then(|| (-delta / dist, capsule.radius - dist));
     }
 
     // The axis is inside the box. Eject through the cheapest face.
     let cap_min = Vec3::new(
-        pos.x - body.radius,
-        pos.y - body.half_height - body.radius,
-        pos.z - body.radius,
+        pos.x - capsule.radius,
+        pos.y - capsule.half_height - capsule.radius,
+        pos.z - capsule.radius,
     );
     let cap_max = Vec3::new(
-        pos.x + body.radius,
-        pos.y + body.half_height + body.radius,
-        pos.z + body.radius,
+        pos.x + capsule.radius,
+        pos.y + capsule.half_height + capsule.radius,
+        pos.z + capsule.radius,
     );
 
     let faces = [
@@ -246,18 +213,10 @@ pub fn contact(collider: &Collider, aabb: &Aabb3d, pos: Vec3) -> Option<(Vec3, f
         .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
-/// Highest surface that could support the body within `probe` metres.
-///
-/// Returns `None` if the collider is not round or nothing is in reach.
-pub fn ground_probe(
-    world: &StaticWorld,
-    collider: &Collider,
-    pos: Vec3,
-    probe: f32,
-) -> Option<f32> {
-    let body = RoundDims::from_collider(collider)?;
-    let foot = body.foot(pos);
-    let footprint = body.radius * 0.9;
+/// Highest surface that could support the capsule within `probe` metres.
+pub fn ground_probe(world: &StaticWorld, capsule: &Capsule, pos: Vec3, probe: f32) -> Option<f32> {
+    let foot = capsule.foot(pos);
+    let footprint = capsule.radius * 0.9;
     let mut best: Option<f32> = None;
 
     for b in world.boxes() {
@@ -271,51 +230,4 @@ pub fn ground_probe(
     }
 
     best
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{CAPSULE_LENGTH, PLAYER_RADIUS, RESTING_HEIGHT};
-
-    #[test]
-    fn reads_the_body_out_of_the_collider() {
-        let params = KccParams::default();
-
-        let body = RoundDims::from_collider(&params.collider).expect("default is a capsule");
-        assert!((body.radius - PLAYER_RADIUS).abs() < 1e-6);
-        assert!((body.half_height - CAPSULE_LENGTH * 0.5).abs() < 1e-6);
-
-        let cylinder = RoundDims::from_collider(&Collider::cylinder(0.5, 2.0))
-            .expect("cylinders are modelled as their circumscribing capsule");
-        assert!((cylinder.radius - 0.5).abs() < 1e-6);
-        assert!((cylinder.half_height - 1.0).abs() < 1e-6);
-
-        assert!(RoundDims::from_collider(&Collider::cuboid(1.0, 1.0, 1.0)).is_none());
-    }
-
-    #[test]
-    fn falls_onto_the_floor_and_rests_on_it() {
-        let params = KccParams::default();
-        let world = StaticWorld::test_room();
-        let dt = 1.0 / 60.0;
-        let mut pos = Vec3::new(0.0, 3.0, 0.0);
-        let mut vel = Vec3::ZERO;
-        let mut grounded = false;
-
-        for _ in 0..180 {
-            let out = move_and_slide(&world, &params, pos, vel, dt);
-            pos = out.position;
-            // Gravity, as the shared movement model applies it each tick.
-            vel = Vec3::new(0.0, out.velocity.y - 24.0 * dt, 0.0);
-            grounded = out.grounded;
-        }
-
-        assert!(grounded, "character should be resting on the floor");
-        assert!(
-            (pos.y - RESTING_HEIGHT).abs() < 0.02,
-            "expected resting height {RESTING_HEIGHT}, got {}",
-            pos.y
-        );
-    }
 }
