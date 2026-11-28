@@ -1,7 +1,7 @@
 # ADR 013 — Fixed 60 Hz tick pipeline, no rewind, bounded extrapolation, solve every tick
 
-- **Status:** Implemented. Every collision mode is solved on every server tick; there is no
-  sub-sampled subsystem. The server and the client both run at 60 Hz.
+- **Status:** Partial — the fixed 60 Hz tick is implemented by Bevy and Lightyear; the eight-phase
+  server pipeline (spatial index, broadphase, capsule solve, snapshot build) is not built.
 - **Decided by:** project owner, second dialogue, final turns (*«Далее»*, *«Продолжи»*), which
   accepted the eight-phase server tick. A 30 Hz server tick was evaluated later and set back to
   60 Hz; the rule that survived both is "solve every tick".
@@ -41,7 +41,7 @@ One tick, eight phases, in this order:
 2. **Movement update** — integrate intent for players without a fresh report; apply reports as the
    shadow base.
 3. **Spatial index rebuild** — counting-sort rebuild of a uniform grid over player/boss colliders
-   (CSR layout, buffers reused; `crates/sim/src/spatial.rs`).
+   (CSR layout, buffers reused).
 4. **Broadphase** — nearest `K`, radius-bounded, pair de-duplication.
 5. **Collision policy** — pick modes per pair (ADR 010), skip `None`.
 6. **Solver** — inelastic capsule/capsule, budgeted vector-sum correction. Runs on **every** tick,
@@ -51,61 +51,48 @@ One tick, eight phases, in this order:
 
 Rules:
 
-- **Fixed timestep**, no variable dt from wall clock. `SERVER_TICK_HZ = 60`,
-  `SERVER_TICK_DT = 1/60`; the client predicts on the matching `CLIENT_TICK_HZ`.
-- **Client prediction is separate.** The KCC runs at `CLIENT_TICK_HZ = 60`; its tick counter is the
-  domain of input frames and reports. The two rates happen to match today, but the server maps the
-  client's domain onto its own by scaling elapsed client ticks, never by assuming they are equal
-  (`SimConfig::map_client_tick`).
+- **Fixed timestep**, no variable dt from wall clock: 60 Hz on both sides, so the client predicts on
+  the same step the server simulates.
+- **Client prediction is separate.** The KCC's tick counter is the domain of input frames and
+  reports. The rates match today, but a server that ran at a different rate would map the client
+  domain onto its own by scaling elapsed ticks, never by assuming equality.
 - **One tick, one solve.** No subsystem is sub-sampled below the tick. If the solve ever costs too
   much, the lever is the grid and the data layout (§7 of the review), not a lower solve rate.
 - **Event time is tick time**, never arrival time. A packet's `tick` decides when it applies; the
   socket's arrival only decides *whether* it still can.
 - **No rewind.** Collisions are always solved at the current tick. Lag compensation for hitscan is
   out of scope until a combat design asks for it.
-- **Bounded extrapolation.** A player with no fresh report is extrapolated for at most
-  `REPORT_WINDOW = 30` server ticks (0.5 s), then frozen. The window is defined in milliseconds and
-  derived from the tick rate, so changing the rate does not silently change it.
+- **Bounded extrapolation.** A player with no fresh report is extrapolated for at most 30 server
+  ticks (0.5 s), then frozen. The window is defined in milliseconds and derived from the tick rate,
+  so changing the rate does not silently change it.
 
 ## Consequences
 
-- **Nothing runs above its driving tick.** Movement state, grid rebuild, broadphase and both
-  collision modes are all 60 Hz. The client's local KCC and peer separation run at the same rate;
-  server corrections arrive once per server tick.
-- **One rate to reason about.** Running both at 60 Hz costs twice the CPU per simulated second of a
-  30 Hz pipeline, but leaves no subsystem behind the tick. Measured cost is ~0.042 ms/tick at 32
-  bots and ~1.13 ms/tick at 256 bots (release, 300-tick runs), i.e. ~394× and ~15× realtime headroom;
-  there is no measured reason to trade the rate away.
-- **Input cadence is half the tick.** `INPUT_SEND_HZ = 30` means one report every second server
-  tick; the shadow is extrapolated between reports only as far as `REPORT_WINDOW`.
-- Snapshot *production* is still tied to the tick — a snapshot is built for every player every tick —
-  but transmission is change-gated with an RTT-adaptive heartbeat (ADR 015). Peer colliders ride on a
-  separate 30 Hz cadence; the client-side interpolation that makes that invisible is part of the
-  still-unbuilt peer consumer.
-- Because there is no rewind, a high-ping player's shots land against current positions. That is a
-  balance decision the combat design must own, not a movement bug.
+The measured numbers and mechanisms below belonged to the removed eight-phase server; they are kept
+as the design record.
+
+- **Nothing runs above its driving tick.** Movement, grid rebuild, broadphase and both collision
+  modes were all 60 Hz, and the client's KCC ran at the same rate.
+- **One rate to reason about.** Running both sides at 60 Hz doubles CPU per simulated second versus
+  a 30 Hz pipeline, but leaves no subsystem behind the tick. The removed server measured ~0.042
+  ms/tick at 32 bots and ~1.13 ms/tick at 256 bots, i.e. ~394× and ~15× realtime headroom.
+- **Input cadence was half the tick.** A report every second server tick was why the shadow had to
+  be extrapolated between reports.
+- **No rewind** is still true in the current tree: Lightyear predicts and corrects, but nothing
+  keeps historical collision state, so lag compensation remains out of scope.
 
 ## What this repository does
 
-- `crates/server/src/main.rs` — `Game` owns the `Simulation` and the `World`; the fixed step is
-  `SERVER_TICK_DT` under `ScheduleRunnerPlugin::run_loop(1 ms)`, and the phases collapse into
-  `pump_net` → `authority::ingest` → `spatial` rebuild → `collision::solve` → snapshot build →
-  `net::send`.
-- `crates/sim/src/authority.rs` — one step is exactly one `Simulation::step`, solver included. The
-  per-player client→server tick mapping (`tick_origin`) scales elapsed client ticks by
-  `SERVER_TICK_HZ / CLIENT_TICK_HZ`, so a client starting its counter at 0 can join and the two
-  clocks stay aligned; a mapped tick outside the window re-anchors instead of rejecting.
-- `crates/sim/src/authority.rs` — the shadow pose is derived, not integrated: every tick sets
-  `pos = anchor_pos + vel * min(age, REPORT_WINDOW) * dt`, where `anchor_pos` is the pose of the last
-  accepted report and `age` is server ticks since it. `INPUT_SEND_HZ` is half the tick, so without
-  this every second 60 Hz solve would read a 30 Hz pose. A `needs_resync` session is never
-  extrapolated: it waits for the client to report from the placement the server gave it.
-- The tick is **single-threaded by decision**, not by omission: determinism (above) comes first, and
-  one core is not the constraint yet. It also **does not allocate** in the steady state, which
-  `crates/sim/tests/allocations.rs` enforces with a counting allocator.
-- Measured: 32 bots at 0.042 ms per tick (~394× headroom), 256 bots at 1.13 ms per tick (~15×).
-  The 10k projection is ~40–47 ms/tick without zone sharding; see `architecture-review.md` §3.4.
-- Not implemented: adaptive peer-update rate, lag compensation.
+- `crates/shared/src/lib.rs` — `TICK_HZ = 60` and `TICK_DURATION` are the single source of the rate.
+  Both binaries insert `Time::<Fixed>::from_hz(TICK_HZ)`; `TICK_DURATION` is passed to
+  `ClientPlugins`/`ServerPlugins`, so Lightyear's timeline and Bevy's physics step agree.
+- `SharedPlugin` installs the physics pipeline and the movement system; the character is moved by
+  `MoveAndSlidePlugin` in `PhysicsSchedule`. The server runs Lightyear's `ServerPlugins` on
+  `MinimalPlugins` with a 1 ms schedule runner and has no game loop of its own.
+- Client prediction replays exactly one tick on rollback because both sides share `TICK_HZ`.
+- **No rewind**: nothing keeps historical collision state, so lag compensation remains unbuilt.
+- Not implemented: the spatial-index, broadphase and capsule-solve phases; bounded extrapolation
+  between reports (there are no reports); the zero-allocation guard (`crates/sim` was removed).
 
 ## Open questions
 

@@ -1,6 +1,7 @@
 # ADR 014 — Character feel: camera-relative rotation, moderate air control, soft collision
 
-- **Status:** Implemented.
+- **Status:** Partial — camera-relative movement and air control are implemented; turning the
+  character toward its movement direction and soft character collision are not.
 - **Decided by:** project owner, second dialogue, turn 3.
 - **Verbatim:** *«выбираю: Rotation: camera Air control: moderate Character collision: soft»*
 
@@ -44,16 +45,23 @@ wall-clock time or on frame count breaks under replay.
 
 ## What this repository does
 
-`crates/sim/src/movement.rs` — camera-relative acceleration, `MAX_SPEED = 6.0`, `MAX_ACCEL = 24.0`,
-reduced airborne authority, linear ground friction. `crates/proto` carries `camera_yaw` and
-`body_yaw` as quantised values (16-bit yaw ≈ 0.0055° resolution). `crates/sim/src/kcc.rs`
-is fully deterministic and takes `CLIENT_TICK_DT`, never wall-clock time.
+`crates/shared/src/movement.rs` — camera-relative wish direction (the BEI `Movement` action is in
+camera space, with forward = −Z), `MAX_SPEED = 6.0`, `MAX_ACCEL = 24.0`, sprint at 1.5×, ground
+friction 14, air acceleration 6 (a quarter of ground), gravity −24 m/s² and jump 7 m/s. The same
+`step_velocity_raw` runs on both sides in `FixedUpdate`.
 
-The camera's turn rate travels as `angular_velocity` in the movement report, so the server can
-extrapolate `body_yaw` between reports instead of holding rotation until the next one arrives.
+Not implemented: the character does not turn toward its movement direction yet — `Rotation` is
+replicated and predicted but never written from input — and soft character collision does not exist
+(ADR 010). Camera yaw is likewise not on the wire: the follow camera reads the controlled player's
+`Position` and looks at it.
 
-Verified in the headless harness: a scripted sprint + jump produces `peak_y 1.8633` and identical
-output across runs (`deterministic: true`).
+`shared::kcc` is the engine-free reference solver and is deterministic; it is used by the `kcc`
+parity test. The networked path uses Avian's `MoveAndSlidePlugin`, which steps inside
+`PhysicsSchedule` on the fixed tick, never on wall-clock delta.
+
+Verified in the headless harness: the scripted run (walk, sprint, wall slide, diagonal slide, jump,
+settle) reports `peak_y 1.8733`, `final_x`/`final_z` ±9.09, `grounded: true` and
+`deterministic: true`.
 
 ## Open questions
 

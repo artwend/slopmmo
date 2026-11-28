@@ -41,7 +41,8 @@ count is elastic and the fleet is the unit of scaling.
   other part of the design can absorb.
 - Handoff needs a transfer protocol: snapshot of the entity (state, pending inputs, collision
   participation), an ownership **epoch**, and a rule for in-flight corrections during the
-  transfer. The epoch in `proto::CollisionCorrection` exists for exactly this reason.
+  transfer. State that crossed the boundary needs an ownership **epoch**, so a stale update from
+  the old node can be recognised and dropped; the prototype has no handoff and therefore no epoch.
 - Cross-cell collisions (two players straddling a boundary, melee across a border) need either
   duplicated collision state or a one-tick borrow from the neighbour. Not solved.
 - Zone borders for static shards need explicit gates; PvP cell borders must be invisible.

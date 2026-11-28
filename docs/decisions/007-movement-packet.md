@@ -1,6 +1,8 @@
 # ADR 007 — One merged `PlayerMovementPacket`, unreliable, 30 Hz send / 60 Hz simulation
 
-- **Status:** Implemented (with a redundancy deviation, see below).
+- **Status:** Superseded by Lightyear's input and replication pipeline (ADR 006). The merged
+  packet no longer exists; what survived is the decision that input is unreliable, tick-addressed
+  and redundant.
 - **Decided by:** project owner, third dialogue, turns 2 and 3.
 - **Verbatim:** *«Я хочу объединить PlayerInput и MovementReport.»* and *«Отличное
   предложение»* to the consolidation of: Unreliable Sequenced, 30 sends/s, two consecutive input
@@ -60,6 +62,9 @@ giving anyone a time machine.
 
 ## Consequences
 
+The numbers in this section describe the packet that was removed; they are kept as the design
+record.
+
 - At 4 input frames per packet the client sends ~93 bytes at 30 Hz ≈ 2.8 KB/s while active: 57 bytes
   of header + report, plus 9 bytes per input frame. The report, not the inputs, dominates. While
   idle it drops to a 4 Hz keepalive of ~62 bytes ≈ 0.3 KB/s (ADR 015).
@@ -70,28 +75,22 @@ giving anyone a time machine.
 
 ## What this repository does
 
-Implemented in `crates/proto/src/packet.rs`:
+The merged packet is gone. Inputs travel as Lightyear input messages for the `Player` context: the
+client's `Movement`/`Jump`/`Sprint` action values are buffered by Lightyear's input timeline
+(`InputTimelineConfig::balanced()` adds a small input delay) and rebroadcast to every client, so
+every client predicts every player. The movement *result* is not on the input channel at all — the
+server's `Position`, `Rotation` and `LinearVelocity` replicate as components, predicted by the owner
+and interpolated by everyone else.
 
-- `PlayerMovementPacket` with `seq`, `player`, `report`, `inputs`, encoded in ~93 bytes at full
-  redundancy. The report's velocity is split into `linear_velocity` and `angular_velocity` so the
-  shadow can dead-reckon rotation without inventing a yaw rate; `body_yaw` remains the pose.
-- `INPUT_SEND_HZ = 30`, `CLIENT_TICK_HZ = 60`; the client sends a report every 2nd prediction tick,
-  which is every second 60 Hz server tick. Reports that would repeat the previous one are suppressed
-  and replaced by a 4 Hz keepalive (ADR 015); the packet layout is unchanged.
-- `INPUT_REDUNDANCY = 3` → **4** frames per packet (newest + 3), not 2 as in the dialogue. Chosen
-  so that three consecutive losses still leave one fresh frame; still well inside the 60-byte
-  budget. Recorded here because it changes the loss tolerance from 1 to 3 packets.
-- `CollisionCorrection` carries `seq`/`tick`/`epoch` and is applied idempotently
-  (`crates/client/src/headless.rs` `CorrectionLog` tracks applied ids).
-- `ServerSnapshot` carries `resync`: set while a clamped resume has not yet been acknowledged by an
-  accepted report, so the client adopts the server's placement. This is the only case in which a
-  client applies a position from the server; corrections remain velocity deltas and normals.
-- No `position_delta` in corrections — the review (`../architecture-review.md`) rejected it: a
-  server that cannot see terrain cannot promise an offset lands outside a wall.
+What carried over from this decision: input is tick-addressed, unreliable, and redundant (the
+library repeats recent input frames in each message), and both sides simulate at
+`shared::TICK_HZ`. What did not: the single merged packet, the 30 Hz report cadence, the hand-rolled
+redundancy window and the server-side correction message.
 
 ## Open questions
 
-- Loss tolerance is currently "3 packets", i.e. 100 ms. Is that right for a 150 ms-RTT player, or
-  should redundancy adapt to measured loss?
-- Do we need explicit input acknowledgements (server tells the client the last tick it consumed)?
-  Today the client only learns from `server_tick` in the snapshot.
+- ~~Loss tolerance / redundancy~~ Answered by the migration: Lightyear's input pipeline owns
+  redundancy, and `InputTimelineConfig` owns the delay/rollback window. The remaining tuning
+  question is how much input delay to trade for jitter tolerance on a real uplink.
+- ~~Explicit input acknowledgements~~ No longer application-visible; Lightyear tracks confirmed
+  inputs as part of prediction and rollback.

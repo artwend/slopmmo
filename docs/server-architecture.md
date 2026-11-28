@@ -83,7 +83,8 @@ A dynamic cell moving is an **actor migration with seamless handoff**:
 2. Authority state is transferred: shadow position and linear/angular velocity, `body_yaw`, applied
    correction id, collision modes, the player's tick offset, and the **epoch**.
 3. The destination node publishes itself as the owner; snapshots for that player now come from it.
-4. The client sees a new epoch and discards corrections from the old one (ADR 007).
+4. The client sees a new epoch and discards state from the old one (the epoch concept is ADR 002's;
+   the correction channel that used it was removed with the custom protocol).
 5. Only then can the source node drop the actor.
 
 The epoch is the whole trick: without it, a correction in flight from the old node arrives after the
@@ -123,17 +124,23 @@ Invariants:
   it applies.
 - No rewind. There is no historical collision state; lag compensation is unbuilt and belongs to the
   combat design (ADR 013).
-- Extrapolation is bounded by `REPORT_WINDOW` (30 server ticks, 0.5 s), then the actor is frozen.
-- A departed player's shadow is parked for `RESUME_WINDOW`; a resume is placed from that shadow and
+- Extrapolation is bounded by a report window of 30 server ticks (0.5 s), then the actor is frozen.
+- A departed player's shadow is parked for a fixed resume window; a resume is placed from that shadow and
   its claim is clamped to the travel possible since the last accepted report. Reconnecting is never
   a way to move.
 - Travel is measured against the **server's** ticks since the last accepted report, never against
   the client-declared report tick. The report tick decides staleness and ordering only. That
-  elapsed time is capped at `REPORT_WINDOW`: a client that goes quiet cannot bank the silence as
+  elapsed time is capped at that window: a client that goes quiet cannot bank the silence as
   travel, and a report past the cap that overshoots is clamped to the cap and answered with
   `resync` instead of being rejected.
 - Everything is deterministic: fixed `dt`, tie-broken iteration order, no wall-clock input.
 - The steady state **does not allocate** and does not block. See §3.5.
+
+**Current implementation.** The pipeline above is the target, not the code. The server runs
+Lightyear's `ServerPlugins` on Bevy's fixed clock: Lightyear delivers inputs,
+`shared::apply_player_input` writes `LinearVelocity`, `MoveAndSlidePlugin` moves the capsule, and
+the resulting components replicate. There is no spatial index, broadphase, capsule solve, snapshot
+build, report window or allocation guard.
 
 ### 3.2 Collision profiles (ADR 009, ADR 010)
 
@@ -146,73 +153,45 @@ Invariants:
 | Players in PvP | yes | yes | soft, hard per ability |
 | Players outside PvP | yes | no | soft |
 
-The server's collider set is `players ∪ bosses`, replicated to clients with a mode. There is no
-terrain on the server — this is the decision that makes the tick cheap (ADR 012) and the reason
-corrections carry velocity, not position. The client solves the replicated set from a tick-keyed
-history before its terrain step (§4.1); the wire list is on by default (`SimConfig::replicate_peers`).
+**Current implementation** deviates from the table: the server spawns the same
+`shared::test_room()` colliders as the client, and both sides run the same `VirtualCharacter`
+controller. Only terrain collision exists; there is no player-vs-player or boss collision, no mode
+and no replicated collider list. The table is the target (ADR 009, ADR 010).
 
 ### 3.3 Pair budget (ADR 011)
 
-`MAX_NEIGHBOURS = 8`, `NEIGHBOUR_RADIUS = 2.0 m`, `MAX_PAIRS_PER_PLAYER = 8` after de-duplication,
-deterministic order by distance then id. `MAX_SNAPSHOT_PEERS = 16` is the AOI replication cap, so a
-client can learn about colliders the server is not currently solving. It is **built and sent by
-default**: the client has the local peer solve, so `SimConfig::replicate_peers` is `true` and the
-shipment carries both the scan and the bytes. Turning it off (`false`) skips both, for a client
-build without the solve.
+**Not implemented.** `MAX_NEIGHBOURS = 8`, `NEIGHBOUR_RADIUS = 2.0 m` and
+`MAX_PAIRS_PER_PLAYER = 8` are the target (ADR 011). The prototype has no spatial index, no pair
+list and no AOI: every player replicates to every client.
 
-### 3.4 Replication (ADR 001, ADR 007)
+### 3.4 Replication (ADR 001, ADR 006)
 
-Hybrid model: **state replication** for what changes every tick, **event messages** for what happens
-once.
+**Current implementation** is plain Lightyear replication; the hybrid target is not built.
 
-| Channel | Reliability | Rate | Content |
-| --- | --- | --- | --- |
-| client → server movement | unreliable, sequenced | 30 Hz on change; 10 Hz anchor while moving; 4 Hz when stationary | `PlayerMovementPacket` |
-| server → client snapshot | unreliable, sequenced | on change; adaptive heartbeat (2×RTT, 100 ms–1 s); peers ≤ 30 Hz | tick, ack, shadow pos, correction, peers, `resync` |
-| corrections | inside the snapshot | on change | `CollisionCorrection` with `seq/tick/epoch` |
-| discrete events | reliable, ordered | on event | loot, ability cast confirmation, chat-adjacent UI |
+| Direction | Mechanism | Cadence |
+| --- | --- | --- |
+| client → server | Lightyear input messages carrying the `Movement`/`Jump`/`Sprint` action values for the `Player` context; rebroadcast to every client | per client tick, buffered by `InputTimelineConfig::balanced()` |
+| server → clients | Lightyear component replication: `Position`, `Rotation`, `LinearVelocity`, `Grounded`, `PlayerId` | `shared::SEND_INTERVAL` (100 ms), changed components only |
+| own player | predicted and rolled back by Lightyear | per tick |
+| other players | interpolated by Lightyear | per tick |
+| discrete events | none yet (ADR 001 event plane) | — |
 
-Bandwidth, at today's encoding: client ≈ 81 B × 30/s ≈ 2.4 KB/s while the state changes, ≈ 0.8 KB/s
-at the 10 Hz walking anchor, and ≈ 200 B/s when stationary (4 Hz keepalive, no redundancy frames).
-Server: ≈ 28 B + 23 B per peer when `SimConfig::replicate_peers` is on (the shipped default) —
-1.5 KB/s with 4 peers, ~7 KB/s at the 16-peer AOI cap — or ≈ 28 B per changed snapshot with the
-peer list off. Both are back-of-envelope; the peer list is the reason AOI exists, and it is on
-because the client's local solve reads it.
+There is no AOI. `Replicate::to_clients(NetworkTarget::All)` sends every player to every client,
+which is acceptable only because the prototype is one small room. There is no hand-written
+snapshot, ack, correction message or peer list; reliability and change detection are the library's.
 
-Neither side streams on a fixed cadence any more (ADR 015). The client stays silent while its input,
-pose, grounding and correction acknowledgement are unchanged — including while walking at a steady
-velocity, which the server already dead-reckons from the last report. The server compares each tick's
-snapshot with the last one it sent for that player — at millimetre precision — and only transmits a
-change in a correction, `resync` or the peer set. `server_tick`, `acked_seq` and `shadow_position`
-do not force a datagram because the client predicts its own pose and only adopts the shadow during
-`resync`. A lost final update is repaired by a heartbeat that scales with the link's measured RTT, so
-a quiet tick costs nothing and a slow path is not sent redundant datagrams. Peer colliders have a
-third, independent cadence: they refresh at `PEER_UPDATE_HZ` (30 Hz) and a correction between
-refreshes carries the last list, so corrections stay tick-rate without dragging peers with them.
+**Target.** Hybrid model: **state replication** for what changes every tick, **event messages** for
+what happens once, with interest management deciding what each client may see. When the event plane
+is added it belongs on reliable, ordered Lightyear channels. Bandwidth budgets in this document are
+open design work, not measured behaviour of the current tree.
 
 ### 3.5 Data layout and allocation discipline
 
-The eight phases above are one linear pass over contiguous memory, and that is a requirement rather
-than an accident (see `architecture-review.md` §7 for the audit that got here).
-
-| Structure | Layout | Why |
-| --- | --- | --- |
-| Players | dense `Vec<ServerPlayer>` + `HashMap<u64, u32>` slot map | the tick walks everyone in order; ids are only needed on join, leave and ingest. `swap_remove` keeps it dense |
-| Spatial grid | CSR: flat `items` ordered by cell + `starts` prefix table + `cursor` scatter buffer | counting sort instead of hashing; no per-cell `Vec`; buffers reused every rebuild |
-| Broadphase / solver | `PairScratch` owned by the simulation | four `Vec`s and an `Impulse` array that never reallocate after the first tick |
-| Snapshots | `Vec<(u64, ServerSnapshot)>` owned by the simulation, peers inline (`PeerList`) | `ServerSnapshot` is `Copy`, so the transport sends a copy instead of cloning a heap vector |
-| AOI peer selection | grid candidates → inline `[(f32, usize); 16]` window per player | the grid culls the scan to nearby cells instead of every body; no per-player `Vec`, no per-player sort |
-
-`crates/sim/tests/allocations.rs` guards this: a counting global allocator asserts that 64
-steady-state ticks perform zero allocations. A `vec![]`, a `collect()` or a heap `clone()` added to
-the tick fails that test.
-
-Concurrency, stated precisely: the UDP endpoint is non-blocking and lightyear pools its receive
-buffers, the I/O layer runs as an async task on Bevy's task pool, and Bevy's executor is
-multi-threaded — but the tick itself is single-threaded on purpose. Determinism is an invariant
-(ADR 013), and the tick costs ~1.1 ms of a 16.67 ms budget at 256 players. `ingest`, `drive` and
-`dispatch` all take `ResMut<GameRes>`, so the executor serialises them by construction; that conflict
-is the design, not a missed optimisation.
+**Not implemented.** The custom server's dense player storage, CSR spatial grid, reusable solver
+scratch, inline snapshot peer list and allocation guard were all removed with `crates/sim`. The
+current tick is Bevy's physics schedule plus Lightyear's replication, and no allocation or
+cache-layout work has been done on it. The audit and its measurements are kept in
+[`architecture-review.md`](architecture-review.md) §7 as a record of the removed design.
 
 ---
 
@@ -277,32 +256,26 @@ create → auth → character select → place in zone instance → play → han
 
 | Quantity | Value | Source |
 | --- | --- | --- |
-| Server tick | 60 Hz (16.67 ms) | `proto::SERVER_TICK_HZ` |
-| Client prediction | 60 Hz (16.7 ms) | `proto::CLIENT_TICK_HZ` |
-| Client send rate | 30 Hz maximum, only on change | `proto::INPUT_SEND_HZ` |
-| Client anchor rate | 10 Hz while moving, 4 Hz stationary, no redundancy frames | `client::ANCHOR_SEND_HZ`, `proto::IDLE_SEND_HZ` |
-| Snapshot heartbeat | adaptive: 2×RTT, clamped 100 ms–1 s (250 ms until a sample) | `server::transport::heartbeat_interval` |
-| Peer refresh rate | 30 Hz, independent of the tick | `proto::PEER_UPDATE_HZ` |
-| Client packet | ~81 B | `proto::PlayerMovementPacket` |
-| Snapshot | 28 B + 23 B per peer | `proto::ServerSnapshot` |
-| Peer cap in snapshot | 16, enabled in the shipped config | `proto::MAX_SNAPSHOT_PEERS`, `SimConfig::replicate_peers` |
-| Neighbour cap | 8 | `proto::MAX_NEIGHBOURS` |
-| Neighbour radius | 2.0 m | `proto::NEIGHBOUR_RADIUS` |
-| Report window | 30 server ticks (0.5 s) | `proto::REPORT_WINDOW` |
-| Resume window | 120 s (7200 ticks) | `sim::authority::RESUME_WINDOW` |
-| Resume travel allowance | 5.4 m fixed cap; not yet scaled by time since detach | `SimConfig::resume_travel()` |
-| Correction budget | 2.0 m/s per tick (vector sum) | `proto::CORRECTION_BUDGET` |
-| Player capsule | r 0.4 m, h 1.8 m | `proto::PLAYER_RADIUS/HEIGHT` |
-| Measured tick cost | 0.040 ms at 32 bots, 1.139 ms at 256 bots with the peer AOI on (the shipped config); 0.023 / 0.436 ms with it off | `server --bots N --duration 5` |
-| Allocation in a steady-state tick | 0 | `crates/sim/tests/allocations.rs` |
+| Server tick | 60 Hz (16.67 ms) | `shared::TICK_HZ`, `shared::TICK_DURATION` |
+| Client simulation | 60 Hz, same fixed step | `shared::TICK_HZ` (`Time::<Fixed>`) |
+| Replication send interval | 100 ms | `shared::SEND_INTERVAL` → `ReplicationMetadata` |
+| Player capsule | r 0.4 m, h 1.8 m, resting centre 0.9 m | `shared::PLAYER_RADIUS`, `PLAYER_HEIGHT`, `RESTING_HEIGHT` |
+| Walk / sprint speed | 6.0 / 9.0 m/s | `shared::MAX_SPEED`, `MoveParams::sprint_speed` |
+| Ground / air acceleration | 24 / 6 m/s² | `shared::MAX_ACCEL`, `MoveParams` |
+| Ground friction | 14 m/s² (linear) | `MoveParams::ground_friction` |
+| Gravity / jump | −24 m/s², 7 m/s | `MoveParams` |
+| Headless script | 1201 ticks; final pose ±9.09 m; `peak_y` 1.8733; deterministic | `cargo run -p client -- --headless` |
 | Design target | 10 000 players in one PvP zone | dialogue turn 2 |
 
-The 10 000-player target is **not** demonstrated by these numbers. 0.039 ms at 32 players is
-linear-ish in the solver only; the unmeasured parts are replication bandwidth, AOI building and
-handoff. Treat the target as a constraint that shapes the design, not as a result. The 32-bot figure
-is also dominated by fixed per-tick bookkeeping, which is why it barely moved when the data layout
-was rewritten — the 256-bot column is the one that reflects the layout (see
-`architecture-review.md` §7.3).
+The 10 000-player target is **not** demonstrated by the prototype. There is no AOI, no server-side
+collision solve and no load-test harness, so the numbers that would support it (bandwidth per
+player, solve cost per pair, handoff cost) are unmeasured. Treat the target as a constraint that
+shapes the design, not as a result.
+
+The legacy wire constants (`SERVER_TICK_HZ`, `INPUT_SEND_HZ`, `MAX_SNAPSHOT_PEERS`,
+`REPORT_WINDOW`, `CORRECTION_BUDGET`, the packet sizes and the bot benchmarks) were removed with the
+`proto`/`sim` crates. Their historical values remain in ADRs 007–015,
+[`architecture-review.md`](architecture-review.md) §7, and the git history before commit `4af32ef`.
 
 ---
 
@@ -310,20 +283,18 @@ was rewritten — the 256-bot column is the one that reflects the layout (see
 
 | Area | Status |
 | --- | --- |
-| Fixed 60 Hz tick, eight phases, solve every tick | Implemented (phases collapsed) |
-| Client KCC vs terrain | Implemented (Avian `VirtualCharacter` + `MoveAndSlidePlugin` in `kcc`) |
-| Client-side peer-collider solve | Implemented — `sim::peers::LocalPeerSolve` samples the tick-keyed collider history and solves before the terrain step; `SimConfig::replicate_peers` is on |
-| Peer-collider history | Implemented — `sim::peers::PeerHistory`, 32 tick-keyed samples, monotonic, interpolated, held (not extrapolated) at the ends |
-| Server shadow + validation | Implemented |
-| Spatial hash, K = 8, pair cap | Implemented (CSR counting-sort grid) |
-| Zero-allocation steady-state tick | Implemented and guarded by a counting allocator |
-| Correction protocol with `(seq, tick, epoch)` | Implemented |
-| Correction integration (one tick per delta, in-flight discount) | Absent — the shadow applies a delta across the whole report window (`architecture-review.md` §7.7) |
-| Server-sanctioned displacement (respawn, teleport, knockback, mounts) | Absent — only a clamped resume can move a shadow |
-| Lightyear UDP transport with admission, timeout, orphan release | Implemented |
-| Reconnect/resume clamp: parked shadow, clamped claim, `resync` adoption | Implemented |
-| Per-player clock offset mapping | Implemented |
-| Lightyear netcode | **Partial** — Lightyear 0.31 owns the wire, prediction/interpolation still ours (ADR 006) |
+| Fixed 60 Hz tick | Implemented — `shared::TICK_HZ` drives Bevy's fixed clock and both Lightyear plugin groups |
+| Authoritative server simulation | Implemented — Lightyear `ServerPlugins`; one player spawned per connected client |
+| Client KCC vs terrain | Implemented — Avian `VirtualCharacter` + `MoveAndSlidePlugin` (`kcc` crate) |
+| Server vs terrain | Implemented — same `shared::test_room()` colliders on both sides (deviation from ADR 009) |
+| Prediction / rollback / interpolation | Implemented — Lightyear component rules for `Position`, `Rotation`, `LinearVelocity`, `Grounded` |
+| Input pipeline | Implemented — BEI actions, server-owned action entities, rebroadcast inputs, owner prediction |
+| UDP transport | Implemented — Lightyear raw UDP (`ServerUdpIo` + `RawServer`; `RawClient` + `UdpIo`) |
+| Headless CI client | Implemented — scripted run with determinism and invariant checks |
+| Interest management / AOI | Absent — all players replicate to all clients |
+| Peer / boss collision, collision modes | Absent (ADR 009, 010, 011) |
+| Server shadow, displacement validation, resume | Absent — removed with the custom protocol (ADR 012) |
+| Traffic suppression, heartbeats, corrections | Absent — Lightyear's replication cadence only (ADR 015) |
 | Roles, raids, parties | Absent |
 | Combat, abilities, hard-mode switching | Absent |
 | NPC / boss simulation | Absent |

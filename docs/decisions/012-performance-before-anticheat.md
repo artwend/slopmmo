@@ -1,6 +1,7 @@
 # ADR 012 — Performance first; anti-cheat is cheap, best-effort and never the architect
 
-- **Status:** Implemented (as validation heuristics, not as an anti-cheat system).
+- **Status:** Open — no server-side validation is implemented; the server trusts the input stream
+  and simulates it. The "performance first" ordering is still the design rule.
 - **Decided by:** project owner, second dialogue, turn 8.
 - **Verbatim:** *«Не стоит ставить борьбу с читерами во главу угла… В первую очередь всегда стоит
   думать о производительности, а потом уже о читерах. Наша задача — просто не дать читерить
@@ -37,14 +38,16 @@ intended bar: *"don't make cheating trivial"*.
 
 ## Consequences
 
-- Corrections are **velocity deltas and contact normals**, never positions — a cheat cannot use the
-  correction channel to teleport.
-- The `TooFast` reject in `authority.rs` is deliberately tolerant (`POSITION_SLACK = 1.35`) because a
-  legitimate step-up, jump arc or slope changes the horizontal/vertical ratio. A tight bound
-  produces false positives on stairs, which are far more damaging than a small speed hack.
-- The displacement window is measured on the **server tick counter** since the last accepted report,
-  not on the client's report tick. The report tick orders and ages the report; letting it also scale
-  the allowance would mean a modified client could widen its own budget by forging a jump.
+- If a custom correction channel is built, corrections must be **velocity deltas and contact
+  normals**, never positions — a cheat must not be able to use it to teleport. The prototype
+  deviates: it uses Lightyear's stock predicted-state corrections, which are authoritative state
+  snapshots rather than gameplay teleports.
+- Any speed/displacement reject should be tolerant (`POSITION_SLACK ≈ 1.35`) because a legitimate
+  step-up, jump arc or slope changes the horizontal/vertical ratio. A tight bound produces false
+  positives on stairs, which are far more damaging than a small speed hack.
+- Measure the displacement window on the **server tick counter**, not the client's report tick: the
+  report tick should order and age the report, or a modified client could widen its own budget by
+  forging a jump.
 - Detection is out of scope for the simulation node; if it is ever added it belongs to a separate
   analytics service consuming the same reports, not to the tick loop.
 - Server cost grows with players, not with terrain area — a design constraint that ADR 002's
@@ -52,14 +55,11 @@ intended bar: *"don't make cheating trivial"*.
 
 ## What this repository does
 
-`crates/sim/src/authority.rs` implements exactly the "kept" rows: displacement check with slack,
-report-window/stale-tick rejection, duplicate `seq` rejection, per-player clock offset mapping.
-There is no analytics, no logging of suspicious events beyond a counter, and no terrain.
-
-Two gaps this ADR's list did not name are now closed: the displacement baseline survives a
-departure (the shadow is parked and a resume is clamped to it, `architecture-review.md` §8), and a
-fresh admission — still unauthenticated and still trusting the report — is the only remaining
-"spawn wherever you claim" path.
+There is no validation layer. The server accepts whatever inputs Lightyear delivers, simulates the
+same character controller as the client, and replicates the result, so a modified client can send
+any action stream it likes. The only integrity property in the prototype is that the server is the
+simulation authority — the client's prediction is corrected to the server's — and the raw UDP link
+is unauthenticated.
 
 ## Open questions
 

@@ -1,6 +1,6 @@
 # ADR 011 — Nearest-neighbour budget: spatial hash, K = 8, capped at both ends
 
-- **Status:** Implemented.
+- **Status:** Open — there is no spatial index or pair solve in the prototype.
 - **Decided by:** project owner, second dialogue, turn 8.
 - **Verbatim:** *«Только с ближайшими. И ещё. Не стоит ставить борьбу с читерами во главу угла…»*
 
@@ -42,13 +42,10 @@ first:
 
 ## What this repository does
 
-`crates/sim/src/spatial.rs` — `SpatialGrid` with `insert`/`nearest(pos, k, radius)`; deterministic
-tie-breaking by id. `crates/sim/src/collision.rs` builds the pair set with the union rule and the
-per-player cap. `MAX_SNAPSHOT_PEERS = 16` is deliberately larger than `K = 8`, so the client can
-know about colliders the server is not currently solving and avoid walking into them. The list is
-built when `SimConfig::replicate_peers` is on, which is the default now that the client-side solve
-exists (ADR 015); the client keeps the replicated sets in a tick-keyed history
-(`sim::peers::PeerHistory`).
+Nothing of the neighbour budget is built. There is no spatial hash and no pair list; the only
+collision query in the prototype is the character controller's move-and-slide against the room's
+boxes. Replication has no AOI cap either: every player is replicated to every client
+(`Replicate::to_clients(NetworkTarget::All)`).
 
 ## Open questions
 

@@ -1,6 +1,6 @@
 # ADR 010 — Collision modes `None` / `Soft` / `Hard`, soft by default in PvP
 
-- **Status:** Implemented.
+- **Status:** Open — no collision modes and no player-vs-player collision exist yet.
 - **Decided by:** project owner, second dialogue, turn 7 (chose "hybrid" among collision models).
 - **Verbatim:** *«Hybrid»* in response to the choice between no player collision, soft collision and
   hard blocking; with *«Character collision: soft»* as the default from turn 3.
@@ -44,13 +44,9 @@ against the same mode the server uses; otherwise every hard contact disagrees.
 
 ## What this repository does
 
-- `crates/sim/src/collision.rs` — `Mode` enum, inelastic impulse
-  `j = -(v_rel·n) / (1/m_a + 1/m_b)`, `CORRECTION_BUDGET = 2.0` applied to the summed correction,
-  `SOFT_MARGIN = 0.05`, `inv_mass = 0` for immovable bodies.
-- `crates/proto/src/packet.rs` — `peer_mode::{NONE, SOFT, HARD}` travels in every `PeerCollider`.
-- `crates/server/src/main.rs` — PvP peers are soft; a `HARD` mode exists in the solver and in the
-  wire format but no gameplay ability switches it on yet.
-- Tests cover soft push-out, budget clamping and hard-blocking normal selection.
+Nothing here is built. The only collision in the prototype is character-vs-static-geometry, solved
+by Avian's `MoveAndSlide` on both sides; players and other dynamic bodies do not collide with each
+other, so there is no mode to select and no contact normal to replicate.
 
 ## Open questions
 

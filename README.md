@@ -4,9 +4,11 @@ A minimal, testable skeleton of an MMORPG client and game server in Rust, implem
 architecture that came out of the design dialogue review in
 [`docs/architecture-review.md`](docs/architecture-review.md).
 
-The point of this repository is not to be a game. It is to be a **working, measurable
-implementation of the movement/authority split**, so the claims in the review can be checked by
-running code instead of arguing about them.
+The point of this repository is not to be a game. It is a **working, measurable implementation of
+server-authoritative movement with client prediction**, so the movement claims in the review can be
+checked by running code instead of arguing about them. The wider collision-authority split argued in
+the ADRs is still design only; the status table in
+[`docs/server-architecture.md`](docs/server-architecture.md) records what is actually built.
 
 - **Rust** 1.100.0 (pinned in `rust-toolchain.toml`)
 - **Bevy** 0.20 (`MinimalPlugins` on the server, `DefaultPlugins` in the client window)

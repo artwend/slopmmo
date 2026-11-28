@@ -34,14 +34,15 @@ Use **Lightyear + built-in UDP transport** as the networking layer for client �
 Movement and frequent state use unreliable channels; reliable/ordered channels are kept for
 discrete commands where order matters.
 
-Non-goals that were made explicit in the dialogue:
+Non-goals that were made explicit in the dialogue, both of which were later dropped:
 
-- Do not use Lightyear's stock prediction model as a black box. The client and server
-  intentionally simulate *different* collision sets (ADR 009), so a correction is not a state
-  copy: it is applied, the client replays its own KCC, and only then does the result become the
-  new visual state.
+- Do not use Lightyear's stock prediction model as a black box. *(Dropped: the client and server
+  now simulate the same room, so stock prediction/rollback applies.)* The old design had the two
+  sides simulate *different* collision sets (ADR 009), which is why a correction used to be a
+  velocity hint plus a local KCC replay rather than a state copy.
 - Do not rely on Lightyear's standard input buffer for the merged movement packet (ADR 007); the
-  owner merged input and movement report into one message, so redundancy is our own concern.
+  owner merged input and movement report into one message, so redundancy was our own concern.
+  *(Dropped: ADR 007's packet is superseded, and the input pipeline is Lightyear's.)*
 
 ## Implementation status
 
@@ -67,84 +68,49 @@ below.
 
 ### Historical: the intermediate hand-rolled path
 
-The notes below describe the state before the migration above. They are kept because they record
-why the split moved in steps, but they no longer describe the code.
+The intermediate migration ran a hand-written protocol on top of Lightyear's raw transport: a `net`
+crate declared `PlayerMovementPacket`/`ServerSnapshot`, `proto` defined their encodings, and `sim`
+held the server shadow, the spatial grid, the capsule solver and the client's peer history. That
+layer was deleted when Lightyear's replication and prediction stack were adopted (commit `4af32ef`).
+Its design rationale is recorded in ADRs 007 and 009–015 and audited in
+[`../network-review.md`](../network-review.md), which describes code that no longer exists.
 
-- `crates/net` declares the protocol: `InputChannel` (client → server, `UnorderedUnreliable`,
-  flushed every frame — the client owns the report cadence, so a channel-level
-  `send_frequency` would only add a timer's worth of latency) and `SnapshotChannel` (server →
-  client, `SequencedUnreliable`, on change with an RTT-adaptive heartbeat), plus the two messages
-  (`PlayerMovementPacket`, `ServerSnapshot`). Both binaries add the same plugin, so the channel and
-  message *ids* agree.
-- Protocol identity is **not** hash-checked in this build: lightyear only compares protocol hashes
-  when its `replication` feature is enabled. `proto::PROTOCOL_VERSION` is stamped in every movement
-  packet instead, and the server rejects and logs a mismatch. Enabling replicon later would restore
-  the hash check; the in-band version can stay either way.
-- `crates/server/src/transport.rs`: a `ServerUdpIo` endpoint; lightyear spawns one link per remote
-  address, and our admission system binds a `player` id to that link on the first movement packet —
-  one player per link, with a rebind allowed only after the previous link has gone quiet. Peer
-  timeout, superseded-link release and snapshot fan-out live here. A timed-out or torn-down link
-  parks its shadow (`Simulation::detach_player`), so the next link for the same id resumes from the
-  server's pose rather than being admitted wherever it claims. An unacknowledged correction is kept
-  in flight and repeated, bounded, until the client echoes it.
-- `crates/client/src/transport.rs`: `RawClient` + `UdpIo` + `LocalAddr(0.0.0.0:0)` +
-  `PeerAddr(server)`, `Connect`, then a plain `MessageSender`/`MessageReceiver` pair.
-- Verified live: `client --headless --connect 127.0.0.1:4000` → `net_sent 600`,
-  `net_snaps 1185`, server logs `admitted player 1`.
-
-**Still ours, on purpose.** The client keeps its own KCC, its own redundancy window
-(`Local::report`), its own `CorrectionLog` idempotency and its own visual smoothing. Lightyear's
-`PredictionHistory`/`VisualCorrection` are not used yet: the two sides simulate *different*
-collision sets (ADR 009), so a correction is a velocity/normal hint plus a replay of the local
-KCC, which is exactly what a stock state-copy prediction would get wrong.
+**Still ours, on purpose.** The simulation: `shared::movement` is the single input→velocity model
+and `crates/kcc` is the Avian virtual-character controller, with `shared::player_physics_bundle`
+building the character on both sides. Lightyear owns everything around it — replication,
+prediction and rollback, interpolation, input buffering and the UDP transport.
 
 **Deliberately not done yet.**
 
-- Peer colliders are still hand-encoded into `MAX_SNAPSHOT_PEERS` (ADR 011). Replicating them as
-  entities with a visibility filter is the next step; the K = 8 AOI cap stays.
-- No delta compression or prioritisation. Snapshots are change-gated (ADR 015), so a tick that
-  changes nothing the client can act on is not sent. The hand-encoded peer set is still the
-  convergence target for step 1 above, and is switched off entirely until a client consumes it
-  (`SimConfig::replicate_peers`); when on, a snapshot is budgeted against
-  `net::MESSAGE_BUDGET` — lightyear's `DEFAULT_MTU` minus the 13-byte packet header — so one message
-  stays one datagram.
-- A running client that never sends is never admitted (no `Hello`): identity is the `player` field
-  of the first movement packet, per ADR 007.
+- **No interest management.** Every player replicates to every client
+  (`Replicate::to_clients(NetworkTarget::All)`); the test room is small enough that full
+  replication is not yet the bottleneck.
+- **No event plane.** Discrete gameplay messages, acknowledgements and prioritisation have no home
+  yet (ADR 001).
+- **No authentication or connection negotiation.** The raw UDP endpoint accepts any source address
+  and spawns a player when a client connects.
+- **No delta-compression or send-priority tuning.** Component replication uses the library defaults
+  with a 100 ms send interval (`shared::SEND_INTERVAL`, passed to `ReplicationMetadata`).
 
-## Remaining convergence plan
+## Next steps
 
-1. Replicate the peer-collider set as components (`Replicate`) instead of encoding
-   `MAX_SNAPSHOT_PEERS` by hand, keeping the K = 8 AOI cap in the visibility filter.
-2. Move the client's local character into Lightyear prediction: the KCC becomes the predicted
-   system, corrections arrive as replicated components, and the client replays from its own
-   history rather than from a shadow position.
-3. Keep the headless harness as the acceptance test: identical invariant output, `net_snaps`
-   replaced by a snapshot-count metric from the Lightyear client, same zero-malformed guarantee.
-
-Acceptance: the live round trip passes through Lightyear, the headless invariant script produces
-the same `peak_y`/`deterministic` result, and the bot benchmark still fits the tick budget.
-The first clause is green today (`cargo test --workspace`, plus the live check).
+- Replace `NetworkTarget::All` with a visibility/priority filter once player count makes full
+  replication expensive.
+- Add the event plane on reliable Lightyear channels (ADR 001).
+- Put authentication and connection negotiation in front of the raw UDP link.
 
 ## Tick domains
 
-Lightyear advances its own `LocalTimeline` at the configured tick duration, but nothing in the game
-reads it: the wire and the simulation use `proto::Tick`, which wraps and is compared through
-`since()`. That is deliberate and currently harmless — no message or channel is registered with
-`on_timeline`, and no component is replicated.
-
-Treat it as a constraint rather than a detail. Adopting `on_timeline`, `lightyear_prediction` or
-`Replicate` means switching to `Res<LocalTimeline>` and stopping the use of `proto::Tick` across
-that layer: 0.31's `Tick` is non-wrapping and saturating, so the two are not interchangeable. There
-are also two tick *rates* in play — the client's fixed step and the server's accumulator — which is
-why `proto::map_client_tick` scales instead of adding.
+There is one tick domain. `shared::TICK_HZ` (60 Hz) sets the Bevy `Time<Fixed>` step, and
+`shared::TICK_DURATION` is passed to both `ClientPlugins` and `ServerPlugins`, so Lightyear's
+timeline, the physics step and a prediction replay all describe the same tick. No custom tick type
+crosses the wire; input messages and replicated components are Lightyear's own.
 
 ## Open questions
 
-- ~~Which Lightyear release pairs with Bevy 0.20?~~ Answered: Lightyear 0.31.0 on Bevy 0.20.1.
-- ~~Does Lightyear's unreliable channel support sequenced (drop-older) semantics?~~ Answered:
-  `ChannelMode::SequencedUnreliable` does, and snapshots use it. Input uses
-  `UnorderedUnreliable`: dropping a late datagram at the channel also drops its redundancy
-  frames, so ordering is left to the ingest path's per-packet dedupe.
-- Simplification worth considering: because the server cannot verify terrain, the predicted
-  component may only need `position/velocity/applied_correction_seq`, with the KCC replayed from
-  server-provided collision events — that is a smaller prediction surface than a stock setup.
+- ~~Which Lightyear release pairs with Bevy 0.20?~~ Answered: Lightyear 0.31 on Bevy 0.20.
+- ~~Does Lightyear's unreliable channel support sequenced (drop-older) semantics?~~ No longer
+  relevant: the hand-written channels were removed with `net`; inputs and replication use
+  Lightyear's own channels and input pipeline.
+- When does replicating every player to every client stop being acceptable, and does Lightyear's
+  visibility filtering cover it without re-introducing a custom replication path?

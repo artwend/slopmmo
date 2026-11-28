@@ -1,6 +1,7 @@
 # ADR 009 — Collision ownership: client owns terrain, server owns players and bosses
 
-- **Status:** Implemented.
+- **Status:** Deviation — the prototype gives both sides the same terrain and the same character
+  controller, so collision ownership is not split yet.
 - **Decided by:** project owner, second dialogue, turns 4–6.
 - **Verbatim:** *«Сервер не должен производить вычисления столкновений со статическими и
   динамическими объектами, это слишком затратно.»* → *«Да у сервера не должно быть данных о
@@ -56,17 +57,18 @@ server does **not** trust it blindly, it validates the *implied displacement* ag
 
 ## What this repository does
 
-- `crates/sim/src/world.rs` — static AABBs exist **client-side and in tests only**;
-  `crates/server/src/main.rs` never constructs a `StaticWorld`.
-- `crates/sim/src/authority.rs` — the server keeps `ServerPlayer { position, velocity, body_yaw,
-  angular_velocity, tick_origin, last_seq, last_tick }` and validates the reported displacement,
-  rejecting with
-  `Reject::{StaleTick, Teleport, TooFast, DuplicateSeq, UnknownPlayer, MalformedTick}`.
-- `crates/sim/src/collision.rs` — capsule-vs-capsule only, with `inv_mass = 0.0` for immovable
-  bodies (bosses).
-- `crates/proto/src/packet.rs` — the correction shape is deliberately `velocity_delta` + optional
-  `hard_normal`; the snapshot's `shadow_position` is explicitly informational and the client must
-  not adopt it.
+The split is not implemented. The prototype is one shared room:
+
+- `crates/shared/src/world.rs` defines `test_room()`, a handful of static AABBs.
+- `crates/server/src/main.rs` spawns those boxes as colliders, so the server **does** hold terrain.
+- `crates/client/src/character.rs` spawns the same boxes as colliders plus meshes.
+- Both sides move the character with the same Avian `VirtualCharacter` + `MoveAndSlidePlugin`, and
+  `shared::SharedPlugin` installs the same physics pipeline.
+
+There is no server shadow, no displacement validation and no ownership epoch. Lightyear predicts
+the owner's character and corrects it from the authoritative server state; that correction is an
+ordinary rollback, not a velocity/normal hint. The packet that carried the old correction shape was
+deleted with the `proto` crate.
 
 ## Open questions
 

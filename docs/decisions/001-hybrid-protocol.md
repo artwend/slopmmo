@@ -1,6 +1,6 @@
 # ADR 001 — Hybrid protocol: event messages plus selective state replication
 
-- **Status:** Partial — the state plane exists, the event plane does not.
+- **Status:** Partial — Lightyear replicates the state plane; the event plane does not exist.
 - **Decided by:** project owner, first dialogue, turn 1.
 - **Verbatim:** *«Какой тип протокола лучше выбрать для ММОРПГ с 10к+ игроками на сервере —
   вариант как в старой lineage с сообщениями, где каждый айди соответствует какому то действию
@@ -41,10 +41,16 @@ filtering is therefore not an optimisation, it is a structural part of the proto
 
 ## What this repository does
 
-`proto` implements the state plane only: `PlayerMovementPacket` (client → server) and
-`ServerSnapshot` (server → client, capped at `MAX_SNAPSHOT_PEERS = 16` peers per snapshot, which
-is the simplest possible AOI). There is no event plane, no opcode dispatch and no versioning
-field yet.
+`crates/shared` declares the protocol: the `Player` input context with its `Movement`, `Jump` and
+`Sprint` actions, plus the `PlayerId` identity component. Lightyear carries both planes that exist
+today — inputs client → server (`InputPlugin<Player>`, rebroadcast so every client predicts every
+player) and component replication server → clients (`Position`, `Rotation`, `LinearVelocity`,
+`Grounded`). There is no event plane, no opcode dispatch and no hand-written snapshot. Protocol
+identity is hash-checked by Lightyear because this build enables its `replication` feature.
+
+Interest management is the missing half of the decision: `Replicate::to_clients(NetworkTarget::All)`
+sends every player to every client, which is the simplest possible AOI and only acceptable at
+prototype scale.
 
 ## Open questions
 

@@ -1,7 +1,7 @@
 # ADR 008 — Hybrid physics: kinematic character controller, geometry solved on the client
 
-- **Status:** Implemented. The client's controller is Avian's `MoveAndSlide` (`crates/kcc`);
-  `sim::kcc` remains the engine-free reference solver.
+- **Status:** Implemented. The character is an Avian `VirtualCharacter` moved by `crates/kcc`
+  (`MoveAndSlidePlugin`), and `shared::kcc` remains the engine-free reference solver.
 - **Decided by:** project owner, second dialogue, turn 1 and the radio pick.
 - **Verbatim:** *«гибридная модель физики»*, then *«да, используем
   `avian/virtual-character/src/character_controller/virtual_character.rs` как основу»*.
@@ -30,8 +30,9 @@ the geometry layer and explicitly **not** `AutoMoveAndSlide`.
 - The **geometry layer** is `MoveAndSlide`-style: move, gather contacts, slide along the remaining
   tangential velocity, repeat for a bounded number of iterations. This is reused as-is; it is the
   part that is boring to write and easy to get wrong (internal edges, ground snapping, slopes).
-- **Not** `AutoMoveAndSlide`: the automatic variant hides the loop and takes over the velocity,
-  which conflicts with prediction/rollback because it decides when the movement "ended".
+- The entity-side API is the released `VirtualCharacter` plus the `AutoMoveAndSlide` settings
+  component it requires, with `MoveAndSlidePlugin` running the loop in `PhysicsSchedule`. The
+  dialogue's plan to avoid `AutoMoveAndSlide` did not survive the port onto released Avian.
 - Dynamic bodies in the world (crates, doors, bosses) are **not** simulated as rigid bodies on the
   server; they are colliders with a mode (ADR 010).
 - Rotation, air control and collision response are feel constants, not physics parameters (ADR 014).
@@ -42,8 +43,8 @@ the geometry layer and explicitly **not** `AutoMoveAndSlide`.
   MMO and much cheaper to predict.
 - Anything that must react physically (a cart hit by a raid) needs an explicit gameplay rule or an
   entity that is simulated on a single authority, not an emergent solver result.
-- Because the character is kinematic, the server can validate **displacement** instead of
-  re-simulating physics — the basis of ADR 009.
+- Because the character is kinematic, a server *could* validate **displacement** instead of
+  re-simulating physics — the basis of ADR 009, which this prototype does not build.
 - Avian is the geometry provider, not the authority: the same `MoveAndSlide` result must be
   reproducible on the client for prediction to work.
 
@@ -62,21 +63,20 @@ forking the branch:
 - `AutoMoveAndSlide::on_hit` keeps the branch's `fn(MoveAndSlideHitData) -> bool` signature and maps
   `true`/`false` onto Avian 0.8's `Accept`/`Ignore`.
 
-The client is an ordinary Avian app: `PhysicsPlugins` + `MoveAndSlidePlugin` run in
-`FixedPostUpdate`, the avatar entity *is* the virtual character, and the movement model writes
-`LinearVelocity` in `FixedUpdate`. `character::read_back` copies `Position`, `LinearVelocity` and
-`Grounded` into `Local` for the report. The report carries that linear velocity alongside the
-camera's `angular_velocity`: the server bounds the yaw rate the same way it bounds linear speed and
-advances `body_yaw` from the report anchor while dead-reckoning, exactly as it advances position.
+Both binaries install the same pipeline through `shared::SharedPlugin`: `PhysicsPlugins` (with the
+transform-sync, interpolation, island and sleeping plugins disabled because they break rollback),
+`MoveAndSlidePlugin`, and a `FixedUpdate` system that turns the BEI action values into
+`LinearVelocity` with `shared::movement::step_velocity_raw`. `LightyearAvianPlugin` registers
+`Position`, `Rotation`, `LinearVelocity` and `Grounded` for replication, prediction, interpolation
+and correction, with `register_physics_components: false` because the character is not a rigid body.
 
-`crates/sim/src/kcc.rs` stays as the engine-free reference solver: the deterministic
-capsule-vs-AABB collide-and-slide is what `sim`'s own tests and the server's bot benchmark use, so
-the cheap test crate never pulls in a physics engine. `crates/sim/src/authority.rs` is unaffected;
-the server's shadow still integrates reported motion and never solves terrain.
+`shared::kcc` stays as the engine-free reference solver: the deterministic capsule-vs-AABB
+collide-and-slide is what the `kcc` parity test compares against, so the solver can be checked
+without a physics engine.
 
 Gap to close: real trimesh terrain. The prototype's terrain is still a handful of axis-aligned
-boxes, so the client builds box colliders; swapping in a trimesh is a change to
-`character::terrain_bundle`, not to the controller. Step-up is still absent, as in the branch.
+boxes (`shared::test_room`), so both sides build box colliders; swapping in a trimesh is a change to
+`shared::terrain_bundle`, not to the controller. Step-up is still absent, as in the branch.
 
 ## Open questions
 

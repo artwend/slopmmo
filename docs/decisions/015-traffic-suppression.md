@@ -1,6 +1,7 @@
 # ADR 015 — Superseded state stays off the wire
 
-- **Status:** Implemented.
+- **Status:** Open — the suppression layer was removed with the hand-written protocol; Lightyear's
+  own replication cadence is what runs today.
 - **Decided by:** engineering follow-up to ADRs 006 and 007. The message layouts and the reliability
   model are unchanged; only *when* a message is put on the wire changed.
 
@@ -69,20 +70,18 @@ trip to deliver the repeat, one to cover an unreliable channel having no acknowl
 datagrams already in flight. The RTT comes from `Link::stats`, which Lightyear's ping manager
 maintains per connected link.
 
-**Server, peer cadence.** Peer colliders are refreshed at `proto::PEER_UPDATE_HZ` (30 Hz), not on
-every tick. `plan_snapshot` decides three things independently: whether anything urgent happened
+**Server, peer cadence.** Peer colliders are refreshed at 30 Hz, not on every tick. `plan_snapshot` decides three things independently: whether anything urgent happened
 (correction or `resync`), whether the peer list is due, and whether the heartbeat expired. A
 correction that lands between peer refreshes leaves immediately and carries the peer list that was
 last sent, so peer traffic stays capped without delaying corrections. `resync` is exempt: it is a
 rare placement request and the client cannot act on it without the current collider set. A client
-interpolates peers between updates; without that, 30 Hz would be visible. The client-side consumer
-now exists: `sim::peers::PeerHistory` keeps the replicated sets keyed by server tick and the fixed
-tick interpolates between them.
+interpolates peers between updates; without that, 30 Hz would be visible. The client keeps the
+replicated sets keyed by server tick and the fixed tick interpolates between them.
 
-**Server, peer list.** `ServerSnapshot::peers` is built only when `SimConfig::replicate_peers` is on.
-It is on by default now that the client solves against the list; `sim::peers::LocalPeerSolve` reads
-the tick-keyed history before the terrain step. Setting the flag to `false` skips both the AOI scan
-and the wire bytes, for a client build without the local solve.
+**Server, peer list.** The peer list is built only when peer replication is switched on. It is on by
+default when the client solves against the list; the local solve reads the tick-keyed history before
+the terrain step. Turning the flag off skips both the AOI scan and the wire bytes, for a client build
+without the local solve.
 
 The simulation still builds a snapshot for every player every tick. The filter lives in the
 transport, so diagnostics, tests and future readers of `Simulation::snapshots()` see the full state.
@@ -103,6 +102,8 @@ client's report gating decides when an input packet exists.
 
 ## Consequences
 
+The measurements below describe the removed protocol; they are kept as the design record.
+
 - **Steady client:** a constant velocity is already described by `pos + vel × age`, so 30 reports/s
   (~2.4 KB/s) drops to ~10 anchors/s (~0.8 KB/s) while walking and 4/s (~0.2 KB/s) while stationary.
   Changes and turns still leave at 30 Hz with their input frames. Measured over a 20 s scripted run
@@ -113,8 +114,8 @@ client's report gating decides when an input packet exists.
   area, the server→client stream is effectively heartbeat-only. Measured on loopback: 184 snapshots
   over a 20 s script (~9/s) versus 77 with the old fixed 250 ms.
 - **Moving peers (when enabled):** with `replicate_peers` on, peer motion goes out at 30 Hz instead
-  of 60 Hz, halving the snapshot stream in a crowd, and corrections ride along at tick rate. This is
-  the shipped configuration now that the client solves against the peer set.
+  of 60 Hz, halving the snapshot stream in a crowd, and corrections ride along at tick rate. That
+  was the configuration at the time, once the client solved against the peer set.
 - **Loss statistics:** `acked_seq` arrives at the heartbeat rate during quiet periods instead of every
   tick. Nothing in the client consumes it today; this would need revisiting before it is used for
   loss estimation.
@@ -127,30 +128,16 @@ client's report gating decides when an input packet exists.
 
 ## What the repository does
 
-- `crates/client/src/main.rs`: `Local::report` sends when the state changed or an anchor is due;
-  `SentReport` stores what the last packet said (tick, pose, linear and angular velocity, input) so
-  dead reckoning can be compared. `ANCHOR_SEND_HZ`, `REPORT_VELOCITY_EPSILON`,
-  `REPORT_ANGULAR_EPSILON`, `REPORT_POSITION_EPSILON`. Tests cover idle anchors, steady-walk anchors,
-  a velocity/input change, a correction ack, and the end of a turn.
-- `crates/server/src/transport.rs`: `Peers::last_sent` (`SentSnapshot { at, peers_at }`),
-  `plan_snapshot`, `PEER_UPDATE_INTERVAL`, `heartbeat_interval`, `snapshots_skipped`. Tests cover
-  informational-only changes, millimetre sensitivity, peer membership and cadence, a correction
-  keeping the peer cadence, heartbeat scaling with RTT, resync repetition, and forgetting the cached
-  snapshot when a link is released.
-- `crates/proto/src/lib.rs`: `IDLE_SEND_HZ`, `IDLE_SEND_TICKS`, `IDLE_SPEED_EPSILON`,
-  `PEER_UPDATE_HZ`.
-- `crates/sim/src/authority.rs`: `SimConfig::replicate_peers` (default `true`) gates `aoi_peers`.
-  A simulation test pins the default and the built list, so the shipped configuration cannot
-  silently stop carrying the colliders the client solves against; the AOI tests keep the selection
-  covered.
+There is no application-level suppression. Input messages are produced by Lightyear's input
+pipeline on the ticks the client has input to send, and replication is sent on the library's own
+schedule: `shared::SEND_INTERVAL` (100 ms) is passed to `ReplicationMetadata`, and Lightyear only
+carries components whose state changed. There is no anchor cadence, no peer-refresh cadence and no
+correction-repetition logic of our own.
 
 ## Open questions
 
-- ~~The peer list is transmitted for a consumer that does not exist.~~ Resolved: the client-side
-  consumer now exists (`sim::peers`), and `SimConfig::replicate_peers` is on by default.
-- **Peer positions are absolute `f32` triples with a `u64` id per collider.** Millimetre
-  fixed-point and a per-connection `u16` peer id would cut a peer entry roughly in half; delta
-  encoding against the previous acknowledged peer set would cut it further.
-- ~~Peer update rate.~~ Resolved: `PEER_UPDATE_HZ = 30`, a separate cadence from corrections.
-- ~~Adaptive heartbeat.~~ Resolved: `2 × RTT`, clamped to 100 ms..1 s, falling back to 250 ms until
-  a sample exists.
+- Does Lightyear's change detection plus the 100 ms send interval give the quiet-wire property this
+  ADR wanted, or does a stationary player still cost a fixed replication stream? Measure it with
+  `tools/packetdump` before adding a suppression layer back.
+- If a custom protocol returns, which of the three rules (input-change gate, anchor cadence,
+  snapshot comparison) is worth rebuilding first?

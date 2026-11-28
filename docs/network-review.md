@@ -5,8 +5,13 @@ Lightyear 0.31 API, what is wrong, and what is merely mislabelled. The gameplay/
 is reviewed in [`architecture-review.md`](architecture-review.md); the decisions themselves are in
 [`decisions/`](decisions/README.md). This document only covers the wire.
 
-Status: **acted on.** Every finding below was implemented; see [Resolution](#resolution) for what
-changed and which test covers it. The findings are kept as written so the reasoning is not lost.
+Status: **acted on, then superseded.** Every finding below was implemented in the hand-written
+transport; commit `4af32ef` then deleted that whole layer (`crates/net`, `crates/proto`,
+`crates/sim`, and the custom code in both `transport.rs` files) when the project moved to
+Lightyear's built-in replication and prediction stack. The current transport is the raw UDP
+endpoint in `crates/server/src/transport.rs` and `crates/client/src/transport.rs` with library-owned
+replication, prediction, interpolation and input. The findings and resolutions below are kept as the
+record of the removed design, not as a description of the current tree.
 
 ## Verified stack
 
@@ -19,9 +24,10 @@ changed and which test covers it. The findings are kept as written so the reason
 | `aeronet_io` | 0.22.0 |
 | `postcard` | 1.2.0 |
 
-Lightyear features actually built: `std`, `client`/`server`, `udp`, `raw_connection`. **Not**
-enabled: `replication`, `prediction`, `interpolation`, `metrics`, `debug`, `netcode`. Several
-findings below follow from that list, so re-check them if it changes.
+Lightyear features built by the audited crate: `std`, `client`/`server`, `udp`, `raw_connection`.
+**Not** enabled there: `replication`, `prediction`, `interpolation`, `metrics`, `debug`, `netcode`.
+Several findings below follow from that list. (The current tree does enable `replication`,
+`prediction` and `interpolation`, which is why the audited layer is now gone.)
 
 Every API claim here was checked against the crate sources under
 `~/.cargo/registry/src/*/lightyear_*-0.31.0/`, not against the book.
