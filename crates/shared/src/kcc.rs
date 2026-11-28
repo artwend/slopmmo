@@ -1,9 +1,9 @@
 //! Capsule vs static geometry, moved in substeps with depenetration.
 //!
-//! This is the engine-free *reference* solver. The client uses
+//! This is the engine-free *reference* solver. The client and server use
 //! `crates/kcc` instead, which runs Avian's `MoveAndSlide` over the same
-//! terrain; keeping this one pure is what lets `sim`'s tests and the server's
-//! bot benchmark run without a physics engine.
+//! terrain; keeping this one pure is what lets the `kcc` parity test compare
+//! the two without a physics engine.
 //!
 //! No step-up yet — see the `TODO` on [`move_and_slide`]. Without a step height
 //! the controller cannot climb a 0.3 m ledge, which is fine while the test room
