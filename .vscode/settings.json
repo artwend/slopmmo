@@ -1,0 +1,4 @@
+{
+  // Use target/rust-analyzer so checks never lock or pollute target/debug
+  "rust-analyzer.cargo.targetDir": true
+}
